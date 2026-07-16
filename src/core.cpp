@@ -3035,10 +3035,11 @@ ExactDayResult exact_route_search(
     const AcoGraph& graph, const std::vector<AcoMeetingList>& meeting_cache,
     const ActionPlan& incumbent_plan, const CandidateEvaluation& incumbent,
     std::int64_t node_budget,
-    const std::optional<std::chrono::steady_clock::time_point>& deadline) {
+    const std::optional<std::chrono::steady_clock::time_point>& deadline,
+    bool return_master_tie = false) {
   ExactDayResult result{incumbent_plan, incumbent.value, 0, true};
   if (node_budget <= 0 || config.spots.empty() ||
-      config.spots.size() > 20) {
+      config.spots.size() > 15) {
     result.complete = node_budget > 0;
     return result;
   }
@@ -3099,8 +3100,9 @@ ExactDayResult exact_route_search(
       int best_time = infinity;
       for (std::size_t last = 0; last < spot_count; ++last) {
         const int time = label_at(mask, last).time;
-        if (std::tie(time, last) <
-            std::tie(best_time, reinterpret_cast<std::size_t&>(best_last))) {
+        if (time < best_time ||
+            (time == best_time &&
+             (best_last < 0 || static_cast<int>(last) < best_last))) {
           best_time = time;
           best_last = static_cast<int>(last);
         }
@@ -3163,12 +3165,154 @@ ExactDayResult exact_route_search(
     all_brands.insert(spot.brand);
     absolute_servings += spot.stocks;
   }
-  const auto absolute_upper =
+  const auto structural_upper =
       std::tuple{static_cast<int>(all_brands.size()),
                  static_cast<int>(all_brands.size()), absolute_servings};
+  auto route_upper = structural_upper;
+
+  // Solve the fuel-relaxed route master exactly before branching through
+  // concrete rendezvous combinations.  Each spot count occupies four bits;
+  // official instances expose at most fifteen agents/spots in this path.
+  // This produces a valid upper bound because adding fuel and refuel timing can
+  // only remove route combinations.  When the ALNS incumbent meets the bound,
+  // the final day is certified without exploring any movement-action tree.
+  struct MasterParent {
+    std::uint64_t previous{};
+    std::size_t column{};
+  };
+  std::vector<std::vector<std::size_t>> maximal_columns(types.size());
+  for (std::size_t agent : patrols) {
+    std::vector<bool> feasible(mask_count);
+    for (const auto& column : columns[agent]) {
+      feasible[static_cast<std::size_t>(column.mask)] = true;
+    }
+    for (std::size_t index = 0; index < columns[agent].size(); ++index) {
+      const auto mask =
+          static_cast<std::size_t>(columns[agent][index].mask);
+      bool dominated = false;
+      for (std::size_t spot = 0; spot < spot_count; ++spot) {
+        if ((mask & (std::size_t{1} << spot)) == 0 &&
+            feasible[mask | (std::size_t{1} << spot)]) {
+          dominated = true;
+          break;
+        }
+      }
+      if (!dominated) maximal_columns[agent].push_back(index);
+    }
+  }
+  auto add_mask = [&](std::uint64_t state, std::uint64_t mask) {
+    for (std::size_t spot = 0; spot < spot_count; ++spot) {
+      if ((mask & (std::uint64_t{1} << spot)) == 0) continue;
+      const unsigned shift = static_cast<unsigned>(4 * spot);
+      const int count = static_cast<int>((state >> shift) & 0xfU);
+      if (count < config.spots[spot].stocks) {
+        state += std::uint64_t{1} << shift;
+      }
+    }
+    return state;
+  };
+  auto master_value = [&](std::uint64_t state) {
+    std::set<int> daily;
+    std::set<int> distinct = known_brands;
+    int servings = 0;
+    for (std::size_t spot = 0; spot < spot_count; ++spot) {
+      const unsigned shift = static_cast<unsigned>(4 * spot);
+      const int count = static_cast<int>((state >> shift) & 0xfU);
+      servings += count;
+      if (count > 0) {
+        daily.insert(config.spots[spot].brand);
+        distinct.insert(config.spots[spot].brand);
+      }
+    }
+    return std::tuple{static_cast<int>(distinct.size()),
+                      static_cast<int>(daily.size()), servings};
+  };
+  std::vector<std::uint64_t> master_states{0};
+  std::vector<std::unordered_map<std::uint64_t, MasterParent>> master_parents;
+  const std::int64_t transition_budget =
+      std::max<std::int64_t>(100'000, node_budget * 250'000);
+  std::int64_t transitions = 0;
+  bool master_complete = true;
+  for (std::size_t depth = 0; depth < patrols.size(); ++depth) {
+    const std::size_t agent = patrols[depth];
+    std::unordered_map<std::uint64_t, MasterParent> next;
+    next.reserve(master_states.size() * 2);
+    for (const std::uint64_t state : master_states) {
+      for (std::size_t column : maximal_columns[agent]) {
+        if (++transitions > transition_budget ||
+            (deadline && (transitions & 4095) == 0 &&
+             std::chrono::steady_clock::now() >= *deadline)) {
+          master_complete = false;
+          break;
+        }
+        const std::uint64_t candidate =
+            add_mask(state, columns[agent][column].mask);
+        next.try_emplace(candidate, MasterParent{state, column});
+      }
+      if (!master_complete) break;
+    }
+    if (!master_complete || next.empty()) {
+      master_complete = false;
+      break;
+    }
+    master_states.clear();
+    master_states.reserve(next.size());
+    for (const auto& [state, parent] : next) {
+      (void)parent;
+      master_states.push_back(state);
+    }
+    master_parents.push_back(std::move(next));
+  }
+  if (master_complete) {
+    auto best_state = master_states.front();
+    route_upper = master_value(best_state);
+    for (const std::uint64_t state : master_states) {
+      const auto value = master_value(state);
+      if (value > route_upper) {
+        best_state = state;
+        route_upper = value;
+      }
+    }
+    if (route_upper <= alns_official_value(result.value) &&
+        !return_master_tie) {
+      result.complete = true;
+      return result;
+    }
+    std::vector<const ExactRouteColumn*> master_selected(types.size(), nullptr);
+    std::uint64_t state = best_state;
+    for (std::size_t depth = patrols.size(); depth > 0; --depth) {
+      const auto& parent = master_parents[depth - 1].at(state);
+      const std::size_t agent = patrols[depth - 1];
+      master_selected[agent] = &columns[agent][parent.column];
+      state = parent.previous;
+    }
+    LnsSkeleton master_skeleton;
+    master_skeleton.routes.resize(types.size());
+    for (std::size_t agent : patrols) {
+      master_skeleton.routes[agent] = master_selected[agent]->route;
+    }
+    auto plan = decode_lns_skeleton(config, day, types, graph, meeting_cache,
+                                    master_skeleton);
+    if (plan) {
+      auto evaluation = evaluate_candidate(config, day, history, *plan);
+      if (evaluation &&
+          (alns_official_value(evaluation->value) >
+               alns_official_value(result.value) ||
+           (return_master_tie &&
+            alns_official_value(evaluation->value) ==
+                alns_official_value(result.value)))) {
+        result.plan = std::move(*plan);
+        result.value = evaluation->value;
+      }
+      if (alns_official_value(result.value) == route_upper) {
+        result.complete = true;
+        return result;
+      }
+    }
+  }
   bool stopped = false;
   bool optimum_reached =
-      alns_official_value(result.value) == absolute_upper;
+      alns_official_value(result.value) == route_upper;
   std::vector<int> collected(spot_count);
   std::vector<const ExactRouteColumn*> selected(types.size(), nullptr);
 
@@ -3227,7 +3371,7 @@ ExactDayResult exact_route_search(
       }
       result.plan = std::move(*plan);
       result.value = evaluation->value;
-      optimum_reached = alns_official_value(result.value) == absolute_upper;
+      optimum_reached = alns_official_value(result.value) == route_upper;
       return;
     }
     const std::size_t agent = patrols[depth];
@@ -3455,7 +3599,8 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
                            const PolicyHistory& history,
                            const AgentTypes& types,
                            const SearchLimits& limits,
-                           unsigned features) {
+                           unsigned features,
+                           bool allow_continuation = true) {
   const auto started = std::chrono::steady_clock::now();
   const bool timed = limits.time_limit_ms >= 0;
   const auto deadline =
@@ -3526,17 +3671,53 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
   ActionPlan best = seeds.front();
   CandidateEvaluation best_evaluation = *seed_evaluations.front();
   CandidateValue best_value = best_evaluation.value;
+  const auto own_traffic_history =
+      config.players == 1
+          ? reconstruct_own_traffic(config, types, history)
+          : std::vector<std::map<int, int>>{};
   auto congestion_value = [&](const CandidateEvaluation& evaluation) {
     // The live single-team practice game derives future traffic entirely from
     // our own actions. Multi-team benchmark matches include external traffic,
     // so self-congestion is not a reliable tie-break there.
-    if (config.players != 1) return std::tuple{0, 0, 0, 0};
+    if (config.players != 1) return std::tuple{0, 0, 0, 0, 0, 0};
+    const bool exact_rolling_day =
+        day.day + 2 == static_cast<int>(config.day_steps.size());
+    if (!exact_rolling_day) {
+      int jammed_pressure = 0;
+      int busy_pressure = 0;
+      int squared_traffic = 0;
+      int total_traffic = 0;
+      for (const auto& [pos, traffic] : evaluation.road_traffic) {
+        (void)pos;
+        jammed_pressure +=
+            std::max(0, traffic - config.jammed_threshold + 1);
+        busy_pressure +=
+            std::max(0, traffic - config.busy_threshold + 1);
+        squared_traffic += traffic * traffic;
+        total_traffic += traffic;
+      }
+      return std::tuple{-jammed_pressure, -busy_pressure, -squared_traffic,
+                        -total_traffic, 0, 0};
+    }
+    const std::map<int, int>* previous =
+        own_traffic_history.empty() ? nullptr : &own_traffic_history.back();
+    int jammed_roads = 0;
+    int busy_roads = 0;
     int jammed_pressure = 0;
     int busy_pressure = 0;
     int squared_traffic = 0;
     int total_traffic = 0;
-    for (const auto& [pos, traffic] : evaluation.road_traffic) {
-      (void)pos;
+    for (int pos = 0; pos < config.width * config.height; ++pos) {
+      if (config.cells[pos] != Terrain::Road) continue;
+      const int current = evaluation.road_traffic.contains(pos)
+                              ? evaluation.road_traffic.at(pos)
+                              : 0;
+      const int prior = previous && previous->contains(pos)
+                            ? previous->at(pos)
+                            : 0;
+      const int traffic = current + prior;
+      jammed_roads += traffic >= config.jammed_threshold;
+      busy_roads += traffic >= config.busy_threshold;
       jammed_pressure +=
           std::max(0, traffic - config.jammed_threshold + 1);
       busy_pressure +=
@@ -3544,8 +3725,8 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
       squared_traffic += traffic * traffic;
       total_traffic += traffic;
     }
-    return std::tuple{-jammed_pressure, -busy_pressure, -squared_traffic,
-                      -total_traffic};
+    return std::tuple{-jammed_roads, -busy_roads, -jammed_pressure,
+                      -busy_pressure, -squared_traffic, -total_traffic};
   };
   auto online_improves = [&](const CandidateEvaluation& candidate,
                              const CandidateEvaluation& incumbent) {
@@ -3737,7 +3918,9 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
   // Keep a bounded exact reserve while allowing the stochastic search to grow
   // with the requested budget.
   const int exact_reserve =
-      exact_requested && !timed ? std::min(2048, maximum / 4) : 0;
+      exact_requested && !timed
+          ? (final_day ? maximum / 2 : std::min(2048, maximum / 4))
+          : 0;
   const int alns_maximum = std::max(0, maximum - exact_reserve);
   const int diversify_after =
       limits.stagnation_iterations > 0
@@ -3944,14 +4127,154 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
       break;
     }
   }
+  if (allow_continuation && config.players == 1 &&
+      day.day + 2 == static_cast<int>(config.day_steps.size()) &&
+      (!timed || std::chrono::steady_clock::now() < deadline) &&
+      elite.size() > 1) {
+    SearchLimits projection_limits = limits;
+    projection_limits.time_limit_ms = -1;
+    projection_limits.min_iterations = 64;
+    projection_limits.max_iterations = 64;
+    projection_limits.stagnation_iterations = 64;
+    struct ContinuationProjection {
+      std::tuple<int, int, int> match;
+      int ending_fuel{};
+    };
+    const auto& prior_traffic = own_traffic_history;
+    auto project_remaining_match = [&](const ActionPlan& current_plan,
+                                       const CandidateEvaluation& current_eval)
+        -> std::optional<ContinuationProjection> {
+      auto traffic_history = prior_traffic;
+      traffic_history.push_back(current_eval.road_traffic);
+      PolicyHistory next_history = history;
+      next_history.submitted_actions.push_back(current_plan);
+      for (const auto& acquisition : current_eval.trace.acquisitions) {
+        if (const Spot* spot = spot_at(config, acquisition.spot_pos)) {
+          next_history.distinct_brands.insert(spot->brand);
+        }
+      }
+      std::vector<int> positions = current_eval.ending_positions;
+      std::vector<int> fuel = current_eval.ending_fuel;
+      int cumulative_daily = std::get<1>(current_eval.value);
+      int servings = std::get<2>(current_eval.value);
+      int distinct = std::get<0>(current_eval.value);
+      for (int next_day = day.day + 1;
+           next_day < static_cast<int>(config.day_steps.size()); ++next_day) {
+        DayInfo next;
+        next.day = next_day;
+        for (std::size_t agent = 0; agent < types.size(); ++agent) {
+          next.agents.push_back(
+              {types[agent], positions[agent], fuel[agent]});
+        }
+        next.traffics = road_status_for_day(config, traffic_history, 1);
+        auto projected_plan = build_alns_plan(
+            config, next, next_history, types, projection_limits, features,
+            false);
+        auto evaluation =
+            evaluate_candidate(config, next, next_history, projected_plan);
+        if (!evaluation) return std::nullopt;
+        distinct = std::get<0>(evaluation->value);
+        cumulative_daily += std::get<1>(evaluation->value);
+        servings += std::get<2>(evaluation->value);
+        positions = evaluation->ending_positions;
+        fuel = evaluation->ending_fuel;
+        traffic_history.push_back(evaluation->road_traffic);
+        next_history.submitted_actions.push_back(projected_plan);
+        for (const auto& acquisition : evaluation->trace.acquisitions) {
+          if (const Spot* spot = spot_at(config, acquisition.spot_pos)) {
+            next_history.distinct_brands.insert(spot->brand);
+          }
+        }
+      }
+      int ending_fuel = 0;
+      for (std::size_t agent = 0; agent < types.size(); ++agent) {
+        if (types[agent] == AgentKind::Patrol) ending_fuel += fuel[agent];
+      }
+      return ContinuationProjection{
+          {distinct, cumulative_daily, servings}, ending_fuel};
+    };
+    auto continuation_rank = [&](const CandidateEvaluation& current_eval,
+                                 const ContinuationProjection& projection) {
+      return std::tuple{projection.match, projection.ending_fuel,
+                        alns_official_value(current_eval.value),
+                        congestion_value(current_eval), current_eval.workload,
+                        std::get<3>(current_eval.value)};
+    };
+    auto best_projection = project_remaining_match(best, best_evaluation);
+    if (best_projection) {
+      auto best_rank =
+          continuation_rank(best_evaluation, *best_projection);
+      for (const auto& candidate : elite) {
+        if (timed && std::chrono::steady_clock::now() >= deadline) break;
+        auto projection =
+            project_remaining_match(candidate.plan, candidate.evaluation);
+        if (!projection) continue;
+        const auto rank =
+            continuation_rank(candidate.evaluation, *projection);
+        if (rank > best_rank) {
+          best = candidate.plan;
+          best_value = candidate.value;
+          best_evaluation = candidate.evaluation;
+          best_projection = std::move(projection);
+          best_rank = rank;
+        }
+      }
+      auto consider_continuation = [&](const ActionPlan& candidate_plan) {
+        if (timed && std::chrono::steady_clock::now() >= deadline) return;
+        auto evaluation =
+            evaluate_candidate(config, day, history, candidate_plan);
+        if (!evaluation) return;
+        auto projection =
+            project_remaining_match(candidate_plan, *evaluation);
+        if (!projection) return;
+        const auto rank = continuation_rank(*evaluation, *projection);
+        if (rank > best_rank) {
+          best = candidate_plan;
+          best_value = evaluation->value;
+          best_evaluation = std::move(*evaluation);
+          best_projection = std::move(projection);
+          best_rank = rank;
+        }
+      };
+      const std::optional<std::chrono::steady_clock::time_point>
+          continuation_deadline =
+              timed ? std::optional<std::chrono::steady_clock::time_point>(
+                          deadline)
+                    : std::nullopt;
+      auto exact_tie = exact_route_search(
+          config, day, history, types, graph, meeting_cache, best,
+          best_evaluation, 32, continuation_deadline, true);
+      consider_continuation(exact_tie.plan);
+    }
+  }
   if (exact_requested &&
       (!timed || std::chrono::steady_clock::now() < deadline)) {
-    const std::int64_t exact_budget =
+    std::int64_t exact_budget =
         std::max<std::int64_t>(0, static_cast<std::int64_t>(maximum) -
                                      iterations_executed);
     const std::optional<std::chrono::steady_clock::time_point> exact_deadline =
         timed ? std::optional<std::chrono::steady_clock::time_point>(deadline)
               : std::nullopt;
+    if (day.day + 1 == static_cast<int>(config.day_steps.size()) &&
+        exact_budget > 0) {
+      auto route_exact = exact_route_search(
+          config, day, history, types, graph, meeting_cache, best,
+          best_evaluation, exact_budget, exact_deadline);
+      exact_budget = route_exact.complete
+                         ? 0
+                         : std::max<std::int64_t>(
+                               0, exact_budget - route_exact.explored_nodes);
+      if (!validate_action_plan(config, day, route_exact.plan)) {
+        auto route_evaluation =
+            evaluate_candidate(config, day, history, route_exact.plan);
+        if (route_evaluation &&
+            online_improves(*route_evaluation, best_evaluation)) {
+          best = std::move(route_exact.plan);
+          best_value = route_exact.value;
+          best_evaluation = std::move(*route_evaluation);
+        }
+      }
+    }
     auto exact = exact_day_search(config, day, history, types, best, best_value,
                                   exact_budget, exact_deadline, features);
     if (!validate_action_plan(config, day, exact.plan)) {
