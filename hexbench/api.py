@@ -244,11 +244,18 @@ def fetch_game_snapshot(
         board = client.get("/game/board", game_id)
         resolved_id = str(board.get("game_id", game_id))
         config = client.get("/game/config", resolved_id)
-        state = client.get("/game/state", resolved_id)
-        day: dict[str, Any] | None = None
-        if state.get("status") == "in_progress":
-            day = client.get("/game/day", resolved_id)
-        return {
+        competitive_state: dict[str, Any] | None = None
+        if board.get("is_practice") and board.get("no_reset"):
+            competitive_state = client.get("/game/competitive/state", game_id)
+            state, day = normalize_competitive_state(competitive_state, config)
+        else:
+            state = client.get("/game/state", resolved_id)
+            day = (
+                client.get("/game/day", resolved_id)
+                if state.get("status") == "in_progress"
+                else None
+            )
+        snapshot = {
             "requested_game_id": game_id,
             "game_id": resolved_id,
             "board": board,
@@ -257,8 +264,67 @@ def fetch_game_snapshot(
             "day": day,
             "fetched_at": datetime.now(UTC).isoformat(),
         }
+        if competitive_state is not None:
+            snapshot["competitive_state"] = competitive_state
+        return snapshot
     finally:
         client.close()
+
+
+def normalize_competitive_state(
+    payload: dict[str, Any], config: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Translate the competitive-practice API into the planner's state/day schema."""
+    if payload.get("selecting"):
+        day_count = len(config.get("daySteps", []))
+        open_day = int(payload.get("open_day", -1))
+        owner_by_day = payload.get("standings", {}).get("owner_by_day", {})
+        if day_count > 0 and open_day >= day_count and owner_by_day:
+            return {
+                "status": "reset_incomplete",
+                "day": open_day,
+                "error": (
+                    "competitive reset cleared agent types and scores but did "
+                    f"not clear day ownership (open_day={open_day}, "
+                    f"configured_days={day_count})"
+                ),
+            }, None
+        return {"status": "selecting_agents", "day": -1}, None
+
+    open_day = payload.get("open")
+    if not isinstance(open_day, dict):
+        return {
+            "status": "finished",
+            "day": len(config.get("daySteps", [])),
+        }, None
+
+    day_index = int(open_day["day"])
+    road_condition = open_day.get("road_condition", {})
+    agents = [
+        {
+            "kind": int(agent["kind"]),
+            "pos": int(agent["pos"]),
+            "fuel": agent.get("fuel"),
+        }
+        for agent in open_day.get("agents", [])
+    ]
+    steps = open_day.get("steps")
+    if steps is None:
+        steps = config["daySteps"][day_index]
+    day = {
+        "day": day_index,
+        "steps": int(steps),
+        "agents": agents,
+        "others": [],
+        "traffics": [
+            {"pos": int(pos), "status": int(status)}
+            for pos, status in road_condition.items()
+        ],
+        # Competitive-practice days are operator-driven and have no enforced
+        # per-request cutoff even when the original display schedule is old.
+        "endsAt": None,
+    }
+    return {"status": "in_progress", "day": day_index}, day
 
 
 def _state_path(state_dir: Path, game_id: str) -> Path:

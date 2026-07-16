@@ -52,17 +52,29 @@ def test_no_reset_practice_competition_requires_day_approval(
         def get(self, path: str, game_id: str):
             if path == "/game/config":
                 return config
-            if path == "/game/state":
-                # The real practice server can advance beyond the configured
-                # days without changing its textual status to ``finished``.
-                return {"status": "in_progress", "day": 1} if self.finished else {
-                    "status": "in_progress",
-                    "day": 0,
+            if path == "/game/competitive/state":
+                if self.finished:
+                    return {
+                        "selecting": False,
+                        "open": None,
+                        "standings": {
+                            "ranking": ["13"],
+                            "timeline": {"distinct_types": 1},
+                        },
+                    }
+                return {
+                    "selecting": False,
+                    "open": {
+                        "day": 0,
+                        "steps": 4,
+                        "agents": [{"kind": 0, "pos": 0, "fuel": 10}],
+                        "road_condition": {},
+                    },
+                    "standings": {
+                        "ranking": ["13"],
+                        "timeline": {"distinct_types": 0},
+                    },
                 }
-            if path == "/game/day":
-                return day
-            if path == "/game/practice/score":
-                return {"detail": {"13": {"distinct_types": 1}}}
             raise AssertionError(path)
 
         def post(self, path: str, payload: dict):
@@ -145,7 +157,7 @@ def test_no_reset_practice_competition_requires_day_approval(
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline and not FakeClient.posts:
             time.sleep(0.01)
-        assert FakeClient.posts[0][0] == "/game/practice/actions"
+        assert FakeClient.posts[0][0] == "/game/competitive/actions"
         assert all(path != "/game/practice/reset" for path, _ in FakeClient.posts)
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
@@ -155,9 +167,7 @@ def test_no_reset_practice_competition_requires_day_approval(
                 break
             time.sleep(0.01)
         assert current["state"] == "finished"
-        assert current["result"] == {
-            "detail": {"13": {"distinct_types": 1}}
-        }
+        assert current["result"]["standings"]["timeline"]["distinct_types"] == 1
         waiting_events = [
             event
             for event in current["events"]

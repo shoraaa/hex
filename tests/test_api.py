@@ -80,6 +80,94 @@ def test_hyperparameters_are_validated_per_selected_method() -> None:
         )
 
 
+def test_no_reset_competition_snapshot_uses_competitive_state(monkeypatch) -> None:
+    calls: list[tuple[str, str]] = []
+    config = {
+        "daySteps": [4],
+        "daySeconds": [60],
+        "agents": [0],
+    }
+
+    class FakeClient:
+        def __init__(self, token: str, base_url: str):
+            pass
+
+        def get(self, path: str, game_id: str):
+            calls.append((path, game_id))
+            if path == "/game/board":
+                return {
+                    "game_id": "practice-comp:13",
+                    "is_practice": True,
+                    "no_reset": True,
+                }
+            if path == "/game/config":
+                return config
+            if path == "/game/competitive/state":
+                return {
+                    "selecting": True,
+                    "canonical_types": None,
+                    "standings": {"timeline": {"total_servings": 0}},
+                }
+            raise AssertionError(path)
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(api, "GameClient", FakeClient)
+    snapshot = api.fetch_game_snapshot("token", "practice-comp")
+
+    assert snapshot["state"] == {"status": "selecting_agents", "day": -1}
+    assert snapshot["day"] is None
+    assert snapshot["competitive_state"]["selecting"] is True
+    assert ("/game/competitive/state", "practice-comp") in calls
+    assert not any(path in {"/game/state", "/game/day"} for path, _ in calls)
+
+
+def test_competitive_open_day_is_normalized_for_the_planner() -> None:
+    config = {"daySteps": [4], "daySeconds": [60], "agents": [0]}
+    state, day = api.normalize_competitive_state(
+        {
+            "selecting": False,
+            "open": {
+                "day": 0,
+                "steps": 4,
+                "agents": [{"kind": 0, "pos": 2, "fuel": 9}],
+                "road_condition": {"1": 2},
+            },
+        },
+        config,
+    )
+
+    assert state == {"status": "in_progress", "day": 0}
+    assert day == {
+        "day": 0,
+        "steps": 4,
+        "agents": [{"kind": 0, "pos": 2, "fuel": 9}],
+        "others": [],
+        "traffics": [{"pos": 1, "status": 2}],
+        "endsAt": None,
+    }
+
+
+def test_incomplete_competitive_reset_is_not_treated_as_agent_selection() -> None:
+    state, day = api.normalize_competitive_state(
+        {
+            "selecting": True,
+            "canonical_types": None,
+            "open_day": 5,
+            "standings": {
+                "owned_days": {"13": 5},
+                "owner_by_day": {str(day): "13" for day in range(5)},
+                "timeline": {"distinct_types": 0, "total_servings": 0},
+            },
+        },
+        {"daySteps": [1, 1, 1, 1, 1]},
+    )
+
+    assert state["status"] == "reset_incomplete"
+    assert state["day"] == 5
+    assert "did not clear day ownership" in state["error"]
+    assert day is None
 def test_search_hyperparameter_metadata_guides_the_dashboard() -> None:
     alns_iterations = next(
         field

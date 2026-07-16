@@ -313,6 +313,17 @@ def test_dashboard_parameter_ui_has_prefills_sliders_and_preview() -> None:
     assert "data-parameter-clear" in script
 
 
+def test_competition_refresh_clears_historical_session_ui_and_stale_polls() -> None:
+    script = (web.STATIC_ROOT / "app.js").read_text()
+
+    assert "resetCompetitionView" in script
+    assert "renderCompetitionSnapshot" in script
+    assert "competitionPollGeneration" in script
+    assert "generation !== state.competitionPollGeneration" in script
+    assert "Server reset incomplete" in script
+    assert 'status === "reset_incomplete"' in script
+
+
 def test_dashboard_policy_list_includes_aco() -> None:
     assert "aco" in web.POLICIES
     assert "aco_ls" in web.POLICIES

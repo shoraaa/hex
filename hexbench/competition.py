@@ -24,6 +24,7 @@ from .api import (
     discover_assigned_games,
     fetch_game_snapshot,
     load_token,
+    normalize_competitive_state,
     normalize_hyperparameters,
     planning_budget,
     trace_action_plan,
@@ -166,6 +167,8 @@ class CompetitionSessionManager:
         board = snapshot.get("board", {})
         if not board.get("game_id"):
             raise ValueError("game snapshot did not contain a canonical id")
+        if snapshot.get("state", {}).get("status") == "reset_incomplete":
+            raise ValueError(str(snapshot["state"].get("error")))
         descriptor = next(
             (row for row in discover_assigned_games(token, self.base_url)
              if row["question_id"] == game_id),
@@ -471,8 +474,18 @@ class CompetitionSessionManager:
             token = load_token(self.env_path)
             client = GameClient(token, self.base_url)
             resolved_id = session["game_id"]
+            competitive_practice = bool(
+                session.get("game", {}).get("is_practice")
+                and session.get("game", {}).get("no_reset")
+            )
+            api_game_id = (
+                str(session.get("requested_game_id") or resolved_id)
+                if competitive_practice
+                else resolved_id
+            )
             config = client.get("/game/config", resolved_id)
             state_path, journal = self._journal(resolved_id)
+            competitive_selection_initialized = False
             while not self._closed:
                 current = self.get_session(session_id)
                 if current is None or current.get("state") in {"cancelled", "finished", "failed"}:
@@ -481,26 +494,49 @@ class CompetitionSessionManager:
                     self._update(session_id, state="paused")
                     self._wait(session_id, 2.0)
                     continue
-                status = client.get("/game/state", resolved_id)
+                competitive_state: dict[str, Any] | None = None
+                day: dict[str, Any] | None = None
+                if competitive_practice:
+                    competitive_state = client.get(
+                        "/game/competitive/state", api_game_id
+                    )
+                    status, day = normalize_competitive_state(
+                        competitive_state, config
+                    )
+                else:
+                    status = client.get("/game/state", resolved_id)
                 current_snapshot = {
                     "requested_game_id": current.get("requested_game_id"),
                     "game_id": resolved_id,
                     "board": current.get("snapshot", {}).get("board", {}),
                     "config": config,
                     "state": status,
-                    "day": None,
+                    "day": day,
                     "fetched_at": _now(),
                 }
+                if competitive_state is not None:
+                    current_snapshot["competitive_state"] = competitive_state
                 self._update(session_id, snapshot=current_snapshot)
+                if status.get("status") == "reset_incomplete":
+                    raise RuntimeError(str(status.get("error")))
                 day_count = len(config.get("daySteps", []))
                 day_index = int(status.get("day", 0))
                 terminal_status = status.get("status") == "finished"
-                terminal_day = (
+                terminal_day = not competitive_practice and (
                     status.get("status") == "in_progress"
                     and day_count > 0
                     and day_index >= day_count
                 )
                 if terminal_status or terminal_day:
+                    if competitive_practice:
+                        result = competitive_state
+                        self._update(
+                            session_id,
+                            state="finished",
+                            result=result,
+                            progress={"status": "finished"},
+                        )
+                        return
                     endpoint = (
                         "/game/practice/score"
                         if current["game"].get("is_practice")
@@ -526,6 +562,23 @@ class CompetitionSessionManager:
                     )
                     return
                 if status.get("status") == "selecting_agents":
+                    if competitive_practice and not competitive_selection_initialized:
+                        competitive_selection_initialized = True
+                        if any(
+                            (
+                                journal.get("types"),
+                                journal.get("submitted_days"),
+                                journal.get("day_snapshots"),
+                                journal.get("distinct_brands"),
+                            )
+                        ):
+                            journal = {
+                                "types": None,
+                                "submitted_days": {},
+                                "day_snapshots": {},
+                                "distinct_brands": [],
+                            }
+                            _write_json(state_path, journal)
                     if current.get("state") == "awaiting_role_approval" and current.get("approval"):
                         proposal = current.get("proposal") or {}
                         approval = current.get("approval")
@@ -533,7 +586,7 @@ class CompetitionSessionManager:
                             raise RuntimeError("role approval fingerprint mismatch")
                         client.post(
                             "/game/agent-types",
-                            {"game_id": resolved_id, "types": proposal.get("types", [])},
+                            {"game_id": api_game_id, "types": proposal.get("types", [])},
                         )
                         journal["types"] = proposal.get("types", [])
                         _write_json(state_path, journal)
@@ -587,9 +640,10 @@ class CompetitionSessionManager:
                     self._update(session_id, state="waiting_for_day", progress={"status": "submitted", "day": day_index})
                     self._wait(session_id, self.poll_interval)
                     continue
-                day = client.get("/game/day", resolved_id)
-                current_snapshot["day"] = day
-                self._update(session_id, snapshot=current_snapshot)
+                if day is None:
+                    day = client.get("/game/day", resolved_id)
+                    current_snapshot["day"] = day
+                    self._update(session_id, snapshot=current_snapshot)
                 if current.get("state") != "awaiting_plan_approval" or not current.get("proposal"):
                     proposal = self._build_proposal(current, config, day, journal)
                     self._update(
@@ -616,8 +670,16 @@ class CompetitionSessionManager:
                     continue
                 proposal = current["proposal"]
                 self._update(session_id, state="submitting", progress={"status": "submitting", "day": day_index})
-                endpoint = "/game/practice/actions" if current["game"].get("is_practice") else "/game/actions"
-                response = client.post(endpoint, {"game_id": resolved_id, "day": day_index, "actions": proposal["actions"]})
+                endpoint = (
+                    "/game/competitive/actions"
+                    if competitive_practice
+                    else (
+                        "/game/practice/actions"
+                        if current["game"].get("is_practice")
+                        else "/game/actions"
+                    )
+                )
+                response = client.post(endpoint, {"game_id": api_game_id, "day": day_index, "actions": proposal["actions"]})
                 journal["submitted_days"][key] = proposal["actions"]
                 journal["day_snapshots"][key] = {
                     "day_info": day,
