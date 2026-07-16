@@ -309,6 +309,88 @@ def test_q01_online_alns_uses_the_protected_aco_ls_type_assignment() -> None:
     assert alns_types == aco_types
 
 
+def test_q01_alns_seed_ignores_refuel_agent_fuel() -> None:
+    scenario_path = (
+        Path(__file__).resolve().parents[1]
+        / "reports/fuel-stress-current/cases"
+        / "d2d87157-9158-484f-be37-814a0cf44524-server.json"
+    )
+    config = json.loads(scenario_path.read_text())["config"]
+    types = [0, 0, 1, 0]
+    roads = [
+        {"pos": row * config["map"]["width"] + column, "status": 0}
+        for row, cells in enumerate(config["map"]["cells"])
+        for column, terrain in enumerate(cells)
+        if terrain == 1
+    ]
+    day_info = {
+        "day": 0,
+        "agents": [
+            {"kind": kind, "pos": pos, "fuel": config["fuelLimits"]}
+            for kind, pos in zip(types, config["agents"], strict=True)
+        ],
+        "others": [],
+        "traffics": roads,
+    }
+    search = {
+        "minIterations": 96,
+        "maxIterations": 96,
+        "stagnationIterations": 96,
+    }
+    payload = {
+        "config": config,
+        "day_info": day_info,
+        "history": {},
+        "types": types,
+        "search": search,
+    }
+    binary = find_binary()
+    local_plan = run_core("plan", "alns", payload, binary=binary)
+    payload["day_info"]["agents"][2]["fuel"] = 0
+    online_plan = run_core("plan", "alns", payload, binary=binary)
+    assert online_plan == local_plan
+
+
+def test_q01_alns_fixed_2048_preserves_saved_online_serving_target() -> None:
+    scenario_path = (
+        Path(__file__).resolve().parents[1]
+        / "reports/fuel-stress-current/cases"
+        / "d2d87157-9158-484f-be37-814a0cf44524-server.json"
+    )
+    scenario = json.loads(scenario_path.read_text())
+    scenario["hyperparameters"] = {
+        "min_iterations": 2048,
+        "max_iterations": 2048,
+        "stagnation_iterations": 2048,
+    }
+    result = run_core("eval", "alns", scenario, binary=find_binary())
+    assert result["score"] == {
+        "distinct_types": 4,
+        "cumulative_daily_types": 28,
+        "total_servings": 126,
+    }
+
+
+def test_new_question_alns_reaches_the_online_219_serving_baseline() -> None:
+    scenario_path = (
+        Path(__file__).resolve().parents[1]
+        / "reports/fuel-stress-current/cases"
+        / "52962f8f-4ac3-4587-9493-9c45ae947243-server.json"
+    )
+    scenario = json.loads(scenario_path.read_text())
+    scenario["hyperparameters"] = {
+        "min_iterations": 2048,
+        "max_iterations": 2048,
+        "stagnation_iterations": 2048,
+    }
+    result = run_core("eval", "alns", scenario, binary=find_binary())
+    assert result["score"] == {
+        "distinct_types": 5,
+        "cumulative_daily_types": 35,
+        "total_servings": 219,
+    }
+
+
 def test_all_planners_accept_published_future_day_lengths() -> None:
     scenario_path = (
         Path(__file__).resolve().parents[1]

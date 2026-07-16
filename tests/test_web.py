@@ -28,7 +28,7 @@ def test_dashboard_job_benchmarks_selected_policies(monkeypatch, tmp_path: Path)
         assert kwargs["peer_team_ids"] == ["13", "18"]
         assert kwargs["hyperparameters"] == {
             "greedy": {"max_targets": 3},
-            "alns": {"fixed_iterations": 3_072},
+            "alns": {"fixed_iterations": 2_048},
         }
         progress({"policy": "greedy", "status": "finished"})
         return {
@@ -301,6 +301,16 @@ def test_dashboard_page_has_selection_and_result_regions() -> None:
     assert 'id="competition-map"' in web.DASHBOARD_HTML
     assert 'id="approve-proposal"' in web.DASHBOARD_HTML
     assert '<script type="module" src="/assets/app.js"></script>' in web.DASHBOARD_HTML
+
+
+def test_dashboard_parameter_ui_has_prefills_sliders_and_preview() -> None:
+    script = (web.STATIC_ROOT / "app.js").read_text()
+
+    assert "ensureParameterValues" in script
+    assert 'class="parameter-slider"' in script
+    assert 'data-parameter-preview=' in script
+    assert "data-parameter-recommended" in script
+    assert "data-parameter-clear" in script
 
 
 def test_dashboard_policy_list_includes_aco() -> None:

@@ -126,7 +126,8 @@ the four maps; `rank-1` counts official-score wins, including ties.
 | `aco` | 7.25 | 35.75 | 150.25 | 4.14 | 1 |
 | `aco_ls` | 7.25 | 35.75 | 151.25 | 3.65 | 2 |
 
-On Q01, the fixed online ALNS ties ACO+LS at `4/28/124`; on Q02 all four
+On Q01, congestion-aware ALNS with 1,024 fixed iterations reaches
+`4/28/126`, ahead of the saved ACO+LS result `4/28/124`; on Q02 all four
 search policies reach `10/40/132`; on Q03 ALNS/LNS reach `10/40/136`; and on
 New Question ALNS/LNS reach `5/35/216`.
 

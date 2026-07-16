@@ -76,6 +76,23 @@ def test_hyperparameters_are_validated_per_selected_method() -> None:
         )
 
 
+def test_search_hyperparameter_metadata_guides_the_dashboard() -> None:
+    fixed_iterations = next(
+        field
+        for field in api.POLICY_HYPERPARAMETERS["alns"]
+        if field["key"] == "fixed_iterations"
+    )
+
+    assert fixed_iterations["recommended"] == 2_048
+    assert fixed_iterations["ui_max"] == 12_000
+    assert [preset["value"] for preset in fixed_iterations["presets"]] == [
+        256,
+        1_024,
+        2_048,
+        6_000,
+    ]
+
+
 def test_fuel_stress_variants_preserve_authoritative_config_except_fuel() -> None:
     config = generate_scenario(17, "medium", "small", "single")["config"]
     config["fuelLimits"] = 2 * config["daySteps"][0]

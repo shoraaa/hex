@@ -40,10 +40,10 @@ POLICIES = (
     "aco",
     "aco_ls",
 )
-# Selected by the deterministic ALNS quality sweep in
-# reports/alns-quality-tuning-{refined,high,deep}.  Larger budgets spend more
-# time proving a single day's score but can leave a worse continuation state.
-PRACTICE_BENCHMARK_DEFAULT_ITERATIONS = 3_072
+# The post-stagnation sweep preserves Q01's 4/28/126 and improves New Question
+# from 218 to 219 at 2,048 iterations. Match-level quality remains non-monotone
+# because same-day ties can produce different continuation states.
+PRACTICE_BENCHMARK_DEFAULT_ITERATIONS = 2_048
 
 
 def _now() -> str:

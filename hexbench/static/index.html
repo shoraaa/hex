@@ -48,7 +48,7 @@
             <label class="field-title" for="game">Map</label><select id="game" disabled></select>
             <div class="field-title split-title"><span>Policies</span><button id="select-defaults" class="text-button">Recommended</button></div>
             <div id="policies" class="policy-grid"></div>
-            <div class="field-title">Per-policy controls</div><div id="hyperparameters" class="parameter-stack"><p class="muted">Select a policy to configure optional controls.</p></div>
+            <div class="field-title">Per-policy controls</div><p class="help">Quality-tuned values are prefilled where available. Use a slider or preset, then review the effective request below.</p><div id="hyperparameters" class="parameter-stack"><p class="muted">Select a policy to configure optional controls.</p></div>
             <details class="advanced"><summary>Stress and anytime experiments</summary>
               <label class="field-title" for="fuel-multipliers">Fuel multipliers</label><input id="fuel-multipliers" class="text-input" value="1.0, 0.5, 0.25"><p class="help">The authoritative server value is included automatically.</p>
               <div class="inline-fields"><label><span>Time budgets (ms)</span><input id="time-limits" class="text-input" value="25, 100, 500, 2000, 10000"></label><label><span>Curve fuel</span><input id="time-fuel" class="text-input" type="number" min="0.01" max="3" step="0.05" value="0.5"></label></div>
@@ -65,7 +65,7 @@
           <section class="panel configure-panel"><div class="panel-heading"><div><span class="kicker">Competition control room</span><h2>Prepare the next decision</h2></div><span class="armed-note" id="approval-note">Approval required</span></div>
             <label class="field-title" for="competition-game">Match</label><select id="competition-game" disabled></select>
             <label class="field-title" for="competition-policy">Policy</label><select id="competition-policy"></select>
-            <div class="field-title">Policy controls</div><div id="competition-hyperparameters" class="parameter-stack"><p class="muted">Select a policy to expose controls.</p></div>
+            <div class="field-title">Policy controls</div><p class="help">Recommended values are prefilled where available and remain editable before starting the session.</p><div id="competition-hyperparameters" class="parameter-stack"><p class="muted">Select a policy to expose controls.</p></div>
             <div class="action-grid one"><button id="start-competition" disabled>Start supervised session</button></div>
             <div class="safety-box"><strong>Nothing submits automatically.</strong><span>Each role assignment and each day plan will be shown on the map and must be approved while its fingerprint is current.</span></div>
           </section>
