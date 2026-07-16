@@ -3,7 +3,7 @@
 The evaluator's score is lexicographic (distinct brands, daily coverage, then
 servings), so tuning must use the same ordering rather than collapsing the
 objectives into an arbitrary weighted sum.  Wall-clock limits are deliberately
-not part of this tuner: fixed iteration budgets make a tuning report
+not part of this tuner: explicit ALNS iteration counts make a tuning report
 reproducible across machines.
 """
 
@@ -29,32 +29,32 @@ from .runner import (
 
 @dataclass(frozen=True, order=True)
 class ALNSParameters:
-    """A deterministic ALNS search budget evaluated by :func:`tune_alns`."""
+    """Explicit deterministic ALNS controls evaluated by :func:`tune_alns`."""
 
-    fixed_iterations: int
+    alns_iterations: int
     min_iterations: int = 32
     stagnation_iterations: int = 0
 
     def __post_init__(self) -> None:
-        if self.fixed_iterations < 1:
-            raise ValueError("fixed_iterations must be positive")
+        if self.alns_iterations < 1:
+            raise ValueError("alns_iterations must be positive")
         if self.min_iterations < 1:
             raise ValueError("min_iterations must be positive")
-        if self.min_iterations > self.fixed_iterations:
-            raise ValueError("min_iterations cannot exceed fixed_iterations")
+        if self.min_iterations > self.alns_iterations:
+            raise ValueError("min_iterations cannot exceed alns_iterations")
         if self.stagnation_iterations < 0:
             raise ValueError("stagnation_iterations cannot be negative")
 
     def as_search(self) -> dict[str, int]:
         return {
             "minIterations": self.min_iterations,
-            "maxIterations": self.fixed_iterations,
+            "maxIterations": self.alns_iterations,
             "stagnationIterations": self.stagnation_iterations,
         }
 
     def as_dict(self) -> dict[str, int]:
         return {
-            "fixed_iterations": self.fixed_iterations,
+            "alns_iterations": self.alns_iterations,
             "min_iterations": self.min_iterations,
             "stagnation_iterations": self.stagnation_iterations,
         }
@@ -68,17 +68,17 @@ def _values(values: Iterable[int], name: str) -> tuple[int, ...]:
 
 
 def parameter_grid(
-    fixed_iterations: Iterable[int],
+    alns_iterations: Iterable[int],
     min_iterations: Iterable[int] = (32,),
     stagnation_iterations: Iterable[int] = (0,),
 ) -> list[ALNSParameters]:
-    """Build and validate the Cartesian product of the requested budgets."""
+    """Build and validate the Cartesian product of ALNS iteration counts."""
 
-    fixed = _values(fixed_iterations, "fixed_iterations")
+    iterations = _values(alns_iterations, "alns_iterations")
     minimum = _values(min_iterations, "min_iterations")
     stagnation = _values(stagnation_iterations, "stagnation_iterations")
     candidates: list[ALNSParameters] = []
-    for budget in fixed:
+    for budget in iterations:
         for lower in minimum:
             for stagnant in stagnation:
                 candidates.append(ALNSParameters(budget, lower, stagnant))
@@ -132,7 +132,7 @@ def tune_alns(
     manifest_path: Path,
     report_dir: Path,
     *,
-    fixed_iterations: Iterable[int] = (128, 256, 512, 1024, 2048, 3072, 4096, 6000),
+    alns_iterations: Iterable[int] = (128, 256, 512, 1024, 2048, 3072, 4096, 6000),
     min_iterations: Iterable[int] = (32,),
     stagnation_iterations: Iterable[int] = (0,),
     binary_path: str | None = None,
@@ -156,7 +156,7 @@ def tune_alns(
     scenarios = [
         json.loads((manifest_path.parent / case["path"]).read_text()) for case in cases
     ]
-    candidates = parameter_grid(fixed_iterations, min_iterations, stagnation_iterations)
+    candidates = parameter_grid(alns_iterations, min_iterations, stagnation_iterations)
     binary = find_binary(binary_path)
     worker_count = max(1, jobs or min(os.cpu_count() or 1, 8))
     tasks = [
@@ -239,7 +239,7 @@ def tune_alns(
         "",
         "## Best parameters",
         "",
-        f"- fixed iterations: `{best['parameters']['fixed_iterations']}`",
+        f"- ALNS iterations: `{best['parameters']['alns_iterations']}`",
         f"- minimum iterations: `{best['parameters']['min_iterations']}`",
         f"- stagnation iterations: `{best['parameters']['stagnation_iterations']}`",
         f"- mean score: `{best['mean_distinct_percent']:.3f}% / {best['mean_daily_percent']:.3f}% / {best['mean_servings_percent']:.3f}%`",
@@ -252,7 +252,7 @@ def tune_alns(
     for rank, candidate in enumerate(report["candidates"], start=1):
         parameters = candidate["parameters"]
         lines.append(
-            f"| {rank} | {parameters['fixed_iterations']} | {parameters['min_iterations']} | {parameters['stagnation_iterations']} | "
+            f"| {rank} | {parameters['alns_iterations']} | {parameters['min_iterations']} | {parameters['stagnation_iterations']} | "
             f"{candidate['mean_distinct_percent']:.3f}% | {candidate['mean_daily_percent']:.3f}% | "
             f"{candidate['mean_servings_percent']:.3f}% | {candidate['runtime_seconds']:.3f} |"
         )

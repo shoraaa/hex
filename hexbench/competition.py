@@ -368,13 +368,13 @@ class CompetitionSessionManager:
             is_practice=bool(session.get("game", {}).get("is_practice")),
             deadline_margin=2.0,
         )
-        fixed = params.get("fixed_iterations")
-        if fixed is not None:
-            fixed = int(fixed)
+        alns_iterations = params.get("alns_iterations")
+        if alns_iterations is not None:
+            alns_iterations = int(alns_iterations)
             return {
-                "minIterations": int(params.get("min_iterations", min(2048, fixed))),
-                "maxIterations": fixed,
-                "stagnationIterations": int(params.get("stagnation_iterations", fixed)),
+                "minIterations": int(params.get("min_iterations", min(2048, alns_iterations))),
+                "maxIterations": alns_iterations,
+                "stagnationIterations": int(params.get("stagnation_iterations", alns_iterations)),
             }
         return {
             "timeLimitMs": min(int(params.get("time_limit_ms", budget * 850)), max(50, int(budget * 850))),
@@ -402,7 +402,7 @@ class CompetitionSessionManager:
             "hyperparameters": {
                 key: value
                 for key, value in session.get("hyperparameters", {}).items()
-                if key != "fixed_iterations"
+                if key != "alns_iterations"
             },
         }
         fallback = False

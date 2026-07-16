@@ -272,9 +272,9 @@ void test_alns_final_day_quality_is_monotone_with_iteration_budget() {
   }
 
   hexudon::SearchLimits short_limits;
-  short_limits.min_iterations = 1;
-  short_limits.max_iterations = 1;
-  short_limits.stagnation_iterations = 1;
+  short_limits.min_iterations = 32;
+  short_limits.max_iterations = 32;
+  short_limits.stagnation_iterations = 0;
   const auto short_plan =
       hexudon::plan_day("alns", config, day, {}, types, short_limits);
   const auto short_score =
@@ -282,9 +282,9 @@ void test_alns_final_day_quality_is_monotone_with_iteration_budget() {
   assert(short_score);
 
   hexudon::SearchLimits long_limits;
-  long_limits.min_iterations = 96;
-  long_limits.max_iterations = 96;
-  long_limits.stagnation_iterations = 96;
+  long_limits.min_iterations = 32;
+  long_limits.max_iterations = 6'000;
+  long_limits.stagnation_iterations = 0;
   const auto long_plan =
       hexudon::plan_day("alns", config, day, {}, types, long_limits);
   const auto long_score = hexudon::score_action_plan(config, day, {}, long_plan);

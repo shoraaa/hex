@@ -3631,10 +3631,14 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
   }
   if (!expired() && (features & AlnsAcoSeed) != 0U &&
       (!timed || limits.time_limit_ms >= 50)) {
-    SearchLimits aco_limits;
+    SearchLimits aco_limits = limits;
     if (timed && limits.time_limit_ms < 1000) {
-      aco_limits.aco_ants = limits.time_limit_ms < 250 ? 4 : 8;
-      aco_limits.aco_iterations = limits.time_limit_ms < 250 ? 4 : 8;
+      if (aco_limits.aco_ants <= 0) {
+        aco_limits.aco_ants = limits.time_limit_ms < 250 ? 4 : 8;
+      }
+      if (aco_limits.aco_iterations <= 0) {
+        aco_limits.aco_iterations = limits.time_limit_ms < 250 ? 4 : 8;
+      }
     }
     seeds.insert(
         seeds.begin(),
@@ -3757,15 +3761,22 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
       (!timed || limits.time_limit_ms >= 250)) {
     shared_meeting_cache = build_aco_meeting_cache(graph);
     SearchLimits legacy_limits = limits;
+    // This is a diversification seed, not a second search budget.  Letting it
+    // inherit an untimed ALNS maximum made a 6,000-iteration request run 6,000
+    // legacy-LNS iterations before ALNS and changed the initial incumbent as a
+    // function of the requested depth.  Keep seed construction bounded and
+    // identical for every sufficiently large fixed budget.
+    legacy_limits.min_iterations = limits.seed_iterations;
+    legacy_limits.max_iterations = legacy_limits.min_iterations;
+    legacy_limits.stagnation_iterations =
+        limits.seed_iterations == 0
+            ? 0
+            : (limits.stagnation_iterations == 0
+                   ? 0
+                   : legacy_limits.max_iterations);
     if (timed) {
       legacy_limits.time_limit_ms =
           std::max(25, std::min(1000, limits.time_limit_ms / 5));
-      legacy_limits.min_iterations =
-          std::min(32, std::max(1, limits.min_iterations));
-      legacy_limits.max_iterations =
-          std::min(96, std::max(legacy_limits.min_iterations,
-                                limits.max_iterations));
-      legacy_limits.stagnation_iterations = legacy_limits.max_iterations;
     }
     ActionPlan legacy = build_lns_plan(config, day, history, types,
                                        legacy_limits, &graph,
@@ -3842,7 +3853,6 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
   std::sort(elite.begin(), elite.end(), elite_order);
   const std::size_t elite_limit = 12U;
   if (elite.size() > elite_limit) elite.resize(elite_limit);
-
   std::mt19937_64 random(lns_seed(config, day, history) ^ 0x414c4e53ULL);
   // Re-initialise seed travel choices with the real deterministic generator.
   for (auto& item : elite) repair_alns_travel(item.solution, 0, random);
@@ -3905,23 +3915,22 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
     }
   };
 
-  const int minimum = std::max(0, limits.min_iterations);
-  const int maximum = std::max(minimum, limits.max_iterations);
+  const int configured_alns_iterations =
+      !timed && final_day && limits.final_alns_iterations >= 0
+          ? limits.final_alns_iterations
+          : limits.max_iterations;
+  const int maximum = std::max(0, configured_alns_iterations);
+  const int minimum = std::min(std::max(0, limits.min_iterations), maximum);
+  const int configured_exact_nodes =
+      final_day && limits.final_exact_nodes >= 0
+          ? limits.final_exact_nodes
+          : limits.exact_nodes;
   const bool exact_requested =
       (features & AlnsExactCompletion) != 0U &&
-      ((!timed && maximum > 96) || timed_exact);
-  // Exact completion branches over every idle agent action at every step. A
-  // few thousand nodes are useful for closing a nearly-complete incumbent,
-  // but they are far too small to replace ALNS on a multi-agent day. The old
-  // split capped ALNS at 2,048 iterations and sent every additional iteration
-  // into that enormous tree, making larger user budgets effectively stagnant.
-  // Keep a bounded exact reserve while allowing the stochastic search to grow
-  // with the requested budget.
-  const int exact_reserve =
-      exact_requested && !timed
-          ? (final_day ? maximum / 2 : std::min(2048, maximum / 4))
-          : 0;
-  const int alns_maximum = std::max(0, maximum - exact_reserve);
+      configured_exact_nodes > 0 && ((!timed && maximum > 96) || timed_exact);
+  // ALNS iterations and exact-search nodes are independent, literal controls.
+  // Neither phase silently borrows a percentage of the other one's allowance.
+  const int alns_maximum = maximum;
   const int diversify_after =
       limits.stagnation_iterations > 0
           ? std::max(16, limits.stagnation_iterations / 2)
@@ -3934,10 +3943,8 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
   long double reheat_temperature = 0.0L;
   std::uniform_real_distribution<long double> unit(0.0L, 1.0L);
 
-  int iterations_executed = 0;
   for (int iteration = 0; iteration < alns_maximum; ++iteration) {
     if (expired()) break;
-    iterations_executed = iteration + 1;
     const int destroy_node = select_mcts_child(0);
     const int repair_node = select_mcts_child(destroy_node);
     const int travel_node = select_mcts_child(repair_node);
@@ -4136,6 +4143,10 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
     projection_limits.min_iterations = 64;
     projection_limits.max_iterations = 64;
     projection_limits.stagnation_iterations = 64;
+    projection_limits.seed_iterations = 64;
+    projection_limits.final_alns_iterations = -1;
+    projection_limits.exact_nodes = 0;
+    projection_limits.final_exact_nodes = -1;
     struct ContinuationProjection {
       std::tuple<int, int, int> match;
       int ending_fuel{};
@@ -4249,9 +4260,7 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
   }
   if (exact_requested &&
       (!timed || std::chrono::steady_clock::now() < deadline)) {
-    std::int64_t exact_budget =
-        std::max<std::int64_t>(0, static_cast<std::int64_t>(maximum) -
-                                     iterations_executed);
+    std::int64_t exact_budget = configured_exact_nodes;
     const std::optional<std::chrono::steady_clock::time_point> exact_deadline =
         timed ? std::optional<std::chrono::steady_clock::time_point>(deadline)
               : std::nullopt;

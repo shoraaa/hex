@@ -31,13 +31,13 @@ uv run hexbench grade \
   --jobs 8
 ```
 
-To tune ALNS locally, evaluate a deterministic grid of fixed iteration
+To tune ALNS locally, evaluate a deterministic grid of explicit ALNS iteration
 budgets on the same manifest:
 
 ```sh
 uv run hexbench alns-tune \
   --cases cases/quick/manifest.json \
-  --fixed-iterations 128,256,512,1024,2048,3072,4096,6000 \
+  --alns-iterations 128,256,512,1024,2048,3072,4096,6000 \
   --min-iterations 32 \
   --stagnation-iterations 0 \
   --report reports/alns-tuning
@@ -45,7 +45,7 @@ uv run hexbench alns-tune \
 
 The tuner ranks candidates by the same lexicographic macro-average as the
 grader (distinct brands, cumulative daily brands, then servings); runtime is
-only a tie-breaker. It uses fixed iteration budgets rather than wall-clock
+only a tie-breaker. It uses explicit ALNS iteration counts rather than wall-clock
 limits so a saved report can be reproduced on another machine. The selected
 configuration and every candidate result are written to `report.json` and
 `report.md`.
@@ -126,10 +126,12 @@ the four maps; `rank-1` counts official-score wins, including ties.
 | `aco` | 7.25 | 35.75 | 150.25 | 4.14 | 1 |
 | `aco_ls` | 7.25 | 35.75 | 151.25 | 3.65 | 2 |
 
-On Q01, congestion-aware ALNS with 1,024 fixed iterations reaches
+On Q01, congestion-aware ALNS with 1,024 ALNS iterations reaches
 `4/28/126`, ahead of the saved ACO+LS result `4/28/124`; on Q02 all four
-search policies reach `10/40/132`; on Q03 ALNS/LNS reach `10/40/136`; and on
-New Question ALNS/LNS reach `5/35/216`.
+search policies reach `10/40/132`; on Q03 ALNS/LNS reach `10/40/136`; and the
+explicit recommended ALNS profile reaches `5/35/219` on New Question. That
+profile runs 1,536 normal-day and 1,024 final-day ALNS iterations, a 2,048
+iteration LNS warm start, and 512 normal-day / 1,024 final-day exact nodes.
 
 The report records validity first and then the official deterministic score
 tuple: distinct brands, cumulative daily brands, and servings. Runtime is
@@ -270,9 +272,9 @@ Practice reset jobs remain serialized. Job/session records, proposal traces,
 and reports are stored under `reports/web/` and reloaded after a dashboard
 restart. The token stays in the Python process and the static UI uses no CDN or
 internet-hosted assets.
-Ordinary dashboard server benchmarks use 3,072 fixed iterations per day for
-LNS/ALNS when neither a time nor fixed-iteration limit is supplied. This is the
-best full-match ALNS setting found by the local quality sweep: larger budgets
+Ordinary dashboard server benchmarks use 2,048 ALNS iterations per day for
+LNS/ALNS when neither a time nor ALNS-iteration limit is supplied. This is the
+best full-match ALNS setting found by the local quality sweep: larger iteration
 can improve a day's isolated score while leaving a worse continuation state.
 Enter a wall-clock limit for a deeper anytime run, use the time-curve mode to
 compare budgets, or use `deploy` for the full safe competition window.
@@ -285,26 +287,37 @@ and grade it against `wait,greedy`. A policy receives only the official map and
 daily information plus history reconstructible from its own accepted plans;
 future road states and simulator internals are not exposed.
 
-`lns` and `alns` also accept an internal `search` object in the C++ `plan` command
-(including `timeLimitMs`, `minIterations`, `maxIterations`, and
-`stagnationIterations`). This client-side budgeting hint is not part of the
-official action protocol; omitting it selects deterministic fixed-iteration
-search for local grading. Live practice and competition deployment make the
-safe wall-clock deadline authoritative for LNS/ALNS (`10,000,000` unreachable
-maximum iterations and stagnation stopping disabled), while explicit limits
-remain available for controlled benchmarks and debugging.
+`lns` and `alns` accept an internal `search` object in the C++ `plan` command.
+The quality/runtime controls are explicit:
 
-Budgets above 96 iterations activate systematic exact branch-and-bound after
-the ALNS warm start. A completed enumeration proves the official daily optimum.
-Exact candidates are not constrained to reproduce an incumbent's arbitrary
-ending positions: each day is optimized against its revealed traffic, and the
-next day is replanned from the accepted state. An exact candidate replaces the
-incumbent only when it strictly improves the three official objectives; ties do
-not exchange one unscored continuation state for another. Timed searches reserve
-the final 30% of a budget of at least five seconds for exact search on the
-final day and always retain the best valid incumbent. Earlier days keep the
-full safe budget in ALNS because continuation-preserving action enumeration is
-too restrictive to use the response window effectively.
+- `timeLimitMs`: wall-clock limit; mutually exclusive with untimed ALNS iterations.
+- `maxIterations`: ALNS iteration cap in timed mode; `minIterations` and
+  `stagnationIterations` control the lower bound and early stopping.
+- `seedIterations`: bounded legacy-LNS seed work before ALNS.
+- `exactNodes`: final-day exact-search node allowance; `0` disables it and `-1`
+  selects the automatic cap.
+- `duplicateWarmupIterations`: how long repeated candidates are still decoded.
+- `annealingEpoch` and `coolingSteps`: deterministic reheating/cooling schedule.
+- `acoAnts`, `acoIterations`, and `acoEvaporation`: ant count, rounds, and
+  pheromone retention for the protected ACO seed.
+
+For untimed search, use `alns_iterations` in the web/API hyperparameter map;
+the planner converts it to `maxIterations`. These controls are not part of the
+official action protocol. Omitting them selects compiled defaults. Live practice
+and competition deployment make the safe wall-clock deadline authoritative for
+LNS/ALNS, while explicit controls remain available for controlled benchmarks.
+
+ALNS iteration counts are direct loop counts. Counts above 96 also enable a
+bounded exact branch-and-bound add-on on the final day, after the ALNS warm
+start; a completed enumeration proves the official final-day optimum. Exact
+candidates are not constrained to reproduce an incumbent's arbitrary ending
+positions: the final day is optimized against its revealed traffic, and earlier
+days retain their full ALNS budget so continuation state is not replaced by a
+daily-only exact solution. An exact candidate replaces the incumbent only when
+it strictly improves the three official objectives; ties do not exchange one
+unscored continuation state for another. Timed searches reserve the final 30%
+of a budget of at least five seconds for exact search on the final day and
+always retain the best valid incumbent.
 The promoted exact phase uses admissible reachability, per-patrol serving,
 stock-allocation, and no-refuel fuel bounds. They only prune branches whose
 best possible lexicographic score cannot beat the incumbent, so they improve

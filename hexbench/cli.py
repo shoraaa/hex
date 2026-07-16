@@ -149,13 +149,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     tune = subparsers.add_parser(
         "alns-tune",
-        help="optimize deterministic ALNS iteration and stopping budgets on a local suite",
+        help="optimize deterministic ALNS iteration and stopping controls on a local suite",
     )
     tune.add_argument("--cases", type=Path, required=True, help="suite manifest.json")
     tune.add_argument(
-        "--fixed-iterations",
+        "--alns-iterations",
         default="128,256,512,1024,2048,3072,4096,6000",
-        help="comma-separated maximum/fixed iteration budgets",
+        help="comma-separated ALNS iteration counts",
     )
     tune.add_argument("--min-iterations", default="32", help="comma-separated minimum iteration values")
     tune.add_argument(
@@ -339,7 +339,7 @@ def main(argv: list[str] | None = None) -> None:
         report = tune_alns(
             args.cases,
             args.report,
-            fixed_iterations=parse_values(args.fixed_iterations),
+            alns_iterations=parse_values(args.alns_iterations),
             min_iterations=parse_values(args.min_iterations),
             stagnation_iterations=parse_values(args.stagnation_iterations),
             binary_path=args.binary,

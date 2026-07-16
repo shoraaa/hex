@@ -28,7 +28,7 @@ def test_dashboard_job_benchmarks_selected_policies(monkeypatch, tmp_path: Path)
         assert kwargs["peer_team_ids"] == ["13", "18"]
         assert kwargs["hyperparameters"] == {
             "greedy": {"max_targets": 3},
-            "alns": {"fixed_iterations": 2_048},
+            "alns": web.PRACTICE_BENCHMARK_DEFAULT_HYPERPARAMETERS,
         }
         progress({"policy": "greedy", "status": "finished"})
         return {

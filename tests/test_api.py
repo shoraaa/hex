@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import json
 import time
+import pytest
 
 from hexbench import api
 from hexbench.generator import generate_scenario
@@ -58,10 +59,8 @@ def test_hyperparameters_are_validated_per_selected_method() -> None:
         ["alns"], {"alns": {"min_iterations": 4, "max_iterations": 8}}
     ) == {"alns": {"min_iterations": 4, "max_iterations": 8}}
     assert api.normalize_hyperparameters(
-        ["alns"], {"alns": {"fixed_iterations": 10_000}}
-    ) == {"alns": {"fixed_iterations": 10_000}}
-    import pytest
-
+        ["alns"], {"alns": {"alns_iterations": 10_000}}
+    ) == {"alns": {"alns_iterations": 10_000}}
     with pytest.raises(ValueError, match="unselected"):
         api.normalize_hyperparameters(["greedy"], {"lns": {"max_iterations": 8}})
     assert api.normalize_hyperparameters(
@@ -72,25 +71,38 @@ def test_hyperparameters_are_validated_per_selected_method() -> None:
     with pytest.raises(ValueError, match="cannot be combined"):
         api.normalize_hyperparameters(
             ["alns"],
-            {"alns": {"fixed_iterations": 10_000, "time_limit_ms": 2_000}},
+            {"alns": {"alns_iterations": 10_000, "time_limit_ms": 2_000}},
+        )
+    with pytest.raises(ValueError, match="cannot be combined"):
+        api.normalize_hyperparameters(
+            ["alns"],
+            {"alns": {"alns_iterations": 10_000, "max_iterations": 2_000}},
         )
 
 
 def test_search_hyperparameter_metadata_guides_the_dashboard() -> None:
-    fixed_iterations = next(
+    alns_iterations = next(
         field
         for field in api.POLICY_HYPERPARAMETERS["alns"]
-        if field["key"] == "fixed_iterations"
+        if field["key"] == "alns_iterations"
     )
 
-    assert fixed_iterations["recommended"] == 2_048
-    assert fixed_iterations["ui_max"] == 12_000
-    assert [preset["value"] for preset in fixed_iterations["presets"]] == [
-        256,
-        1_024,
-        2_048,
-        6_000,
-    ]
+    assert alns_iterations["recommended"] == 1_536
+    assert alns_iterations["ui_max"] == 12_000
+    fields = {field["key"]: field for field in api.POLICY_HYPERPARAMETERS["alns"]}
+    assert {
+        "final_alns_iterations",
+        "seed_iterations",
+        "exact_nodes",
+        "final_exact_nodes",
+        "aco_ants",
+        "aco_iterations",
+        "aco_evaporation",
+    } <= fields.keys()
+    assert fields["final_alns_iterations"]["recommended"] == 1_024
+    assert fields["seed_iterations"]["recommended"] == 2_048
+    assert fields["exact_nodes"]["recommended"] == 512
+    assert fields["final_exact_nodes"]["recommended"] == 1_024
 
 
 def test_fuel_stress_variants_preserve_authoritative_config_except_fuel() -> None:
@@ -382,7 +394,7 @@ def test_real_deploy_uses_deadline_governed_online_alns_search(
     assert planning["budget_seconds"] > 0
 
 
-def test_real_deploy_fixed_iterations_activates_untimed_exact_search(
+def test_real_deploy_alns_iterations_activates_untimed_exact_search(
     monkeypatch, tmp_path: Path
 ) -> None:
     config = generate_scenario(10, "medium", "small", "single")["config"]
@@ -437,7 +449,7 @@ def test_real_deploy_fixed_iterations_activates_untimed_exact_search(
         poll_interval=0.01,
         binary_path=str(api.find_binary()),
         base_url="https://example.invalid/api",
-        method_hyperparameters={"fixed_iterations": 10_000},
+        method_hyperparameters={"alns_iterations": 10_000},
         progress=progress_events.append,
     )
 
@@ -449,7 +461,7 @@ def test_real_deploy_fixed_iterations_activates_untimed_exact_search(
         }
     ]
     planning = next(event for event in progress_events if event["status"] == "planning")
-    assert planning["iteration_limit"] == 10_000
+    assert planning["alns_iterations"] == 10_000
     assert "budget_seconds" not in planning
 
 

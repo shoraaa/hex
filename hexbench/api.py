@@ -22,9 +22,23 @@ from .runner import find_binary, run_core
 
 BASE_URL = "https://hexudon.hairbui76.id.vn/api"
 
-# These are deliberately client-side controls. They are validated before a
-# practice reset starts and are passed to the C++ planner only for the named
-# policy. Empty entries preserve each policy's compiled defaults.
+# These are explicit solver controls. They are validated before a practice reset
+# starts and passed to the C++ planner only for the named policy. Empty entries
+# preserve that policy's compiled defaults.
+ALNS_HYPERPARAMETERS = (
+    {"key": "time_limit_ms", "label": "ALNS wall-clock limit", "unit": "ms", "type": "integer", "min": 50, "step": 50, "ui_max": 10_000, "help": "Timed mode; mutually exclusive with ALNS iterations."},
+    {"key": "alns_iterations", "label": "ALNS iterations on days 1–6", "unit": "iterations/day", "type": "integer", "min": 1, "step": 1, "ui_min": 32, "ui_max": 12_000, "ui_step": 32, "recommended": 1_536, "help": "Literal untimed ALNS loop count on every non-final day; exact-search nodes are additional work."},
+    {"key": "final_alns_iterations", "label": "ALNS iterations on final day", "unit": "iterations", "type": "integer", "min": 1, "max": 12_000, "step": 1, "recommended": 1_024, "help": "Literal final-day ALNS loop count. Leave blank to reuse the non-final count."},
+    {"key": "min_iterations", "label": "Minimum ALNS iterations", "type": "integer", "min": 1, "max": 12_000, "step": 1, "recommended": 1_536, "help": "Minimum loop count before stagnation stopping; clamped to the configured final-day count."},
+    {"key": "max_iterations", "label": "Timed ALNS iteration cap", "type": "integer", "min": 1, "step": 1, "ui_max": 10_000, "help": "Iteration cap used with the wall-clock limit."},
+    {"key": "stagnation_iterations", "label": "ALNS stagnation threshold", "type": "integer", "min": 0, "step": 1, "ui_max": 12_000, "recommended": 2_048, "help": "Diversify after half this many stagnant moves and stop at this count after the minimum; 0 disables both."},
+    {"key": "seed_iterations", "label": "LNS warm-start iterations", "unit": "iterations/day", "type": "integer", "min": 0, "max": 12_000, "step": 1, "recommended": 2_048, "help": "Literal legacy-LNS iterations used to construct the ALNS warm start on each day; 0 disables it."},
+    {"key": "exact_nodes", "label": "Exact-search nodes on days 1–6", "unit": "nodes/day", "type": "integer", "min": 0, "max": 10_000, "step": 1, "recommended": 512, "help": "Literal branch-and-bound node allowance after ALNS on every non-final day; 0 disables it."},
+    {"key": "final_exact_nodes", "label": "Exact-search nodes on final day", "unit": "nodes", "type": "integer", "min": 0, "max": 10_000, "step": 1, "recommended": 1_024, "help": "Literal final-day branch-and-bound allowance; leave blank to reuse the non-final allowance."},
+    {"key": "aco_ants", "label": "ALNS ACO seed ants", "unit": "ants", "type": "integer", "min": 1, "max": 128, "step": 1, "help": "Ant count for the protected ACO seed; blank uses the map-derived default."},
+    {"key": "aco_iterations", "label": "ALNS ACO seed iterations", "unit": "iterations", "type": "integer", "min": 1, "max": 256, "step": 1, "help": "ACO rounds for the protected seed; blank uses the day-horizon default."},
+    {"key": "aco_evaporation", "label": "ALNS ACO pheromone retention", "type": "number", "exclusive_min": 0, "exclusive_max": 1, "step": 0.01, "ui_min": 0.05, "ui_max": 0.99, "help": "Pheromone retention used by the protected ACO seed."},
+)
 POLICY_HYPERPARAMETERS: dict[str, tuple[dict[str, Any], ...]] = {
     "wait": (),
     "hotspot": (),
@@ -47,20 +61,8 @@ POLICY_HYPERPARAMETERS: dict[str, tuple[dict[str, Any], ...]] = {
     "local_search": (
         {"key": "passes", "label": "Route-search passes", "type": "integer", "min": 1, "max": 32, "step": 1},
     ),
-    "lns": (
-        {"key": "time_limit_ms", "label": "Time limit", "unit": "ms", "type": "integer", "min": 50, "step": 50, "ui_max": 10_000, "help": "Wall-clock mode; leave blank when using fixed iterations."},
-        {"key": "fixed_iterations", "label": "Fixed iteration budget", "unit": "iterations", "type": "integer", "min": 1, "step": 1, "ui_min": 32, "ui_max": 12_000, "ui_step": 32, "recommended": 2_048, "presets": [{"label": "Fast", "value": 256}, {"label": "Balanced", "value": 1_024}, {"label": "Recommended", "value": 2_048}, {"label": "Deep", "value": 6_000}], "help": "Deterministic mode. The recommended budget preserves Q01's 126 and reaches 219 on New Question."},
-        {"key": "min_iterations", "label": "Minimum iterations", "type": "integer", "min": 1, "max": 2048, "step": 1},
-        {"key": "max_iterations", "label": "Maximum iterations", "type": "integer", "min": 1, "step": 1, "ui_max": 10_000},
-        {"key": "stagnation_iterations", "label": "Stagnation limit", "type": "integer", "min": 0, "step": 1, "ui_max": 10_000, "help": "Use 0 to disable early stopping."},
-    ),
-    "alns": (
-        {"key": "time_limit_ms", "label": "Time limit", "unit": "ms", "type": "integer", "min": 50, "step": 50, "ui_max": 10_000, "help": "Wall-clock mode; leave blank when using fixed iterations."},
-        {"key": "fixed_iterations", "label": "Fixed iteration budget", "unit": "iterations", "type": "integer", "min": 1, "step": 1, "ui_min": 32, "ui_max": 12_000, "ui_step": 32, "recommended": 2_048, "presets": [{"label": "Fast", "value": 256}, {"label": "Balanced", "value": 1_024}, {"label": "Recommended", "value": 2_048}, {"label": "Deep", "value": 6_000}], "help": "Deterministic mode. The recommended budget preserves Q01's 126 and reaches 219 on New Question."},
-        {"key": "min_iterations", "label": "Minimum iterations", "type": "integer", "min": 1, "max": 2048, "step": 1},
-        {"key": "max_iterations", "label": "Maximum iterations", "type": "integer", "min": 1, "step": 1, "ui_max": 10_000},
-        {"key": "stagnation_iterations", "label": "Stagnation limit", "type": "integer", "min": 0, "step": 1, "ui_max": 10_000, "help": "Use 0 to disable early stopping."},
-    ),
+    "lns": ALNS_HYPERPARAMETERS,
+    "alns": ALNS_HYPERPARAMETERS,
     "aco": (
         {"key": "ants", "label": "Ant count", "type": "integer", "min": 1, "step": 1, "ui_max": 128, "recommended": 20},
         {"key": "iterations", "label": "ACO iterations", "type": "integer", "min": 1, "step": 1, "ui_max": 100, "recommended": 20},
@@ -125,17 +127,21 @@ def normalize_hyperparameters(
                 raise ValueError(f"{method}.{key} exceeds the C++ integer range")
             normalized[key] = int(value) if field["type"] == "integer" else float(value)
         if method in {"lns", "alns"}:
-            if "fixed_iterations" in normalized and "time_limit_ms" in normalized:
+            if "alns_iterations" in normalized and "time_limit_ms" in normalized:
                 raise ValueError(
-                    f"{method}.fixed_iterations cannot be combined with time_limit_ms"
+                    f"{method}.alns_iterations cannot be combined with time_limit_ms"
+                )
+            if "alns_iterations" in normalized and "max_iterations" in normalized:
+                raise ValueError(
+                    f"{method}.alns_iterations cannot be combined with max_iterations"
                 )
             effective_min = normalized.get("min_iterations", 32)
             effective_max = normalized.get(
-                "fixed_iterations",
+                "alns_iterations",
                 normalized.get("max_iterations", 10_000_000),
             )
             if effective_min > effective_max:
-                raise ValueError(f"{method}.min_iterations cannot exceed max_iterations")
+                raise ValueError(f"{method}.min_iterations cannot exceed ALNS iterations")
         result[method] = normalized
     return result
 
@@ -519,24 +525,24 @@ def deploy(
                     deadline_margin=deadline_margin,
                 )
                 safe_time_limit_ms = max(50, int(budget * 0.85 * 1000))
-                fixed_iterations = normalized_hyperparameters.get("fixed_iterations")
+                alns_iterations = normalized_hyperparameters.get("alns_iterations")
                 planner_hyperparameters = {
                     key: value
                     for key, value in normalized_hyperparameters.items()
-                    if key != "fixed_iterations"
+                    if key != "alns_iterations"
                 }
-                if fixed_iterations is not None:
-                    fixed_iterations = int(fixed_iterations)
+                if alns_iterations is not None:
+                    alns_iterations = int(alns_iterations)
                     search = {
                         "minIterations": int(
                             normalized_hyperparameters.get(
-                                "min_iterations", min(2048, fixed_iterations)
+                                "min_iterations", min(2048, alns_iterations)
                             )
                         ),
-                        "maxIterations": fixed_iterations,
+                        "maxIterations": alns_iterations,
                         "stagnationIterations": int(
                             normalized_hyperparameters.get(
-                                "stagnation_iterations", fixed_iterations
+                                "stagnation_iterations", alns_iterations
                             )
                         ),
                     }
@@ -574,8 +580,8 @@ def deploy(
                     "status": "planning",
                     "response_window_seconds": budget,
                 }
-                if fixed_iterations is not None:
-                    progress_event["iteration_limit"] = fixed_iterations
+                if alns_iterations is not None:
+                    progress_event["alns_iterations"] = alns_iterations
                 else:
                     progress_event["budget_seconds"] = solver_time_limit_ms / 1000
                 emit(

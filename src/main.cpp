@@ -66,19 +66,36 @@ hexudon::SearchLimits parse_search_limits(const boost::json::object& object) {
     assign(search, "minIterations", limits.min_iterations);
     assign(search, "maxIterations", limits.max_iterations);
     assign(search, "stagnationIterations", limits.stagnation_iterations);
+    assign(search, "seedIterations", limits.seed_iterations);
+    assign(search, "finalAlnsIterations", limits.final_alns_iterations);
+    assign(search, "exactNodes", limits.exact_nodes);
+    assign(search, "finalExactNodes", limits.final_exact_nodes);
+    assign(search, "acoAnts", limits.aco_ants);
+    assign(search, "acoIterations", limits.aco_iterations);
+    assign_double(search, "acoEvaporation", limits.aco_evaporation);
   }
   if (const auto* value = object.if_contains("hyperparameters")) {
     const auto& hyperparameters = value->as_object();
     explicit_time_limit =
         explicit_time_limit || hyperparameters.contains("time_limit_ms");
     explicit_max_iterations =
-        explicit_max_iterations || hyperparameters.contains("max_iterations");
+        explicit_max_iterations || hyperparameters.contains("max_iterations") ||
+        hyperparameters.contains("alns_iterations");
     explicit_stagnation =
         explicit_stagnation || hyperparameters.contains("stagnation_iterations");
     assign(hyperparameters, "time_limit_ms", limits.time_limit_ms);
     assign(hyperparameters, "min_iterations", limits.min_iterations);
     assign(hyperparameters, "max_iterations", limits.max_iterations);
+    assign(hyperparameters, "alns_iterations", limits.max_iterations);
     assign(hyperparameters, "stagnation_iterations", limits.stagnation_iterations);
+    assign(hyperparameters, "seed_iterations", limits.seed_iterations);
+    assign(hyperparameters, "final_alns_iterations",
+           limits.final_alns_iterations);
+    assign(hyperparameters, "exact_nodes", limits.exact_nodes);
+    assign(hyperparameters, "final_exact_nodes", limits.final_exact_nodes);
+    assign(hyperparameters, "aco_ants", limits.aco_ants);
+    assign(hyperparameters, "aco_iterations", limits.aco_iterations);
+    assign_double(hyperparameters, "aco_evaporation", limits.aco_evaporation);
     assign(hyperparameters, "max_targets", limits.max_targets);
     assign(hyperparameters, "fuel_reserve", limits.fuel_reserve);
     assign(hyperparameters, "passes", limits.local_search_passes);
@@ -97,6 +114,8 @@ hexudon::SearchLimits parse_search_limits(const boost::json::object& object) {
       limits.min_iterations > limits.max_iterations || limits.max_targets < 0 ||
       limits.fuel_reserve < 0 || limits.local_search_passes < 0 ||
       limits.aco_ants < 0 || limits.aco_iterations < 0 ||
+      limits.seed_iterations < 0 || limits.final_alns_iterations < -1 ||
+      limits.exact_nodes < 0 || limits.final_exact_nodes < -1 ||
       limits.aco_evaporation <= 0.0 || limits.aco_evaporation >= 1.0) {
     throw std::invalid_argument("invalid search limits");
   }

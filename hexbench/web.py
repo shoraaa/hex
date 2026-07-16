@@ -40,10 +40,17 @@ POLICIES = (
     "aco",
     "aco_ls",
 )
-# The post-stagnation sweep preserves Q01's 4/28/126 and improves New Question
-# from 218 to 219 at 2,048 iterations. Match-level quality remains non-monotone
-# because same-day ties can produce different continuation states.
-PRACTICE_BENCHMARK_DEFAULT_ITERATIONS = 2_048
+# Explicit deterministic profile that preserves the saved New Question 219
+# serving trajectory. ALNS and exact work are separate literal counts.
+PRACTICE_BENCHMARK_DEFAULT_HYPERPARAMETERS = {
+    "alns_iterations": 1_536,
+    "final_alns_iterations": 1_024,
+    "min_iterations": 1_536,
+    "stagnation_iterations": 2_048,
+    "seed_iterations": 2_048,
+    "exact_nodes": 512,
+    "final_exact_nodes": 1_024,
+}
 
 
 def _now() -> str:
@@ -373,11 +380,9 @@ class DashboardApp:
                     parameters = effective_hyperparameters.setdefault(method, {})
                     if (
                         "time_limit_ms" not in parameters
-                        and "fixed_iterations" not in parameters
+                        and "alns_iterations" not in parameters
                     ):
-                        parameters["fixed_iterations"] = (
-                            PRACTICE_BENCHMARK_DEFAULT_ITERATIONS
-                        )
+                        parameters.update(PRACTICE_BENCHMARK_DEFAULT_HYPERPARAMETERS)
             self._update(
                 job_id,
                 effective_hyperparameters=effective_hyperparameters,
@@ -901,7 +906,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       <div id="policies" class="policies"></div>
       <label class="title" style="margin-top:20px">Method hyper-parameters</label>
       <div id="hyperparameters" class="hyperparameters"><div class="parameter-help">Select a policy to configure its optional controls.</div></div>
-      <div class="parameter-help">Ordinary server benchmarks default LNS/ALNS to 6,000 fixed iterations per day, including deterministic exact completion. Enter a Time limit for wall-clock search; the dedicated time curve compares budgets separately.</div>
+      <div class="parameter-help">Untimed ALNS exposes literal warm-start, normal-day/final-day ALNS, and normal-day/final-day exact-search counts. Enter a wall-clock limit for timed search or set every fixed-search phase below.</div>
       <label class="title" for="fuel-multipliers">Fuel stress multipliers</label>
       <input class="fuel-input" id="fuel-multipliers" value="1.0, 0.5, 0.25" aria-describedby="fuel-help">
       <div class="parameter-help" id="fuel-help" style="margin:-8px 0 14px">Multiples of Day-1 steps; the server fuel value is always included.</div>
@@ -1033,7 +1038,7 @@ async function poll(id) {
     const title = p.policy ? `${p.policy}: ${phase}` : (job.status === 'queued' ? 'Waiting for earlier job' : 'Benchmarking on server');
     const day = Number.isInteger(p.day) ? `Day ${p.day + 1} of ${job.game.total_days}` : '';
     const budget = Number.isFinite(p.budget_seconds) ? `planning budget ${Number(p.budget_seconds).toFixed(1)}s` : '';
-    const iterations = Number.isInteger(p.iteration_limit) ? `${p.iteration_limit.toLocaleString()} fixed iterations` : '';
+    const iterations = Number.isInteger(p.alns_iterations) ? `${p.alns_iterations.toLocaleString()} ALNS iterations` : '';
     const detail = [day,budget,iterations,`${job.methods.length} selected ${job.methods.length === 1 ? 'policy' : 'policies'}`].filter(Boolean).join(' · ');
     setStatus('running',title,detail); setTimeout(() => poll(id),1000);
   } catch (error) { setStatus('error','Lost benchmark status',error.message); setRunDisabled(false); }

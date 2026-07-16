@@ -351,7 +351,7 @@ def test_q01_alns_seed_ignores_refuel_agent_fuel() -> None:
     assert online_plan == local_plan
 
 
-def test_q01_alns_fixed_2048_preserves_saved_online_serving_target() -> None:
+def test_q01_alns_recommended_profile_preserves_saved_online_serving_target() -> None:
     scenario_path = (
         Path(__file__).resolve().parents[1]
         / "reports/fuel-stress-current/cases"
@@ -359,9 +359,13 @@ def test_q01_alns_fixed_2048_preserves_saved_online_serving_target() -> None:
     )
     scenario = json.loads(scenario_path.read_text())
     scenario["hyperparameters"] = {
-        "min_iterations": 2048,
-        "max_iterations": 2048,
+        "alns_iterations": 1536,
+        "final_alns_iterations": 1024,
+        "min_iterations": 1536,
         "stagnation_iterations": 2048,
+        "seed_iterations": 2048,
+        "exact_nodes": 512,
+        "final_exact_nodes": 1024,
     }
     result = run_core("eval", "alns", scenario, binary=find_binary())
     assert result["score"] == {
@@ -379,9 +383,13 @@ def test_new_question_alns_reaches_the_online_219_serving_baseline() -> None:
     )
     scenario = json.loads(scenario_path.read_text())
     scenario["hyperparameters"] = {
-        "min_iterations": 2048,
-        "max_iterations": 2048,
+        "alns_iterations": 1536,
+        "final_alns_iterations": 1024,
+        "min_iterations": 1536,
         "stagnation_iterations": 2048,
+        "seed_iterations": 2048,
+        "exact_nodes": 512,
+        "final_exact_nodes": 1024,
     }
     result = run_core("eval", "alns", scenario, binary=find_binary())
     assert result["score"] == {

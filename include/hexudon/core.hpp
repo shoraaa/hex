@@ -88,6 +88,10 @@ struct SearchLimits {
   int min_iterations{96};
   int max_iterations{96};
   int stagnation_iterations{96};
+  int seed_iterations{32};
+  int final_alns_iterations{-1};
+  int exact_nodes{0};
+  int final_exact_nodes{-1};
   int max_targets{};
   int fuel_reserve{};
   int local_search_passes{};
