@@ -108,7 +108,7 @@ hexudon::SearchLimits parse_search_limits(const boost::json::object& object) {
 int main(int argc, char** argv) {
   try {
     if (argc != 3) {
-      std::cerr << "usage: hexudon <types|plan|check|eval> <policy>\n";
+      std::cerr << "usage: hexudon <types|plan|check|trace|eval> <policy>\n";
       return 2;
     }
     const std::string command = argv[1];
@@ -153,6 +153,15 @@ int main(int argc, char** argv) {
             {"servings", score->total_servings}};
       }
       output = std::move(checked);
+    } else if (command == "trace") {
+      const auto& object = input.as_object();
+      const auto config = hexudon::parse_map_config(object.at("config"));
+      const auto day = hexudon::parse_day_info(object.at("day_info"));
+      const auto actions = parse_actions(object.at("actions"));
+      const auto history = object.if_contains("history")
+                               ? hexudon::parse_history(object.at("history"))
+                               : hexudon::PolicyHistory{};
+      output = hexudon::trace_action_plan(config, day, history, actions);
     } else {
       throw std::invalid_argument("unknown command: " + command);
     }

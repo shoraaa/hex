@@ -11,6 +11,7 @@ import re
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -48,12 +49,14 @@ POLICY_HYPERPARAMETERS: dict[str, tuple[dict[str, Any], ...]] = {
     ),
     "lns": (
         {"key": "time_limit_ms", "label": "Time limit (ms)", "type": "integer", "min": 50, "step": 50},
+        {"key": "fixed_iterations", "label": "Fixed iteration budget", "type": "integer", "min": 1, "step": 1},
         {"key": "min_iterations", "label": "Minimum iterations", "type": "integer", "min": 1, "max": 2048, "step": 1},
         {"key": "max_iterations", "label": "Maximum iterations", "type": "integer", "min": 1, "step": 1},
         {"key": "stagnation_iterations", "label": "Stagnation limit (0 = disabled)", "type": "integer", "min": 0, "step": 1},
     ),
     "alns": (
         {"key": "time_limit_ms", "label": "Time limit (ms)", "type": "integer", "min": 50, "step": 50},
+        {"key": "fixed_iterations", "label": "Fixed iteration budget", "type": "integer", "min": 1, "step": 1},
         {"key": "min_iterations", "label": "Minimum iterations", "type": "integer", "min": 1, "max": 2048, "step": 1},
         {"key": "max_iterations", "label": "Maximum iterations", "type": "integer", "min": 1, "step": 1},
         {"key": "stagnation_iterations", "label": "Stagnation limit (0 = disabled)", "type": "integer", "min": 0, "step": 1},
@@ -122,8 +125,15 @@ def normalize_hyperparameters(
                 raise ValueError(f"{method}.{key} exceeds the C++ integer range")
             normalized[key] = int(value) if field["type"] == "integer" else float(value)
         if method in {"lns", "alns"}:
+            if "fixed_iterations" in normalized and "time_limit_ms" in normalized:
+                raise ValueError(
+                    f"{method}.fixed_iterations cannot be combined with time_limit_ms"
+                )
             effective_min = normalized.get("min_iterations", 32)
-            effective_max = normalized.get("max_iterations", 10_000_000)
+            effective_max = normalized.get(
+                "fixed_iterations",
+                normalized.get("max_iterations", 10_000_000),
+            )
             if effective_min > effective_max:
                 raise ValueError(f"{method}.min_iterations cannot exceed max_iterations")
         result[method] = normalized
@@ -219,6 +229,32 @@ class GameClient:
             raise RuntimeError(f"POST {path} failed (ambiguous network error; not retried)") from None
 
 
+def fetch_game_snapshot(
+    token: str, game_id: str, base_url: str = BASE_URL
+) -> dict[str, Any]:
+    """Fetch the read-only map/state/day bundle used by both web modes."""
+    client = GameClient(token, base_url)
+    try:
+        board = client.get("/game/board", game_id)
+        resolved_id = str(board.get("game_id", game_id))
+        config = client.get("/game/config", resolved_id)
+        state = client.get("/game/state", resolved_id)
+        day: dict[str, Any] | None = None
+        if state.get("status") == "in_progress":
+            day = client.get("/game/day", resolved_id)
+        return {
+            "requested_game_id": game_id,
+            "game_id": resolved_id,
+            "board": board,
+            "config": config,
+            "state": state,
+            "day": day,
+            "fetched_at": datetime.now(UTC).isoformat(),
+        }
+    finally:
+        client.close()
+
+
 def _state_path(state_dir: Path, game_id: str) -> Path:
     key = hashlib.sha256(game_id.encode()).hexdigest()[:24]
     return state_dir / f"{key}.json"
@@ -226,8 +262,15 @@ def _state_path(state_dir: Path, game_id: str) -> Path:
 
 def _load_state(path: Path) -> dict[str, Any]:
     if not path.exists():
-        return {"distinct_brands": [], "submitted_days": {}, "types": None}
-    return json.loads(path.read_text())
+        return {
+            "distinct_brands": [],
+            "submitted_days": {},
+            "day_snapshots": {},
+            "types": None,
+        }
+    state = json.loads(path.read_text())
+    state.setdefault("day_snapshots", {})
+    return state
 
 
 def _save_state(path: Path, state: dict[str, Any]) -> None:
@@ -265,6 +308,26 @@ def planning_budget(
             min(budget, day_info["endsAt"] - time.time() - deadline_margin),
         )
     return budget
+
+
+def trace_action_plan(
+    config: dict[str, Any],
+    day_info: dict[str, Any],
+    history: dict[str, Any] | None,
+    actions: list[list[int]],
+    *,
+    binary_path: str | None = None,
+) -> dict[str, Any]:
+    """Replay a proposed day plan with the authoritative C++ simulator."""
+    binary = find_binary(binary_path)
+    payload: dict[str, Any] = {
+        "config": config,
+        "day_info": day_info,
+        "actions": actions,
+    }
+    if history:
+        payload["history"] = history
+    return run_core("trace", "greedy", payload, binary=binary)
 
 
 def predict_acquired_brands(
@@ -351,8 +414,11 @@ def deploy(
     base_url: str = BASE_URL,
     quiet: bool = False,
     method_hyperparameters: dict[str, int | float] | None = None,
+    progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     def emit(payload: dict[str, Any]) -> dict[str, Any]:
+        if progress is not None:
+            progress(payload)
         if not quiet:
             print(json.dumps(payload))
         return payload
@@ -375,7 +441,13 @@ def deploy(
         if status["status"] == "selecting_agents":
             # A resettable practice game may reuse the same composite id. Its
             # old local journal must not suppress submissions in the replay.
-            journal = {"distinct_brands": [], "submitted_days": {}, "types": None}
+            journal = {
+                "distinct_brands": [],
+                "submitted_days": {},
+                "day_snapshots": {},
+                "types": None,
+            }
+            emit({"game_id": resolved_id, "status": "selecting_agent_types"})
             types = run_core("types", method, config, binary=binary)
             validate_agent_types(types, len(config["agents"]))
             if dry_run:
@@ -431,6 +503,13 @@ def deploy(
                 and day_info["endsAt"] - time.time() <= deadline_margin
             )
             if close_to_deadline:
+                emit(
+                    {
+                        "game_id": resolved_id,
+                        "day": day_index,
+                        "status": "deadline_fallback",
+                    }
+                )
                 actions = [[-config["daySteps"][day_index]] for _ in types]
             else:
                 budget = planning_budget(
@@ -439,22 +518,78 @@ def deploy(
                     is_practice=is_practice,
                     deadline_margin=deadline_margin,
                 )
-                try:
-                    # Keep validation, fallback construction, and submission outside
-                    # the solver budget. The C++ ALNS clock includes preprocessing.
-                    safe_time_limit_ms = max(50, int(budget * 0.85 * 1000))
+                safe_time_limit_ms = max(50, int(budget * 0.85 * 1000))
+                fixed_iterations = normalized_hyperparameters.get("fixed_iterations")
+                planner_hyperparameters = {
+                    key: value
+                    for key, value in normalized_hyperparameters.items()
+                    if key != "fixed_iterations"
+                }
+                if fixed_iterations is not None:
+                    fixed_iterations = int(fixed_iterations)
+                    search = {
+                        "minIterations": int(
+                            normalized_hyperparameters.get(
+                                "min_iterations", min(2048, fixed_iterations)
+                            )
+                        ),
+                        "maxIterations": fixed_iterations,
+                        "stagnationIterations": int(
+                            normalized_hyperparameters.get(
+                                "stagnation_iterations", fixed_iterations
+                            )
+                        ),
+                    }
+                else:
                     requested_time_limit_ms = int(
                         normalized_hyperparameters.get(
                             "time_limit_ms", safe_time_limit_ms
                         )
                     )
-                    # A long server deadline is not an instruction to speculate
-                    # across hidden future days. Default production planning uses
-                    # the same bounded online search as practice; an explicit
-                    # time limit is the opt-in exhaustive benchmark path.
-                    exhaustive_timed_search = (
-                        "time_limit_ms" in normalized_hyperparameters
+                    solver_time_limit_ms = min(
+                        requested_time_limit_ms, safe_time_limit_ms
                     )
+                    deadline_governed_search = method in {"lns", "alns"}
+                    search = {
+                        "timeLimitMs": solver_time_limit_ms,
+                        "minIterations": int(
+                            normalized_hyperparameters.get("min_iterations", 32)
+                        ),
+                        "maxIterations": int(
+                            normalized_hyperparameters.get(
+                                "max_iterations",
+                                10_000_000 if deadline_governed_search else 2048,
+                            )
+                        ),
+                        "stagnationIterations": int(
+                            normalized_hyperparameters.get(
+                                "stagnation_iterations",
+                                0 if deadline_governed_search else 96,
+                            )
+                        ),
+                    }
+                progress_event = {
+                    "game_id": resolved_id,
+                    "day": day_index,
+                    "status": "planning",
+                    "response_window_seconds": budget,
+                }
+                if fixed_iterations is not None:
+                    progress_event["iteration_limit"] = fixed_iterations
+                else:
+                    progress_event["budget_seconds"] = solver_time_limit_ms / 1000
+                emit(
+                    progress_event
+                )
+                try:
+                    # Keep validation, fallback construction, and submission outside
+                    # the solver budget. The C++ ALNS clock includes preprocessing.
+                    # The server deadline is the authoritative stopping rule for
+                    # LNS/ALNS. Keep validation and submission headroom outside
+                    # this budget, but do not pair a long wall-clock allowance
+                    # with small iteration/stagnation caps that make the solver
+                    # converge prematurely. Explicit limits remain available for
+                    # controlled benchmarks and debugging.
                     actions = run_core(
                         "plan",
                         method,
@@ -463,15 +598,8 @@ def deploy(
                             "day_info": day_info,
                             "history": history,
                             "types": types,
-                            "search": {
-                                "timeLimitMs": min(
-                                    requested_time_limit_ms, safe_time_limit_ms
-                                ),
-                                "minIterations": int(normalized_hyperparameters.get("min_iterations", 32)),
-                                "maxIterations": int(normalized_hyperparameters.get("max_iterations", 10_000_000 if exhaustive_timed_search else 2048)),
-                                "stagnationIterations": int(normalized_hyperparameters.get("stagnation_iterations", 0 if exhaustive_timed_search else 96)),
-                            },
-                            "hyperparameters": normalized_hyperparameters,
+                            "search": search,
+                            "hyperparameters": planner_hyperparameters,
                         },
                         binary=binary,
                         timeout=budget,
@@ -504,6 +632,13 @@ def deploy(
                         "actions": actions,
                     }
                 )
+            emit(
+                {
+                    "game_id": resolved_id,
+                    "day": day_index,
+                    "status": "submitting",
+                }
+            )
             endpoint = "/game/practice/actions" if is_practice else "/game/actions"
             client.post(
                 endpoint,
@@ -514,6 +649,12 @@ def deploy(
                 set(journal.get("distinct_brands", [])) | acquired
             )
             journal["submitted_days"][day_key] = actions
+            journal["day_snapshots"][day_key] = {
+                "day_info": day_info,
+                "actions": actions,
+                "validation": check,
+                "submitted_at": datetime.now(UTC).isoformat(),
+            }
             _save_state(state_path, journal)
             submitted = {
                 "game_id": resolved_id,
@@ -614,6 +755,96 @@ def discover_practice_questions(
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             continue
+    return discovered
+
+
+def _question_data(question: dict[str, Any]) -> dict[str, Any]:
+    """Decode manager question metadata without leaking it to callers."""
+    value = question.get("question_data", {})
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _game_descriptor(
+    question: dict[str, Any], data: dict[str, Any], own_team_id: str | None
+) -> dict[str, Any] | None:
+    """Normalize a manager question into a safe UI-facing game descriptor.
+
+    Resettable practice maps are deliberately distinguished from non-reset
+    practice competitions.  The latter use the practice action endpoint but
+    must be operated exactly like a live competition.
+    """
+    teams = [str(team.get("team_id")) for team in data.get("teams", []) if isinstance(team, dict)]
+    if own_team_id is not None and teams and own_team_id not in teams:
+        return None
+    game_map = data.get("map", {}) if isinstance(data.get("map"), dict) else {}
+    is_practice = bool(data.get("is_practice"))
+    no_reset = bool(data.get("no_reset"))
+    practice_lab = is_practice and not no_reset
+    question_id = str(question.get("id", ""))
+    if not question_id:
+        return None
+    return {
+        "question_id": question_id,
+        "name": str(question.get("name") or question_id),
+        "mode": "practice" if practice_lab else "competition",
+        "competition_kind": "practice_competition" if is_practice else "competition",
+        "is_practice": is_practice,
+        "no_reset": no_reset,
+        "width": game_map.get("width"),
+        "height": game_map.get("height"),
+        "total_days": len(data.get("daySteps", [])),
+        "day_seconds": list(data.get("daySeconds", [])),
+        "day_steps": list(data.get("daySteps", [])),
+        "players": data.get("players"),
+        "team_ids": teams,
+        "starts_at": data.get("startsAt"),
+        "capabilities": {
+            "reset": practice_lab,
+            "benchmark": practice_lab,
+            "local_evaluation": practice_lab,
+            "submit": True,
+            "peer_rank": is_practice,
+            "replay": is_practice,
+        },
+    }
+
+
+def discover_assigned_games(
+    token: str, base_url: str = BASE_URL
+) -> list[dict[str, Any]]:
+    """Return every assigned question classified for Practice or Competition.
+
+    Unlike :func:`discover_practice_questions`, this includes real matches and
+    ``no_reset`` practice competitions.  The manager endpoint is the source of
+    assignment truth; game state is fetched lazily by the web layer.
+    """
+    try:
+        response = httpx.get(
+            f"{_manager_authority(base_url)}/manager/api/question",
+            headers={"Authorization": token},
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        questions = payload.get("data", payload) if isinstance(payload, dict) else payload
+        if not isinstance(questions, list):
+            raise RuntimeError("manager question response is not a list")
+    except (httpx.HTTPError, ValueError) as error:
+        raise RuntimeError(f"question discovery failed: {error}") from None
+
+    own_team_id = _token_team_id(token)
+    discovered: list[dict[str, Any]] = []
+    for question in questions:
+        if not isinstance(question, dict):
+            continue
+        descriptor = _game_descriptor(question, _question_data(question), own_team_id)
+        if descriptor is not None:
+            discovered.append(descriptor)
     return discovered
 
 
@@ -1188,11 +1419,17 @@ def practice_benchmark(
             peer_team_ids = discover_peer_team_ids(token, question_id, base_url)
         rows: list[dict[str, Any]] = []
         for method in methods:
+            def deploy_progress(event: dict[str, Any], policy: str = method) -> None:
+                if progress is not None:
+                    progress({"policy": policy, **event})
+
             if progress is not None:
                 progress({"policy": method, "status": "resetting"})
             if not quiet:
                 print(json.dumps({"policy": method, "status": "resetting"}))
             client.post("/game/practice/reset", {"game_id": resolved_id})
+            if progress is not None:
+                progress({"policy": method, "status": "reset_complete"})
             started = time.perf_counter()
             deploy(
                 game_id,
@@ -1207,6 +1444,7 @@ def practice_benchmark(
                 base_url=base_url,
                 quiet=True,
                 method_hyperparameters=normalized_hyperparameters.get(method),
+                progress=deploy_progress,
             )
             elapsed = time.perf_counter() - started
             response = client.get("/game/practice/score", resolved_id)
@@ -1241,6 +1479,10 @@ def practice_benchmark(
             if progress is not None:
                 progress({"policy": best_policy, "status": "restoring_best"})
             client.post("/game/practice/reset", {"game_id": resolved_id})
+            def restore_progress(event: dict[str, Any]) -> None:
+                if progress is not None:
+                    progress({"policy": best_policy, "restoring": True, **event})
+
             deploy(
                 game_id,
                 best_policy,
@@ -1254,6 +1496,7 @@ def practice_benchmark(
                 base_url=base_url,
                 quiet=True,
                 method_hyperparameters=normalized_hyperparameters.get(best_policy),
+                progress=restore_progress,
             )
             final_policy = best_policy
 
@@ -1425,6 +1668,8 @@ def practice_suite(
     binary_path: str | None = None,
     base_url: str = BASE_URL,
     quiet: bool = False,
+    hyperparameters: dict[str, dict[str, int | float]] | None = None,
+    progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Benchmark policies on every resettable practice map and rank the result."""
     if not methods:
@@ -1478,6 +1723,16 @@ def practice_suite(
             )
         automatic_peers = question.get("team_ids") or None
         selected_peers = automatic_peers if peer_team_ids is None else peer_team_ids
+        if progress is not None:
+            progress(
+                {
+                    "status": "benchmarking",
+                    "map": index,
+                    "maps": len(questions),
+                    "game_id": question_id,
+                    "name": question["name"],
+                }
+            )
         try:
             report = practice_benchmark(
                 question_id,
@@ -1491,9 +1746,21 @@ def practice_suite(
                 binary_path=binary_path,
                 base_url=base_url,
                 quiet=True,
+                hyperparameters=hyperparameters,
             )
             row = _suite_map_summary(question, report, destination / "report.json")
             maps.append(row)
+            if progress is not None:
+                progress(
+                    {
+                        "status": "finished_map",
+                        "map": index,
+                        "maps": len(questions),
+                        "game_id": question_id,
+                        "name": question["name"],
+                        "score": row["score"],
+                    }
+                )
             if not quiet:
                 print(
                     json.dumps(
@@ -1514,6 +1781,17 @@ def practice_suite(
             errors.append(
                 {"question_id": question_id, "name": question["name"], "error": str(error)}
             )
+            if progress is not None:
+                progress(
+                    {
+                        "status": "map_failed",
+                        "map": index,
+                        "maps": len(questions),
+                        "game_id": question_id,
+                        "name": question["name"],
+                        "error": str(error),
+                    }
+                )
             if not quiet:
                 print(json.dumps({"name": question["name"], "status": "error", "error": str(error)}))
 

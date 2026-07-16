@@ -8,6 +8,48 @@ from hexbench import api
 from hexbench.generator import generate_scenario
 
 
+def test_game_descriptor_classifies_no_reset_practice_as_competition() -> None:
+    question = {
+        "id": "6860f3ae-8715-4a5a-97f4-a0d6849b4d6a",
+        "name": "New Question X",
+    }
+    descriptor = api._game_descriptor(
+        question,
+        {
+            "is_practice": True,
+            "no_reset": True,
+            "map": {"width": 30, "height": 24},
+            "daySteps": [171, 121, 177, 178, 61],
+            "daySeconds": [60] * 5,
+            "teams": [{"team_id": "13"}],
+        },
+        "13",
+    )
+    assert descriptor is not None
+    assert descriptor["mode"] == "competition"
+    assert descriptor["competition_kind"] == "practice_competition"
+    assert descriptor["capabilities"]["reset"] is False
+    assert descriptor["capabilities"]["submit"] is True
+
+
+def test_game_descriptor_keeps_resettable_practice_in_lab() -> None:
+    descriptor = api._game_descriptor(
+        {"id": "practice", "name": "Practice"},
+        {
+            "is_practice": True,
+            "no_reset": False,
+            "map": {"width": 12, "height": 12},
+            "daySteps": [40],
+            "daySeconds": [60],
+            "teams": [{"team_id": "13"}],
+        },
+        "13",
+    )
+    assert descriptor is not None
+    assert descriptor["mode"] == "practice"
+    assert descriptor["capabilities"]["reset"] is True
+
+
 def test_hyperparameters_are_validated_per_selected_method() -> None:
     assert api.normalize_hyperparameters(
         ["lns"], {"lns": {"min_iterations": 4, "max_iterations": 8}}
@@ -15,6 +57,9 @@ def test_hyperparameters_are_validated_per_selected_method() -> None:
     assert api.normalize_hyperparameters(
         ["alns"], {"alns": {"min_iterations": 4, "max_iterations": 8}}
     ) == {"alns": {"min_iterations": 4, "max_iterations": 8}}
+    assert api.normalize_hyperparameters(
+        ["alns"], {"alns": {"fixed_iterations": 10_000}}
+    ) == {"alns": {"fixed_iterations": 10_000}}
     import pytest
 
     with pytest.raises(ValueError, match="unselected"):
@@ -24,6 +69,11 @@ def test_hyperparameters_are_validated_per_selected_method() -> None:
     ) == {"aco": {"ants": 1000, "iterations": 1000, "evaporation": 0.1}}
     with pytest.raises(ValueError, match="less than"):
         api.normalize_hyperparameters(["aco"], {"aco": {"evaporation": 1.0}})
+    with pytest.raises(ValueError, match="cannot be combined"):
+        api.normalize_hyperparameters(
+            ["alns"],
+            {"alns": {"fixed_iterations": 10_000, "time_limit_ms": 2_000}},
+        )
 
 
 def test_fuel_stress_variants_preserve_authoritative_config_except_fuel() -> None:
@@ -239,11 +289,12 @@ def test_deploy_dry_run_makes_no_posts(monkeypatch, tmp_path: Path) -> None:
     assert FakeClient.instances[0].posts == []
 
 
-def test_real_deploy_defaults_to_bounded_online_alns_search(
+def test_real_deploy_uses_deadline_governed_online_alns_search(
     monkeypatch, tmp_path: Path
 ) -> None:
     config = generate_scenario(10, "medium", "small", "single")["config"]
     captured: list[dict] = []
+    progress_events: list[dict] = []
 
     class FakeClient:
         def __init__(self, token: str, base_url: str):
@@ -302,16 +353,92 @@ def test_real_deploy_defaults_to_bounded_online_alns_search(
         poll_interval=0.01,
         binary_path=str(api.find_binary()),
         base_url="https://example.invalid/api",
+        progress=progress_events.append,
     )
     assert len(captured) == 1
     assert captured[0]["timeLimitMs"] > 0
     assert captured[0]["minIterations"] == 32
-    assert captured[0]["maxIterations"] == 2048
-    assert captured[0]["stagnationIterations"] == 96
+    assert captured[0]["maxIterations"] == 10_000_000
+    assert captured[0]["stagnationIterations"] == 0
+    planning = next(event for event in progress_events if event["status"] == "planning")
+    assert planning["day"] == 0
+    assert planning["budget_seconds"] > 0
+
+
+def test_real_deploy_fixed_iterations_activates_untimed_exact_search(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = generate_scenario(10, "medium", "small", "single")["config"]
+    captured: list[dict] = []
+    progress_events: list[dict] = []
+
+    class FakeClient:
+        def __init__(self, token: str, base_url: str):
+            pass
+
+        def get(self, path: str, game_id: str):
+            if path == "/game/board":
+                return {"game_id": "practice:team", "is_practice": True}
+            if path == "/game/config":
+                return config
+            if path == "/game/state":
+                return {"status": "in_progress", "day": 0}
+            if path == "/game/day":
+                return {
+                    "day": 0,
+                    "agents": [
+                        {"kind": 0, "pos": pos, "fuel": config["fuelLimits"]}
+                        for pos in config["agents"]
+                    ],
+                    "others": [],
+                    "traffics": [],
+                }
+            raise AssertionError(path)
+
+        def close(self) -> None:
+            pass
+
+    def fake_run_core(command, method, payload, **kwargs):
+        if command == "plan":
+            captured.append(payload["search"])
+            return [[-config["daySteps"][0]] for _ in config["agents"]]
+        if command == "check":
+            return {"valid": True}
+        raise AssertionError(command)
+
+    monkeypatch.setattr(api, "GameClient", FakeClient)
+    monkeypatch.setattr(api, "load_token", lambda _: "redacted-test-token")
+    monkeypatch.setattr(api, "run_core", fake_run_core)
+    api.deploy(
+        "practice",
+        "alns",
+        tmp_path / ".env",
+        tmp_path / "state",
+        dry_run=True,
+        once=True,
+        deadline_margin=2,
+        poll_interval=0.01,
+        binary_path=str(api.find_binary()),
+        base_url="https://example.invalid/api",
+        method_hyperparameters={"fixed_iterations": 10_000},
+        progress=progress_events.append,
+    )
+
+    assert captured == [
+        {
+            "minIterations": 2048,
+            "maxIterations": 10_000,
+            "stagnationIterations": 10_000,
+        }
+    ]
+    planning = next(event for event in progress_events if event["status"] == "planning")
+    assert planning["iteration_limit"] == 10_000
+    assert "budget_seconds" not in planning
 
 
 def test_practice_benchmark_resets_ranks_and_leaves_best(monkeypatch, tmp_path: Path) -> None:
     completed: list[str] = []
+    progress_events: list[dict] = []
 
     class FakeClient:
         instances: list["FakeClient"] = []
@@ -359,6 +486,16 @@ def test_practice_benchmark_resets_ranks_and_leaves_best(monkeypatch, tmp_path: 
             pass
 
     def fake_deploy(game_id: str, method: str, *args, **kwargs):
+        callback = kwargs.get("progress")
+        assert callback is not None
+        callback(
+            {
+                "game_id": "practice:13",
+                "day": 0,
+                "status": "planning",
+                "budget_seconds": 58.0,
+            }
+        )
         completed.append(method)
         return {"status": "finished"}
 
@@ -373,6 +510,7 @@ def test_practice_benchmark_resets_ranks_and_leaves_best(monkeypatch, tmp_path: 
         tmp_path / "report",
         peer_team_ids=[],
         quiet=True,
+        progress=progress_events.append,
     )
     assert report["best_policy"] == "local_search"
     assert report["final_policy"] == "local_search"
@@ -381,6 +519,14 @@ def test_practice_benchmark_resets_ranks_and_leaves_best(monkeypatch, tmp_path: 
         "greedy",
     ]
     assert len(FakeClient.instances[0].posts) == 2
+    assert {
+        "policy": "greedy",
+        "game_id": "practice:13",
+        "day": 0,
+        "status": "planning",
+        "budget_seconds": 58.0,
+    } in progress_events
+    assert {"policy": "greedy", "status": "reset_complete"} in progress_events
     assert (tmp_path / "report" / "report.json").exists()
 
 

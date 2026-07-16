@@ -10,19 +10,23 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .api import (
     BASE_URL,
     _suite_map_summary,
+    discover_assigned_games,
     discover_practice_questions,
+    fetch_game_snapshot,
     fuel_stress_benchmark,
     load_token,
     lns_time_benchmark,
     normalize_hyperparameters,
     POLICY_HYPERPARAMETERS,
     practice_benchmark,
+    practice_suite,
 )
+from .competition import CompetitionSessionManager
 
 POLICIES = (
     "greedy",
@@ -36,6 +40,10 @@ POLICIES = (
     "aco",
     "aco_ls",
 )
+# Selected by the deterministic ALNS quality sweep in
+# reports/alns-quality-tuning-{refined,high,deep}.  Larger budgets spend more
+# time proving a single day's score but can leave a worse continuation state.
+PRACTICE_BENCHMARK_DEFAULT_ITERATIONS = 3_072
 
 
 def _now() -> str:
@@ -63,16 +71,153 @@ class DashboardApp:
         self.poll_interval = poll_interval
         self._jobs: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
+        self._load_jobs()
+        self._competition = CompetitionSessionManager(
+            env_path,
+            state_dir,
+            report_dir,
+            binary_path=binary_path,
+            base_url=base_url,
+            poll_interval=max(0.2, poll_interval),
+        )
         # Practice resets are stateful. One worker prevents two jobs from
         # resetting the same team game underneath each other.
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hexbench-web")
 
     def close(self) -> None:
+        self._competition.close()
         self._executor.shutdown(wait=False, cancel_futures=True)
 
-    def list_games(self) -> list[dict[str, Any]]:
+    def _job_path(self, job_id: str) -> Path:
+        return self.report_dir / job_id / "job.json"
+
+    def _persist_job(self, job: dict[str, Any]) -> None:
+        path = self._job_path(str(job["id"]))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(job, indent=2) + "\n")
+        temporary.replace(path)
+
+    def _load_jobs(self) -> None:
+        if not self.report_dir.exists():
+            return
+        for path in self.report_dir.glob("*/job.json"):
+            try:
+                job = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if not isinstance(job, dict) or not job.get("id"):
+                continue
+            if job.get("status") in {"queued", "running"}:
+                job["status"] = "interrupted"
+                job["error"] = "dashboard restarted before the run completed"
+                job["updated_at"] = _now()
+                self._persist_job(job)
+            self._jobs[str(job["id"])] = job
+        for path in self.report_dir.glob("*/report.json"):
+            job_id = path.parent.name
+            if job_id in self._jobs:
+                continue
+            try:
+                report = json.loads(path.read_text())
+                timestamp = datetime.fromtimestamp(path.stat().st_mtime, UTC).isoformat()
+            except (OSError, ValueError):
+                continue
+            if not isinstance(report, dict):
+                continue
+            mode = (
+                "practice"
+                if "best_policy" in report
+                else ("lns_time" if "time_limits_ms" in report else "fuel_stress")
+            )
+            self._jobs[job_id] = {
+                "id": job_id,
+                "status": "completed",
+                "mode": mode,
+                "created_at": timestamp,
+                "updated_at": timestamp,
+                "game": {
+                    "name": report.get("game_id", "Legacy run"),
+                    "question_id": str(report.get("game_id", "")).split(":", 1)[0],
+                },
+                "methods": [row.get("policy") for row in report.get("results", []) if isinstance(row, dict)],
+                "legacy": True,
+                "report": str(path),
+            }
+
+    def list_games(self, mode: str = "practice") -> list[dict[str, Any]]:
         token = load_token(self.env_path)
-        return discover_practice_questions(token, self.base_url)
+        if mode == "competition":
+            return [
+                game
+                for game in discover_assigned_games(token, self.base_url)
+                if game.get("mode") == "competition"
+            ]
+        return [
+            {
+                **game,
+                "mode": "practice",
+                "competition_kind": "practice",
+                "is_practice": True,
+                "no_reset": False,
+                "capabilities": {
+                    "reset": True,
+                    "benchmark": True,
+                    "local_evaluation": True,
+                    "submit": True,
+                    "peer_rank": True,
+                    "replay": True,
+                },
+            }
+            for game in discover_practice_questions(token, self.base_url)
+        ]
+
+    def list_all_games(self) -> list[dict[str, Any]]:
+        token = load_token(self.env_path)
+        return discover_assigned_games(token, self.base_url)
+
+    def snapshot(self, game_id: str) -> dict[str, Any]:
+        return fetch_game_snapshot(load_token(self.env_path), game_id, self.base_url)
+
+    def replay(self, game_id: str, team_id: str | None = None) -> dict[str, Any]:
+        from .api import GameClient
+
+        client = GameClient(load_token(self.env_path), self.base_url)
+        try:
+            board = client.get("/game/board", game_id)
+            resolved = str(board.get("game_id", game_id))
+            if not board.get("is_practice"):
+                raise ValueError("replay is only available for practice games")
+            if team_id:
+                question_id = resolved.split(":", 1)[0]
+                resolved = f"{question_id}:{team_id}"
+            return {"game_id": resolved, "replay": client.get("/game/practice/peer", resolved)}
+        finally:
+            client.close()
+
+    def start_competition(
+        self,
+        game_id: str,
+        method: str,
+        hyperparameters: dict[str, int | float] | None = None,
+    ) -> dict[str, Any]:
+        return self._competition.start_session(game_id, method, hyperparameters)
+
+    def get_competition(self, session_id: str) -> dict[str, Any] | None:
+        return self._competition.get_session(session_id)
+
+    def competition_sessions(self) -> list[dict[str, Any]]:
+        return self._competition.recent_sessions()
+
+    def approve_competition(
+        self, session_id: str, fingerprint: str, allow_fallback: bool = False
+    ) -> dict[str, Any]:
+        return self._competition.approve(
+            session_id, fingerprint=fingerprint, allow_fallback=allow_fallback
+        )
+
+    def control_competition(self, session_id: str, action: str) -> dict[str, Any]:
+        return self._competition.control(session_id, action)
 
     def start_job(
         self,
@@ -90,7 +235,7 @@ class DashboardApp:
         unknown = [method for method in methods if method not in POLICIES]
         if unknown:
             raise ValueError(f"unknown policies: {', '.join(unknown)}")
-        if mode not in {"practice", "fuel_stress", "lns_time"}:
+        if mode not in {"practice", "practice_suite", "fuel_stress", "lns_time"}:
             raise ValueError("unknown benchmark mode")
         if mode == "lns_time" and (
             len(methods) != 1 or methods[0] not in {"lns", "alns"}
@@ -109,12 +254,25 @@ class DashboardApp:
             raise ValueError("time-curve fuel multiplier must be in (0, 3]")
         normalized_hyperparameters = normalize_hyperparameters(methods, hyperparameters)
 
-        games = self.list_games()
-        question = next(
-            (game for game in games if game["question_id"] == game_id), None
-        )
-        if question is None:
-            raise ValueError("game is not an assigned resettable practice game")
+        games = self.list_games("practice")
+        if mode == "practice_suite":
+            question = {
+                "question_id": "all",
+                "name": "All resettable practice maps",
+                "width": None,
+                "height": None,
+                "total_days": sum(int(game.get("total_days") or 0) for game in games),
+                "map_count": len(games),
+                "team_ids": [],
+            }
+            if not games:
+                raise ValueError("no assigned resettable practice games")
+        else:
+            question = next(
+                (game for game in games if game["question_id"] == game_id), None
+            )
+            if question is None:
+                raise ValueError("game is not an assigned resettable practice game")
 
         job_id = uuid.uuid4().hex
         job = {
@@ -130,12 +288,21 @@ class DashboardApp:
             "time_limits_ms": list(time_limits),
             "time_fuel_multiplier": time_fuel,
             "progress": {"status": "queued"},
+            "events": [{"at": _now(), "status": "queued"}],
         }
         with self._lock:
             self._jobs[job_id] = job
+            self._persist_job(job)
         if mode == "practice":
             self._executor.submit(
                 self._run_job, job_id, question, methods, normalized_hyperparameters
+            )
+        elif mode == "practice_suite":
+            self._executor.submit(
+                self._run_suite_job,
+                job_id,
+                methods,
+                normalized_hyperparameters,
             )
         elif mode == "fuel_stress":
             self._executor.submit(
@@ -171,7 +338,20 @@ class DashboardApp:
 
     def _update(self, job_id: str, **values: Any) -> None:
         with self._lock:
-            self._jobs[job_id].update(values, updated_at=_now())
+            updated_at = _now()
+            self._jobs[job_id].update(values, updated_at=updated_at)
+            if "progress" in values or "status" in values:
+                progress = values.get("progress") or {}
+                self._jobs[job_id].setdefault("events", []).append(
+                    {
+                        "at": updated_at,
+                        "status": values.get("status", progress.get("status")),
+                        **({"policy": progress["policy"]} if "policy" in progress else {}),
+                        **({"day": progress["day"]} if "day" in progress else {}),
+                    }
+                )
+                self._jobs[job_id]["events"] = self._jobs[job_id]["events"][-200:]
+            self._persist_job(self._jobs[job_id])
 
     def _run_job(
         self,
@@ -187,6 +367,21 @@ class DashboardApp:
 
         destination = self.report_dir / job_id
         try:
+            effective_hyperparameters = copy.deepcopy(hyperparameters)
+            for method in methods:
+                if method in {"lns", "alns"}:
+                    parameters = effective_hyperparameters.setdefault(method, {})
+                    if (
+                        "time_limit_ms" not in parameters
+                        and "fixed_iterations" not in parameters
+                    ):
+                        parameters["fixed_iterations"] = (
+                            PRACTICE_BENCHMARK_DEFAULT_ITERATIONS
+                        )
+            self._update(
+                job_id,
+                effective_hyperparameters=effective_hyperparameters,
+            )
             report = practice_benchmark(
                 question["question_id"],
                 methods,
@@ -200,7 +395,7 @@ class DashboardApp:
                 base_url=self.base_url,
                 quiet=True,
                 progress=progress,
-                hyperparameters=hyperparameters,
+                hyperparameters=effective_hyperparameters,
             )
             summary = _suite_map_summary(
                 question, report, destination / "report.json"
@@ -263,6 +458,50 @@ class DashboardApp:
                     "wall_seconds": report["wall_seconds"],
                     "report": str(destination / "report.json"),
                 },
+            )
+        except Exception as error:
+            self._update(
+                job_id,
+                status="failed",
+                progress={"status": "failed"},
+                error=str(error),
+            )
+
+    def _run_suite_job(
+        self,
+        job_id: str,
+        methods: list[str],
+        hyperparameters: dict[str, dict[str, int | float]],
+    ) -> None:
+        self._update(
+            job_id,
+            status="running",
+            progress={"status": "discovering_maps"},
+        )
+
+        def progress(event: dict[str, Any]) -> None:
+            self._update(job_id, progress=event)
+
+        destination = self.report_dir / job_id
+        try:
+            report = practice_suite(
+                methods,
+                self.env_path,
+                self.state_dir,
+                destination,
+                peer_team_ids=None,
+                poll_interval=self.poll_interval,
+                binary_path=self.binary_path,
+                base_url=self.base_url,
+                quiet=True,
+                hyperparameters=hyperparameters,
+                progress=progress,
+            )
+            self._update(
+                job_id,
+                status="completed",
+                progress={"status": "completed"},
+                result=report,
             )
         except Exception as error:
             self._update(
@@ -341,29 +580,73 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'",
+        )
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _asset(self, name: str) -> None:
+        safe_name = Path(unquote(name)).name
+        if safe_name != name or safe_name not in {"app.js", "styles.css"}:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "asset not found"})
+            return
+        asset = STATIC_ROOT / safe_name
+        if not asset.is_file():
+            self._json(HTTPStatus.NOT_FOUND, {"error": "asset not found"})
+            return
+        body = asset.read_bytes()
+        content_type = "text/javascript; charset=utf-8" if safe_name.endswith(".js") else "text/css; charset=utf-8"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
         if path == "/":
             self._html()
+            return
+        if path.startswith("/assets/"):
+            self._asset(path.removeprefix("/assets/"))
             return
         if path == "/api/health":
             self._json(HTTPStatus.OK, {"status": "ok"})
             return
-        if path == "/api/games":
+        if path == "/api/bootstrap":
             try:
                 self._json(
                     HTTPStatus.OK,
                     {
-                        "games": self.app.list_games(),
+                        "schema_version": 2,
+                        "games": self.app.list_all_games(),
+                        "policies": POLICIES,
+                        "hyperparameters": POLICY_HYPERPARAMETERS,
+                        "modes": {"practice": True, "competition": True},
+                    },
+                )
+            except RuntimeError as error:
+                self._json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+            return
+        if path == "/api/games":
+            try:
+                mode = parse_qs(parsed.query).get("mode", ["practice"])[0]
+                if mode not in {"practice", "competition", "all"}:
+                    raise ValueError("mode must be practice, competition, or all")
+                self._json(
+                    HTTPStatus.OK,
+                    {
+                        "games": self.app.list_all_games() if mode == "all" else self.app.list_games(mode),
                         "policies": POLICIES,
                         "hyperparameters": POLICY_HYPERPARAMETERS,
                     },
                 )
-            except RuntimeError as error:
+            except (RuntimeError, ValueError) as error:
                 self._json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
             return
         if path == "/api/jobs":
@@ -376,10 +659,50 @@ class DashboardHandler(BaseHTTPRequestHandler):
             else:
                 self._json(HTTPStatus.OK, job)
             return
+        if path == "/api/runs":
+            self._json(HTTPStatus.OK, {"runs": self.app.recent_jobs()})
+            return
+        if path.startswith("/api/runs/"):
+            job = self.app.get_job(path.removeprefix("/api/runs/"))
+            if job is None:
+                self._json(HTTPStatus.NOT_FOUND, {"error": "run not found"})
+            else:
+                self._json(HTTPStatus.OK, job)
+            return
+        if path.startswith("/api/games/") and path.endswith("/snapshot"):
+            game_id = unquote(path.removeprefix("/api/games/").removesuffix("/snapshot")).strip("/")
+            try:
+                self._json(HTTPStatus.OK, self.app.snapshot(game_id))
+            except (RuntimeError, ValueError) as error:
+                self._json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+            return
+        if path.startswith("/api/games/") and path.endswith("/replay"):
+            game_id = unquote(path.removeprefix("/api/games/").removesuffix("/replay")).strip("/")
+            team_id = parse_qs(parsed.query).get("team_id", [None])[0]
+            try:
+                self._json(HTTPStatus.OK, self.app.replay(game_id, team_id))
+            except (RuntimeError, ValueError) as error:
+                self._json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+            return
+        if path == "/api/competition/sessions":
+            self._json(HTTPStatus.OK, {"sessions": self.app.competition_sessions()})
+            return
+        if path.startswith("/api/competition/sessions/"):
+            session = self.app.get_competition(path.removeprefix("/api/competition/sessions/"))
+            if session is None:
+                self._json(HTTPStatus.NOT_FOUND, {"error": "session not found"})
+            else:
+                self._json(HTTPStatus.OK, session)
+            return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        if urlparse(self.path).path != "/api/jobs":
+        path = urlparse(self.path).path
+        if path not in {
+            "/api/jobs",
+            "/api/practice/runs",
+            "/api/competition/sessions",
+        } and not path.startswith("/api/competition/sessions/"):
             self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
             return
         try:
@@ -389,6 +712,39 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if self.headers.get_content_type() != "application/json":
                 raise ValueError("Content-Type must be application/json")
             payload = json.loads(self.rfile.read(length))
+            if not isinstance(payload, dict):
+                raise ValueError("request body must be an object")
+            if path == "/api/competition/sessions":
+                game_id = payload.get("game_id")
+                method = payload.get("method", "local_search")
+                hyperparameters = payload.get("hyperparameters")
+                if not isinstance(game_id, str) or not isinstance(method, str):
+                    raise ValueError("game_id and method are required")
+                if hyperparameters is not None and not isinstance(hyperparameters, dict):
+                    raise ValueError("hyperparameters must be an object")
+                session = self.app.start_competition(game_id, method, hyperparameters)
+                self._json(HTTPStatus.ACCEPTED, session)
+                return
+            if path.startswith("/api/competition/sessions/"):
+                session_id = path.removeprefix("/api/competition/sessions/").removesuffix("/approve").removesuffix("/control").strip("/")
+                if path.endswith("/approve"):
+                    fingerprint = payload.get("fingerprint")
+                    if not isinstance(fingerprint, str):
+                        raise ValueError("fingerprint is required")
+                    session = self.app.approve_competition(
+                        session_id,
+                        fingerprint,
+                        bool(payload.get("allow_fallback", False)),
+                    )
+                elif path.endswith("/control"):
+                    action = payload.get("action")
+                    if not isinstance(action, str):
+                        raise ValueError("control action is required")
+                    session = self.app.control_competition(session_id, action)
+                else:
+                    raise ValueError("unsupported competition session operation")
+                self._json(HTTPStatus.ACCEPTED, session)
+                return
             game_id = payload.get("game_id")
             methods = payload.get("methods")
             hyperparameters = payload.get("hyperparameters")
@@ -545,6 +901,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       <div id="policies" class="policies"></div>
       <label class="title" style="margin-top:20px">Method hyper-parameters</label>
       <div id="hyperparameters" class="hyperparameters"><div class="parameter-help">Select a policy to configure its optional controls.</div></div>
+      <div class="parameter-help">Ordinary server benchmarks default LNS/ALNS to 6,000 fixed iterations per day, including deterministic exact completion. Enter a Time limit for wall-clock search; the dedicated time curve compares budgets separately.</div>
       <label class="title" for="fuel-multipliers">Fuel stress multipliers</label>
       <input class="fuel-input" id="fuel-multipliers" value="1.0, 0.5, 0.25" aria-describedby="fuel-help">
       <div class="parameter-help" id="fuel-help" style="margin:-8px 0 14px">Multiples of Day-1 steps; the server fuel value is always included.</div>
@@ -672,8 +1029,13 @@ async function poll(id) {
     const job = await jsonFetch(`/api/jobs/${id}`), p = job.progress || {};
     if (job.status === 'completed') { if (job.mode === 'fuel_stress') { setStatus('completed','Fuel stress complete','Authoritative map variants were evaluated locally; no server state changed.'); renderFuel(job); } else if (job.mode === 'lns_time') { setStatus('completed','LNS time curve complete','Each budget was applied independently per match day.'); renderTime(job); } else { setStatus('completed','Benchmark complete',`Best policy ${job.result.summary.best_policy} is left on the server.`); render(job); } setRunDisabled(false); return; }
     if (job.status === 'failed') { setStatus('error','Benchmark failed',job.error); setRunDisabled(false); return; }
-    const title = p.policy ? `${p.policy}: ${p.status}` : (job.status === 'queued' ? 'Waiting for earlier job' : 'Benchmarking on server');
-    setStatus('running',title,`${job.methods.length} selected ${job.methods.length === 1 ? 'policy' : 'policies'}`); setTimeout(() => poll(id),1000);
+    const phase = String(p.status || 'running').replaceAll('_',' ');
+    const title = p.policy ? `${p.policy}: ${phase}` : (job.status === 'queued' ? 'Waiting for earlier job' : 'Benchmarking on server');
+    const day = Number.isInteger(p.day) ? `Day ${p.day + 1} of ${job.game.total_days}` : '';
+    const budget = Number.isFinite(p.budget_seconds) ? `planning budget ${Number(p.budget_seconds).toFixed(1)}s` : '';
+    const iterations = Number.isInteger(p.iteration_limit) ? `${p.iteration_limit.toLocaleString()} fixed iterations` : '';
+    const detail = [day,budget,iterations,`${job.methods.length} selected ${job.methods.length === 1 ? 'policy' : 'policies'}`].filter(Boolean).join(' · ');
+    setStatus('running',title,detail); setTimeout(() => poll(id),1000);
   } catch (error) { setStatus('error','Lost benchmark status',error.message); setRunDisabled(false); }
 }
 run.addEventListener('click', async () => {
@@ -705,3 +1067,10 @@ load();
 </body>
 </html>
 """
+
+# The previous embedded page is kept above as a compatibility fallback for
+# downstream imports.  The served dashboard is now an offline static bundle;
+# keeping the constant name preserves the existing test and plugin surface.
+STATIC_ROOT = Path(__file__).with_name("static")
+if (STATIC_ROOT / "index.html").is_file():
+    DASHBOARD_HTML = (STATIC_ROOT / "index.html").read_text()

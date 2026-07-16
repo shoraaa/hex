@@ -84,6 +84,28 @@ void test_validation_respects_refuel_order_and_horizon() {
   assert(horizon_error && horizon_error->find("horizon") != std::string::npos);
 }
 
+void test_trace_action_plan_emits_authoritative_frames() {
+  const auto config = small_config();
+  hexudon::DayInfo day;
+  day.day = 0;
+  for (int pos : config.agents) {
+    day.agents.push_back(
+        {hexudon::AgentKind::Patrol, pos, config.fuel_limit});
+  }
+  const hexudon::ActionPlan plan(config.agents.size(),
+                                 std::vector<int>{-config.day_steps[0]});
+  const auto trace =
+      hexudon::trace_action_plan(config, day, {}, plan).as_object();
+  assert(trace.at("valid").as_bool());
+  const auto& frames = trace.at("frames").as_array();
+  assert(frames.size() == static_cast<std::size_t>(config.day_steps[0] + 1));
+  assert(frames.front().as_object().at("step").as_int64() == 0);
+  assert(frames.back().as_object().at("step").as_int64() ==
+         config.day_steps[0]);
+  assert(frames.back().as_object().at("agents").as_array().size() ==
+         config.agents.size());
+}
+
 void test_all_converted_policies_produce_valid_daily_answers() {
   auto config = small_config();
   hexudon::DayInfo day;
@@ -275,7 +297,7 @@ void test_alns_final_day_quality_is_monotone_with_iteration_budget() {
                      short_score->total_servings}));
 }
 
-void test_online_alns_ignores_future_schedule_and_preserves_aco_ls() {
+void test_online_alns_accepts_full_schedule_and_preserves_daily_quality() {
   auto config = small_config();
   config.day_steps = {14, 8, 32, 20};
   config.day_seconds = {60, 10, 120, 30};
@@ -314,11 +336,58 @@ void test_online_alns_ignores_future_schedule_and_preserves_aco_ls() {
                      aco_score->total_servings}));
 
   auto altered = config;
-  altered.day_steps = {14, 1000, 1, 9999};
-  altered.day_seconds = {60, 0.1, 600, 1};
+  altered.day_steps = {14, 32, 8, 32};
+  altered.day_seconds = {60, 30, 60, 30};
   const auto altered_alns =
       hexudon::plan_day("alns", altered, day, {}, types, limits);
-  assert(altered_alns == alns);
+  const auto altered_score =
+      hexudon::score_action_plan(altered, day, {}, altered_alns);
+  assert(altered_score);
+}
+
+void test_alns_balances_collections_after_official_score() {
+  hexudon::MapConfig config;
+  config.starts_at = 1700000000;
+  config.day_seconds = {60};
+  config.day_steps = {20};
+  config.height = 5;
+  config.width = 5;
+  config.cells.assign(25, hexudon::Terrain::Plain);
+  config.spots = {
+      {0, 1, 1}, {1, 3, 1}, {2, 5, 1}, {3, 9, 1},
+      {4, 15, 1}, {5, 19, 1}, {6, 21, 1}, {7, 23, 1},
+  };
+  config.agents = {0, 4, 20, 24};
+  config.fuel_limit = 40;
+  config.players = 1;
+  config.busy_threshold = 2;
+  config.jammed_threshold = 4;
+
+  hexudon::DayInfo day;
+  day.day = 0;
+  const hexudon::AgentTypes types(config.agents.size(),
+                                  hexudon::AgentKind::Patrol);
+  for (int pos : config.agents) {
+    day.agents.push_back(
+        {hexudon::AgentKind::Patrol, pos, config.fuel_limit});
+  }
+  hexudon::SearchLimits limits;
+  limits.min_iterations = 96;
+  limits.max_iterations = 96;
+  limits.stagnation_iterations = 96;
+  const auto plan =
+      hexudon::plan_day("alns", config, day, {}, types, limits);
+  const auto trace =
+      hexudon::trace_action_plan(config, day, {}, plan).as_object();
+  assert(trace.at("valid").as_bool());
+  assert(trace.at("score").as_object().at("servings").as_int64() == 8);
+  std::vector<int> collections(types.size());
+  for (const auto& item : trace.at("acquisitions").as_array()) {
+    const auto& event = item.as_object();
+    ++collections[event.at("agent").to_number<std::size_t>()];
+  }
+  for (int count : collections) assert(count >= 1);
+  assert(*std::max_element(collections.begin(), collections.end()) <= 3);
 }
 
 }  // namespace
@@ -328,6 +397,7 @@ int main() {
   test_costs();
   test_wait_evaluation();
   test_validation_respects_refuel_order_and_horizon();
+  test_trace_action_plan_emits_authoritative_frames();
   test_all_converted_policies_produce_valid_daily_answers();
   test_fuel_aware_holds_low_fuel_patrol_for_rescue();
   test_lns_is_deterministic_and_rescues_a_stranded_patrol();
@@ -335,6 +405,7 @@ int main() {
   test_aco_handles_patrol_starting_on_spot();
   test_high_iteration_alns_reaches_known_daily_optimum();
   test_alns_final_day_quality_is_monotone_with_iteration_budget();
-  test_online_alns_ignores_future_schedule_and_preserves_aco_ls();
+  test_online_alns_accepts_full_schedule_and_preserves_daily_quality();
+  test_alns_balances_collections_after_official_score();
   std::cout << "core tests passed\n";
 }

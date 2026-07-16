@@ -24,17 +24,20 @@ def test_dashboard_job_benchmarks_selected_policies(monkeypatch, tmp_path: Path)
 
     def fake_benchmark(game_id, methods, *args, progress=None, **kwargs):
         assert game_id == "question"
-        assert methods == ["greedy", "local_search"]
+        assert methods == ["greedy", "alns"]
         assert kwargs["peer_team_ids"] == ["13", "18"]
-        assert kwargs["hyperparameters"] == {"greedy": {"max_targets": 3}}
+        assert kwargs["hyperparameters"] == {
+            "greedy": {"max_targets": 3},
+            "alns": {"fixed_iterations": 3_072},
+        }
         progress({"policy": "greedy", "status": "finished"})
         return {
             "game_id": "question:13",
-            "best_policy": "local_search",
-            "final_policy": "local_search",
+            "best_policy": "alns",
+            "final_policy": "alns",
             "results": [
                 {
-                    "policy": "local_search",
+                    "policy": "alns",
                     "rank": 1,
                     "distinct_types": 4,
                     "cumulative_daily_types": 28,
@@ -75,7 +78,7 @@ def test_dashboard_job_benchmarks_selected_policies(monkeypatch, tmp_path: Path)
     try:
         created = app.start_job(
             "question",
-            ["greedy", "local_search"],
+            ["greedy", "alns"],
             {"greedy": {"max_targets": 3}},
         )
         deadline = time.monotonic() + 2
@@ -228,6 +231,59 @@ def test_dashboard_lns_time_job_passes_budgets(monkeypatch, tmp_path: Path) -> N
         app.close()
 
 
+def test_dashboard_practice_suite_runs_all_resettable_maps(
+    monkeypatch, tmp_path: Path
+) -> None:
+    question = {
+        "question_id": "question",
+        "name": "Q01",
+        "width": 12,
+        "height": 12,
+        "total_days": 7,
+        "team_ids": [],
+    }
+    monkeypatch.setattr(web, "load_token", lambda _: "token")
+    monkeypatch.setattr(
+        web, "discover_practice_questions", lambda token, base_url: [question]
+    )
+
+    def fake_suite(methods, env_path, state_dir, report_dir, **kwargs):
+        assert methods == ["greedy"]
+        assert kwargs["hyperparameters"] == {"greedy": {"max_targets": 3}}
+        kwargs["progress"]({"status": "finished_map", "map": 1, "maps": 1})
+        return {
+            "schema_version": 1,
+            "methods": methods,
+            "map_count": 1,
+            "maps": [],
+            "completed_peer_comparison": {"wins": 0, "ties": 0, "losses": 0},
+            "errors": [],
+        }
+
+    monkeypatch.setattr(web, "practice_suite", fake_suite)
+    app = web.DashboardApp(
+        tmp_path / ".env", tmp_path / "state", tmp_path / "reports"
+    )
+    try:
+        created = app.start_job(
+            "all",
+            ["greedy"],
+            {"greedy": {"max_targets": 3}},
+            mode="practice_suite",
+        )
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            job = app.get_job(created["id"])
+            assert job is not None
+            if job["status"] in {"completed", "failed"}:
+                break
+            time.sleep(0.01)
+        assert job["status"] == "completed"
+        assert job["mode"] == "practice_suite"
+    finally:
+        app.close()
+
+
 def test_dashboard_page_has_selection_and_result_regions() -> None:
     assert 'id="game"' in web.DASHBOARD_HTML
     assert 'id="policies"' in web.DASHBOARD_HTML
@@ -238,6 +294,13 @@ def test_dashboard_page_has_selection_and_result_regions() -> None:
     assert 'id="fuel-multipliers"' in web.DASHBOARD_HTML
     assert 'id="time-run"' in web.DASHBOARD_HTML
     assert 'id="time-results"' in web.DASHBOARD_HTML
+    assert 'id="suite-run"' in web.DASHBOARD_HTML
+    assert 'id="suite-results"' in web.DASHBOARD_HTML
+    assert 'data-mode="practice"' in web.DASHBOARD_HTML
+    assert 'data-mode="competition"' in web.DASHBOARD_HTML
+    assert 'id="competition-map"' in web.DASHBOARD_HTML
+    assert 'id="approve-proposal"' in web.DASHBOARD_HTML
+    assert '<script type="module" src="/assets/app.js"></script>' in web.DASHBOARD_HTML
 
 
 def test_dashboard_policy_list_includes_aco() -> None:

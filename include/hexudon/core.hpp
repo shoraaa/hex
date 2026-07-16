@@ -122,6 +122,12 @@ std::optional<Score> score_action_plan(const MapConfig& config,
                                        const DayInfo& day,
                                        const PolicyHistory& history,
                                        const ActionPlan& plan);
+// Validate and replay one day using the authoritative simulator.  The result
+// contains `valid`, `error`, `score`, and a per-step `frames` array suitable
+// for the web map/replay view.
+json::value trace_action_plan(const MapConfig& config, const DayInfo& day,
+                              const PolicyHistory& history,
+                              const ActionPlan& plan);
 EvaluationResult evaluate_scenario(const json::value& scenario,
                                    const std::string& policy,
                                    const SearchLimits& limits = {});

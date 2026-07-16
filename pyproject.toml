@@ -20,7 +20,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["hexbench"]
+include = [
+  "hexbench/static/*.html",
+  "hexbench/static/*.css",
+  "hexbench/static/*.js",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-

@@ -6,7 +6,13 @@ from pathlib import Path
 
 from hexbench.generator import SUITE_FACTORS, generate_scenario, generate_suite
 from hexbench.models import is_connected, validate_config
-from hexbench.runner import find_binary, grade_suite, run_core
+from hexbench.runner import (
+    find_binary,
+    grade_suite,
+    normalized_performance,
+    run_core,
+    structural_optimum,
+)
 
 
 def test_seeded_generation_is_deterministic_and_valid() -> None:
@@ -34,7 +40,7 @@ def test_full_suite_covers_independent_initial_map_and_match_factors(tmp_path) -
     assert manifest["design_version"] == 2
     assert manifest["coverage"] == "balanced-pairwise"
     assert manifest["players"] == 16
-    assert len(manifest["cases"]) == 192
+    assert len(manifest["cases"]) == 1_000
 
     designs = [case["design"] for case in manifest["cases"]]
     for left, right in combinations(SUITE_FACTORS, 2):
@@ -134,11 +140,115 @@ def test_parallel_core_and_grader_are_score_deterministic(tmp_path) -> None:
         jobs=4,
     )
     assert serial_report["comparisons"] == parallel_report["comparisons"]
+    assert serial_report["ranking"] == parallel_report["ranking"]
     for method in ("local_search", "coordinated"):
         assert (
             serial_report["cases"][0]["results"][method]["score"]
             == parallel_report["cases"][0]["results"][method]["score"]
         )
+
+
+def test_normalized_grade_uses_equal_case_weight_and_invalid_zero() -> None:
+    scenario = {
+        "config": {
+            "daySteps": [10, 10],
+            "agents": [0, 1, 2],
+            "spots": [
+                {"brand": 0, "stocks": 2},
+                {"brand": 1, "stocks": 5},
+                {"brand": 1, "stocks": 1},
+            ],
+        }
+    }
+    optimum = structural_optimum(scenario)
+    assert optimum == {
+        "distinct_types": 2,
+        "cumulative_daily_types": 4,
+        "total_servings": 12,
+    }
+    valid = normalized_performance(
+        {
+            "invalid_days": 0,
+            "score": {
+                "distinct_types": 2,
+                "cumulative_daily_types": 2,
+                "total_servings": 6,
+            },
+        },
+        optimum,
+    )
+    assert valid["objective_percentages"] == {
+        "distinct_types": 100.0,
+        "cumulative_daily_types": 50.0,
+        "total_servings": 50.0,
+    }
+    invalid = normalized_performance(
+        {
+            "invalid_days": 1,
+            "score": {
+                "distinct_types": 2,
+                "cumulative_daily_types": 4,
+                "total_servings": 12,
+            },
+        },
+        optimum,
+    )
+    assert invalid["objective_percentages"] == {
+        "distinct_types": 0.0,
+        "cumulative_daily_types": 0.0,
+        "total_servings": 0.0,
+    }
+
+
+def test_grader_ranks_average_percentages_lexicographically(
+    monkeypatch, tmp_path: Path
+) -> None:
+    scenario = {
+        "config": {
+            "daySteps": [1],
+            "agents": [0],
+            "spots": [
+                {"brand": 0, "stocks": 1},
+                {"brand": 1, "stocks": 1},
+            ],
+        }
+    }
+    (tmp_path / "case.json").write_text(json.dumps(scenario))
+    manifest = {
+        "schema_version": 1,
+        "suite": "lexicographic-average-test",
+        "cases": [{"path": "case.json", "seed": 1}],
+    }
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+
+    def fake_run_core(command, policy, payload, **kwargs):
+        assert command == "eval"
+        score = (
+            {
+                "distinct_types": 2,
+                "cumulative_daily_types": 0,
+                "total_servings": 0,
+            }
+            if policy == "priority"
+            else {
+                "distinct_types": 1,
+                "cumulative_daily_types": 2,
+                "total_servings": 2,
+            }
+        )
+        return {"invalid_days": 0, "score": score}
+
+    monkeypatch.setattr("hexbench.runner.run_core", fake_run_core)
+    report = grade_suite(
+        tmp_path / "manifest.json",
+        "priority",
+        ["lower"],
+        tmp_path / "report",
+        binary_path=str(find_binary()),
+        jobs=1,
+    )
+    assert report["ranking"] == ["priority", "lower"]
+    assert report["comparisons"]["lower"]["lexicographic_result"] == "win"
 
 
 def test_lns_is_deterministic_across_core_thread_counts() -> None:
@@ -166,16 +276,23 @@ def test_alns_static_split_preserves_sparse_map_support() -> None:
     assert sparse_types.count(1) == 2
 
 
-def test_alns_type_selection_does_not_depend_on_day_schedule() -> None:
+def test_alns_type_selection_accepts_the_published_day_schedule() -> None:
     binary = find_binary()
-    scenario = generate_scenario(20106, "hard", "small", "multi")
+    # Exercise both the published variable schedule and a legal all-minimum
+    # schedule through the one-time role-selection path.
+    scenario = generate_scenario(13, "hard", "large", "multi")
     config = scenario["config"]
     expected = run_core("types", "alns", config, binary=binary)
 
     altered = json.loads(json.dumps(config))
-    altered["daySteps"] = [1, 10_000]
-    altered["daySeconds"] = [0.1, 600.0]
-    assert run_core("types", "alns", altered, binary=binary) == expected
+    minimum = altered["map"]["width"] + altered["map"]["height"]
+    altered["daySteps"] = [minimum] * len(altered["daySteps"])
+    altered["daySeconds"] = [60.0] * len(altered["daySteps"])
+    changed = run_core("types", "alns", altered, binary=binary)
+    assert len(expected) == len(config["agents"])
+    assert len(changed) == len(config["agents"])
+    assert set(expected) <= {0, 1}
+    assert set(changed) <= {0, 1}
 
 
 def test_q01_online_alns_uses_the_protected_aco_ls_type_assignment() -> None:
@@ -192,7 +309,7 @@ def test_q01_online_alns_uses_the_protected_aco_ls_type_assignment() -> None:
     assert alns_types == aco_types
 
 
-def test_all_planners_ignore_unrevealed_future_day_lengths() -> None:
+def test_all_planners_accept_published_future_day_lengths() -> None:
     scenario_path = (
         Path(__file__).resolve().parents[1]
         / "reports/fuel-stress-current/cases"
@@ -213,8 +330,13 @@ def test_all_planners_ignore_unrevealed_future_day_lengths() -> None:
         "aco_ls",
     )
     altered = json.loads(json.dumps(config))
-    altered["daySteps"][1:] = [9999, 1, 8888, 2, 7777, 3]
-    altered["daySeconds"][1:] = [0.1, 600, 0.2, 500, 0.3, 400]
+    minimum = config["map"]["width"] + config["map"]["height"]
+    maximum = 4 * minimum
+    altered["daySteps"][1:] = [
+        maximum if index % 2 == 0 else minimum
+        for index in range(len(altered["daySteps"]) - 1)
+    ]
+    altered["daySeconds"][1:] = [60.0] * (len(altered["daySteps"]) - 1)
     for policy in policies:
         types = run_core("types", policy, config, binary=binary)
         day = {
@@ -246,9 +368,13 @@ def test_all_planners_ignore_unrevealed_future_day_lengths() -> None:
                     "stagnationIterations": 96,
                 },
             }
-        assert run_core("plan", policy, payload(config), binary=binary) == run_core(
-            "plan", policy, payload(altered), binary=binary
-        )
+        original = run_core("plan", policy, payload(config), binary=binary)
+        changed = run_core("plan", policy, payload(altered), binary=binary)
+        # Day 0 remains the same horizon, so both plans must stay legal even
+        # when future horizons are very different. A policy may or may not
+        # change its first-day route depending on whether continuation search
+        # finds a different ending state.
+        assert original and changed
 
 
 def test_aco_is_deterministic_across_core_thread_counts() -> None:

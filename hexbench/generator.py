@@ -91,6 +91,7 @@ SUITE_FACTORS: dict[str, tuple[Any, ...]] = {
     "topology": TOPOLOGIES,
     "spots": SPOT_DENSITIES,
 }
+SUITE_CASE_COUNTS = {"quick": 30, "full": 1_000}
 
 
 def _remove_ponds(
@@ -452,10 +453,10 @@ def _generate_suite_scenario(seed: int, factors: dict[str, Any]) -> dict[str, An
 
 
 def generate_suite(name: str, output: Path) -> Path:
-    if name not in {"quick", "full"}:
+    if name not in SUITE_CASE_COUNTS:
         raise ValueError("suite must be quick or full")
     output.mkdir(parents=True, exist_ok=True)
-    case_count = 30 if name == "quick" else 192
+    case_count = SUITE_CASE_COUNTS[name]
     design_seed = 0x484558 + (0 if name == "quick" else 100_000)
     design = _balanced_covering_design(case_count, design_seed)
     cases = [

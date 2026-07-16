@@ -15,6 +15,7 @@ from .api import (
 )
 from .generator import generate_suite
 from .runner import grade_suite
+from .tuning import tune_alns
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -146,7 +147,30 @@ def build_parser() -> argparse.ArgumentParser:
     time_curve.add_argument("--binary")
     time_curve.add_argument("--base-url", default=BASE_URL)
 
-    web = subparsers.add_parser("web", help="serve the practice benchmark dashboard")
+    tune = subparsers.add_parser(
+        "alns-tune",
+        help="optimize deterministic ALNS iteration and stopping budgets on a local suite",
+    )
+    tune.add_argument("--cases", type=Path, required=True, help="suite manifest.json")
+    tune.add_argument(
+        "--fixed-iterations",
+        default="128,256,512,1024,2048,3072,4096,6000",
+        help="comma-separated maximum/fixed iteration budgets",
+    )
+    tune.add_argument("--min-iterations", default="32", help="comma-separated minimum iteration values")
+    tune.add_argument(
+        "--stagnation-iterations",
+        default="0",
+        help="comma-separated stopping-after-stagnation values; 0 disables it",
+    )
+    tune.add_argument("--report", type=Path, default=Path("reports/alns-tuning"))
+    tune.add_argument("--binary")
+    tune.add_argument("--jobs", type=int, default=0, help="parallel workers; 0=auto")
+    tune.add_argument("--timeout", type=float, default=60, help="per case timeout in seconds")
+
+    web = subparsers.add_parser(
+        "web", help="serve the Practice and Competition operations console"
+    )
     web.add_argument("--host", default="0.0.0.0")
     web.add_argument("--port", type=int, default=5678)
     web.add_argument("--env", type=Path, default=Path(".env"))
@@ -308,6 +332,21 @@ def main(argv: list[str] | None = None) -> None:
                 }
             )
         )
+    elif args.command == "alns-tune":
+        def parse_values(raw: str) -> list[int]:
+            return [int(item.strip()) for item in raw.split(",") if item.strip()]
+
+        report = tune_alns(
+            args.cases,
+            args.report,
+            fixed_iterations=parse_values(args.fixed_iterations),
+            min_iterations=parse_values(args.min_iterations),
+            stagnation_iterations=parse_values(args.stagnation_iterations),
+            binary_path=args.binary,
+            jobs=None if args.jobs == 0 else args.jobs,
+            timeout=args.timeout,
+        )
+        print(json.dumps({"report": str(args.report / "report.json"), "best": report["best"]["parameters"]}))
     elif args.command == "web":
         from .web import serve_dashboard
 

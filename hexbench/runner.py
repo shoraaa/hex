@@ -10,6 +10,17 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
+OBJECTIVES = (
+    "distinct_types",
+    "cumulative_daily_types",
+    "total_servings",
+)
+OPTIMUM_DEFINITION = (
+    "Per-case structural upper bound: every brand is collected, every brand "
+    "is collected on every day, and every spot serves up to one bowl per "
+    "available agent per day; travel, fuel, and congestion feasibility are "
+    "ignored."
+)
 
 
 def find_binary(explicit: str | None = None) -> Path:
@@ -48,14 +59,38 @@ def run_core(
     return json.loads(completed.stdout)
 
 
-def _grade_key(result: dict[str, Any]) -> tuple[int, int, int, int]:
-    score = result["score"]
-    return (
-        int(result["invalid_days"] == 0),
-        score["distinct_types"],
-        score["cumulative_daily_types"],
-        score["total_servings"],
+def structural_optimum(scenario: dict[str, Any]) -> dict[str, int]:
+    config = scenario["config"]
+    days = len(config["daySteps"])
+    agents = len(config["agents"])
+    distinct = len({int(spot["brand"]) for spot in config["spots"]})
+    daily_servings = sum(
+        min(int(spot["stocks"]), agents) for spot in config["spots"]
     )
+    return {
+        "distinct_types": distinct,
+        "cumulative_daily_types": distinct * days,
+        "total_servings": daily_servings * days,
+    }
+
+
+def normalized_performance(
+    result: dict[str, Any], optimum: dict[str, int]
+) -> dict[str, Any]:
+    percentages: dict[str, float] = {}
+    valid = result["invalid_days"] == 0
+    for objective in OBJECTIVES:
+        denominator = optimum[objective]
+        percentage = (
+            100.0
+            if denominator == 0
+            else 100.0 * result["score"][objective] / denominator
+        )
+        percentages[objective] = min(100.0, percentage) if valid else 0.0
+    return {
+        "optimum_score": optimum,
+        "objective_percentages": percentages,
+    }
 
 
 def grade_suite(
@@ -86,6 +121,9 @@ def grade_suite(
             "cumulative_daily_types": 0,
             "total_servings": 0,
             "runtime_seconds": 0.0,
+            "distinct_percent": 0.0,
+            "daily_percent": 0.0,
+            "servings_percent": 0.0,
         }
         for name in methods
     }
@@ -114,29 +152,21 @@ def grade_suite(
         evaluated = list(executor.map(evaluate, tasks))
     wall_seconds = time.perf_counter() - wall_started
     for case_index, name, result in evaluated:
+        optimum = structural_optimum(scenarios[case_index])
+        performance = normalized_performance(result, optimum)
+        result.update(performance)
         rows[case_index]["results"][name] = result
+        rows[case_index]["optimum_score"] = optimum
         aggregate = aggregates[name]
         aggregate["valid_cases"] += int(result["invalid_days"] == 0)
         aggregate["invalid_days"] += result["invalid_days"]
         aggregate["runtime_seconds"] += result["runtime_seconds"]
-        for objective in (
-            "distinct_types",
-            "cumulative_daily_types",
-            "total_servings",
-        ):
+        for objective in OBJECTIVES:
             aggregate[objective] += result["score"][objective]
-
-    comparisons: dict[str, dict[str, int]] = {}
-    for baseline in baselines:
-        if baseline == method:
-            continue
-        count = {"wins": 0, "ties": 0, "losses": 0}
-        for row in rows:
-            own = _grade_key(row["results"][method])
-            other = _grade_key(row["results"][baseline])
-            key = "wins" if own > other else ("losses" if own < other else "ties")
-            count[key] += 1
-        comparisons[baseline] = count
+        percentages = performance["objective_percentages"]
+        aggregate["distinct_percent"] += percentages["distinct_types"]
+        aggregate["daily_percent"] += percentages["cumulative_daily_types"]
+        aggregate["servings_percent"] += percentages["total_servings"]
 
     case_count = len(rows)
     for aggregate in aggregates.values():
@@ -147,16 +177,70 @@ def grade_suite(
             "runtime_seconds",
         ):
             aggregate[f"mean_{key}"] = aggregate[key] / case_count if case_count else 0
+        for key in (
+            "distinct_percent",
+            "daily_percent",
+            "servings_percent",
+        ):
+            aggregate[f"mean_{key}"] = (
+                aggregate[key] / case_count if case_count else 0.0
+            )
+
+    ranking = sorted(
+        methods,
+        key=lambda name: (
+            aggregates[name]["mean_distinct_percent"],
+            aggregates[name]["mean_daily_percent"],
+            aggregates[name]["mean_servings_percent"],
+            -aggregates[name]["runtime_seconds"],
+        ),
+        reverse=True,
+    )
+    comparisons: dict[str, dict[str, Any]] = {}
+    own_average = {
+        "distinct_types": aggregates[method]["mean_distinct_percent"],
+        "cumulative_daily_types": aggregates[method]["mean_daily_percent"],
+        "total_servings": aggregates[method]["mean_servings_percent"],
+    }
+    own_key = tuple(own_average[objective] for objective in OBJECTIVES)
+    for baseline in baselines:
+        if baseline == method:
+            continue
+        baseline_average = {
+            "distinct_types": aggregates[baseline]["mean_distinct_percent"],
+            "cumulative_daily_types": aggregates[baseline]["mean_daily_percent"],
+            "total_servings": aggregates[baseline]["mean_servings_percent"],
+        }
+        baseline_key = tuple(
+            baseline_average[objective] for objective in OBJECTIVES
+        )
+        if own_key > baseline_key:
+            lexicographic_result = "win"
+        elif own_key < baseline_key:
+            lexicographic_result = "loss"
+        else:
+            lexicographic_result = "tie"
+        comparisons[baseline] = {
+            "method_average_percentages": own_average,
+            "baseline_average_percentages": baseline_average,
+            "delta_percentage_points": {
+                objective: own_average[objective] - baseline_average[objective]
+                for objective in OBJECTIVES
+            },
+            "lexicographic_result": lexicographic_result,
+        }
 
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "suite": manifest["suite"],
         "method": method,
         "case_count": case_count,
         "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
         "jobs": worker_count,
         "wall_seconds": wall_seconds,
+        "optimum_definition": OPTIMUM_DEFINITION,
         "aggregates": aggregates,
+        "ranking": ranking,
         "comparisons": comparisons,
         "cases": rows,
     }
@@ -168,23 +252,35 @@ def grade_suite(
         f"Suite: `{manifest['suite']}` ({case_count} cases)",
         f"Workers: `{worker_count}` · wall time: `{wall_seconds:.3f}s`",
         "",
-        "| Method | Valid cases | Invalid days | Mean brands | Mean daily brands | Mean servings | Runtime (s) |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        f"Optimum: {OPTIMUM_DEFINITION}",
+        "",
+        "The grade is the lexicographic vector of macro-averaged objective percentages: distinct types first, then cumulative daily types, then servings. Every case has equal weight and an invalid case contributes 0% to every component.",
+        "",
+        "| Rank | Method | Valid | Distinct optimum | Daily optimum | Servings optimum | Runtime (s) |",
+        "|---:|---|---:|---:|---:|---:|---:|",
     ]
-    for name, aggregate in aggregates.items():
+    for rank, name in enumerate(ranking, start=1):
+        aggregate = aggregates[name]
         lines.append(
-            f"| {name} | {aggregate['valid_cases']}/{case_count} | "
-            f"{aggregate['invalid_days']} | {aggregate['mean_distinct_types']:.2f} | "
-            f"{aggregate['mean_cumulative_daily_types']:.2f} | "
-            f"{aggregate['mean_total_servings']:.2f} | "
+            f"| {rank} | {name} | {aggregate['valid_cases']}/{case_count} | "
+            f"{aggregate['mean_distinct_percent']:.2f}% | "
+            f"{aggregate['mean_daily_percent']:.2f}% | "
+            f"{aggregate['mean_servings_percent']:.2f}% | "
             f"{aggregate['runtime_seconds']:.3f} |"
         )
     if comparisons:
-        lines.extend(("", "## Pairwise lexicographic result", ""))
-        for baseline, counts in comparisons.items():
+        lines.extend(("", "## Average-performance comparison", ""))
+        for baseline, comparison in comparisons.items():
+            own = comparison["method_average_percentages"]
+            other = comparison["baseline_average_percentages"]
             lines.append(
-                f"- vs `{baseline}`: {counts['wins']} wins, {counts['ties']} ties, "
-                f"{counts['losses']} losses"
+                f"- `{method}` ({own['distinct_types']:.2f}%, "
+                f"{own['cumulative_daily_types']:.2f}%, "
+                f"{own['total_servings']:.2f}%) vs `{baseline}` "
+                f"({other['distinct_types']:.2f}%, "
+                f"{other['cumulative_daily_types']:.2f}%, "
+                f"{other['total_servings']:.2f}%): "
+                f"**{comparison['lexicographic_result']}**"
             )
     (report_dir / "report.md").write_text("\n".join(lines) + "\n")
     return report
