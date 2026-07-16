@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hexbench.local/schemas/day-info.json",
+  "title": "HEXUDON daily match information",
+  "type": "object",
+  "required": ["endsAt", "day", "agents", "others", "traffics"],
+  "properties": {
+    "endsAt": {"type": ["number", "null"]},
+    "day": {"type": "integer", "minimum": -1},
+    "agents": {"type": "array", "items": {"$ref": "#/$defs/agent"}},
+    "others": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "agents"],
+        "properties": {
+          "id": {"type": ["integer", "string"]},
+          "agents": {"type": "array", "items": {"$ref": "#/$defs/agent"}}
+        },
+        "additionalProperties": false
+      }
+    },
+    "traffics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["pos", "status"],
+        "properties": {
+          "pos": {"type": "integer", "minimum": 0},
+          "status": {"type": "integer", "minimum": 0, "maximum": 2}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "$defs": {
+    "agent": {
+      "type": "object",
+      "required": ["kind", "pos", "fuel"],
+      "properties": {
+        "kind": {"type": "integer", "minimum": 0, "maximum": 1},
+        "pos": {"type": "integer", "minimum": 0},
+        "fuel": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

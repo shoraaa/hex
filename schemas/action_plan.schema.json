@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hexbench.local/schemas/action-plan.json",
+  "title": "HEXUDON daily action answer",
+  "type": "array",
+  "items": {
+    "type": "array",
+    "minItems": 1,
+    "items": {"type": "integer", "maximum": 5}
+  }
+}
