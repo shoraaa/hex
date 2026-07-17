@@ -101,7 +101,7 @@ struct SearchLimits {
   bool use_aco_seed{true};
   bool use_legacy_seed{true};
   bool use_local_search_seed{true};
-  // Zero selects the policy default: two for ALNS and one for LNS.
+  // Zero selects the policy default: three for ALNS and one for LNS.
   int alns_restarts{};
 };
 

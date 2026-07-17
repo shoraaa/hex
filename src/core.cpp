@@ -1619,6 +1619,7 @@ enum AlnsFeature : unsigned {
   AlnsExactStockBound = 1U << 5U,
   AlnsExactFuelBound = 1U << 6U,
   AlnsAcoSeed = 1U << 7U,
+  AlnsSisrRecreate = 1U << 8U,
 };
 
 constexpr unsigned kAcceptedExactBoundFeatures =
@@ -1676,6 +1677,28 @@ void repair_lns_skeleton(const MapConfig& config, const DayInfo& day,
     for (const auto& route : skeleton.routes) total += route.size();
     return static_cast<int>(total);
   };
+
+  // SISR recreate samples a customer ordering once per repair, then takes a
+  // strongly best-biased random element from that ordering.  HEX has no scalar
+  // customer prize, so the score ordering below uses the official brand tier;
+  // the density orderings prefer spots that are cheap to connect to two/five
+  // other spots.  The 4:4:1:1:1 mix mirrors the useful TOP orderings (random,
+  // score, close-to-start, KNN-2, KNN-5) without importing depot assumptions.
+  int sisr_sort = 0;
+  double sisr_shaw = 0.0;
+  if (mode == 4) {
+    static constexpr std::array<int, 5> weights{4, 4, 1, 1, 1};
+    const int draw = static_cast<int>(random() % 11U);
+    int cumulative = 0;
+    for (std::size_t index = 0; index < weights.size(); ++index) {
+      cumulative += weights[index];
+      if (draw < cumulative) {
+        sisr_sort = static_cast<int>(index);
+        break;
+      }
+    }
+    sisr_shaw = 0.3 * static_cast<double>(random() % 10001U) / 10000.0;
+  }
 
   while (total_visits() < maximum_visits) {
     std::vector<int> assigned(config.spots.size());
@@ -1739,15 +1762,64 @@ void repair_lns_skeleton(const MapConfig& config, const DayInfo& day,
                std::tie(right.projected_time, right.delta, right.tie_break,
                         right.position);
       });
-      options.front().regret =
+      std::size_t option_index = 0;
+      if (mode == 4 && options.size() > 1) {
+        // SISR's blink mechanism occasionally ignores the current cheapest
+        // feasible insertion.  Keep its one-percent rate, but always retain a
+        // feasible fallback so a sequence of blinks cannot truncate repair.
+        while (option_index + 1 < options.size() && random() % 100U == 0U) {
+          ++option_index;
+        }
+      }
+      options[option_index].regret =
           options.size() > 1
               ? options[1].projected_time - options[0].projected_time
               : horizon;
-      candidates.push_back(options.front());
+      candidates.push_back(options[option_index]);
     }
     if (candidates.empty()) break;
+    auto density_distance = [&](int spot, std::size_t neighbours) {
+      std::vector<int> distances;
+      distances.reserve(config.spots.size());
+      const int node = graph.node_for_pos.at(config.spots[spot].pos);
+      for (std::size_t other = 0; other < config.spots.size(); ++other) {
+        if (other == static_cast<std::size_t>(spot)) continue;
+        const int other_node =
+            graph.node_for_pos.at(config.spots[other].pos);
+        distances.push_back(lns_path_time(graph, node, other_node));
+      }
+      std::sort(distances.begin(), distances.end());
+      int total = 0;
+      for (std::size_t index = 0;
+           index < std::min(neighbours, distances.size()); ++index) {
+        total += distances[index];
+      }
+      return total;
+    };
     std::sort(candidates.begin(), candidates.end(), [&](const auto& left,
                                                         const auto& right) {
+      if (mode == 4) {
+        if (sisr_sort == 0) return left.tie_break < right.tie_break;
+        if (sisr_sort == 1) {
+          if (left.tier != right.tier) return left.tier > right.tier;
+          // Within one official-value tier, schedule the difficult insertion
+          // first.  Cheap-first leaves high-detour brands until they no longer
+          // fit; this HEX-specific regret safeguard was stronger in ablation.
+          return std::tie(left.delta, left.tie_break) >
+                 std::tie(right.delta, right.tie_break);
+        }
+        if (sisr_sort == 2) {
+          return std::tie(left.projected_time, left.delta, left.tie_break) <
+                 std::tie(right.projected_time, right.delta, right.tie_break);
+        }
+        const std::size_t neighbours = sisr_sort == 3 ? 2U : 5U;
+        const int left_density = density_distance(left.spot, neighbours);
+        const int right_density = density_distance(right.spot, neighbours);
+        return std::tuple{left.tier, -left_density, -left.delta,
+                          left.tie_break} >
+               std::tuple{right.tier, -right_density, -right.delta,
+                          right.tie_break};
+      }
       if (mode == 1 || mode == 3) {
         if (left.tier != right.tier) return left.tier > right.tier;
         if (left.regret != right.regret) return left.regret > right.regret;
@@ -1758,7 +1830,15 @@ void repair_lns_skeleton(const MapConfig& config, const DayInfo& day,
                       right.position);
     });
     std::size_t selected = 0;
-    if (mode == 2 || mode == 3) {
+    if (mode == 4 && sisr_sort != 0 && sisr_shaw > 0.0001) {
+      const double unit = (static_cast<double>(random() % 1000001U) + 0.5) /
+                          1000001.0;
+      const std::size_t reverse_index = std::min<std::size_t>(
+          candidates.size() - 1,
+          static_cast<std::size_t>(candidates.size() *
+                                   std::pow(unit, sisr_shaw)));
+      selected = candidates.size() - 1 - reverse_index;
+    } else if (mode == 2 || mode == 3) {
       const std::size_t range = std::min<std::size_t>(3, candidates.size());
       selected = static_cast<std::size_t>(random() % range);
     }
@@ -3909,9 +3989,11 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
     mcts[parent].children.push_back(index);
     return index;
   };
+  const int repair_operator_count =
+      (features & AlnsSisrRecreate) != 0U ? 5 : 4;
   for (int destroy = 0; destroy < 5; ++destroy) {
     const int destroy_node = add_node(0);
-    for (int repair = 0; repair < 4; ++repair) {
+    for (int repair = 0; repair < repair_operator_count; ++repair) {
       const int repair_node = add_node(destroy_node);
       for (int travel = 0; travel < 4; ++travel) {
         (void)add_node(repair_node);
@@ -4361,8 +4443,10 @@ ActionPlan build_alns_multirestart_plan(
       0ULL, 0x9e3779b97f4a7c15ULL, 0xbf58476d1ce4e5b9ULL};
   auto plans = parallel_alns_restarts(
       restart_limits.size(), [&](std::size_t index) {
+        const unsigned restart_features =
+            index == 2 ? features | AlnsSisrRecreate : features;
         return build_alns_plan(config, day, history, types,
-                               restart_limits[index], features, true,
+                               restart_limits[index], restart_features, true,
                                restart_salts[index]);
       });
 
@@ -5216,7 +5300,7 @@ ActionPlan plan_day_online(const std::string& policy, const MapConfig& config,
   if (policy == "lns" || policy == "alns") {
     SearchLimits resolved_limits = limits;
     if (resolved_limits.alns_restarts == 0) {
-      resolved_limits.alns_restarts = policy == "alns" ? 2 : 1;
+      resolved_limits.alns_restarts = policy == "alns" ? 3 : 1;
     }
     return build_alns_multirestart_plan(
         config, day, history, fixed_types, resolved_limits,

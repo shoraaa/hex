@@ -69,18 +69,28 @@ sample, but production remained lexicographically better on the complete
 1,000-case suite and a 100-case stratified 3,072-iteration check. Production
 therefore retains all three seed phases.
 
-Production `alns` runs two independent same-day ALNS chains. Restart zero is
-the protected production search; restart one uses the same seed portfolio with
-an independent deterministic ALNS random stream. Both start from the identical
-revealed day state. A non-final alternative is accepted only when it strictly
-improves the official score while preserving ending positions, fuel, generated
-traffic, and resulting distinct-brand history. On the final day, any strict
-official improvement is accepted. Official ties always retain restart zero.
+Production `alns` runs three independent same-day ALNS chains. Restarts zero
+and one are the protected production searches with the established operator
+portfolio and independent deterministic random streams. Restart two is a
+reduced-seed diversification chain with a HEX-adapted SISR recreate arm: it
+samples random, official-brand-tier, close-to-start, KNN-2, and KNN-5 visit
+orderings, uses Shaw-biased selection, and occasionally blinks the cheapest
+feasible insertion. All chains start from the identical revealed day state. A
+non-final alternative is accepted only when it strictly improves the official
+score while preserving ending positions, fuel, generated traffic, and
+resulting distinct-brand history. On the final day, any strict official
+improvement is accepted. Official ties always retain restart zero.
 The 1,000-case 512-iteration promotion gate produced 27 wins, 973 ties, and no
 losses versus one restart, improving mean normalized servings from 67.4378% to
 67.4468% without changing normalized distinct or daily coverage. Set
-`alns_restarts=1` to reproduce the single-restart control or up to 3 for an
-explicit experiment; `lns` remains single-restart by default.
+`alns_restarts=1` to reproduce the single-restart control or `2` to disable the
+SISR diversification chain; `lns` remains single-restart by default.
+
+The SISR chain passed the complete 1,000-case 512-iteration promotion gate
+against the protected two-chain solver with `29` wins, `971` ties, and no
+losses. Mean normalized distinct coverage stayed at `97.55990%`; daily coverage
+improved from `96.26825%` to `96.27004%`, and servings improved from
+`67.44677%` to `67.45301%`. Aggregate benchmark compute increased by `20.2%`.
 
 `quick` contains 30 balanced smoke cases. `full` contains 1,000 cases from a
 deterministic pairwise covering design. Fuel pressure, terrain composition,
