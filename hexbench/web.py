@@ -31,11 +31,6 @@ from .api import (
 from .competition import CompetitionSessionManager
 
 POLICIES = (
-    "greedy",
-    "utility_greedy",
-    "fuel_aware",
-    "stock_maximiser",
-    "coordinated",
     "local_search",
     "lns",
     "alns",

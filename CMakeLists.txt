@@ -12,7 +12,12 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(Boost 1.81 REQUIRED COMPONENTS json)
 find_package(Threads REQUIRED)
 
-add_library(hexudon_core src/core.cpp)
+add_library(hexudon_core
+    src/core.cpp
+    src/local_search.cpp
+    src/aco.cpp
+    src/lns.cpp
+    src/bp.cpp)
 target_include_directories(hexudon_core PUBLIC include)
 target_link_libraries(hexudon_core PUBLIC Boost::json Threads::Threads)
 target_compile_options(hexudon_core PRIVATE -Wall -Wextra -Wpedantic)

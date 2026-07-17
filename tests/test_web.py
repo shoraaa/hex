@@ -24,13 +24,13 @@ def test_dashboard_job_benchmarks_selected_policies(monkeypatch, tmp_path: Path)
 
     def fake_benchmark(game_id, methods, *args, progress=None, **kwargs):
         assert game_id == "question"
-        assert methods == ["greedy", "alns"]
+        assert methods == ["local_search", "alns"]
         assert kwargs["peer_team_ids"] == ["13", "18"]
         assert kwargs["hyperparameters"] == {
-            "greedy": {"max_targets": 3},
+            "local_search": {"passes": 3},
             "alns": web.PRACTICE_BENCHMARK_DEFAULT_HYPERPARAMETERS,
         }
-        progress({"policy": "greedy", "status": "finished"})
+        progress({"policy": "local_search", "status": "finished"})
         return {
             "game_id": "question:13",
             "best_policy": "alns",
@@ -46,7 +46,7 @@ def test_dashboard_job_benchmarks_selected_policies(monkeypatch, tmp_path: Path)
                     "wall_seconds": 0.1,
                 },
                 {
-                    "policy": "greedy",
+                    "policy": "local_search",
                     "rank": 2,
                     "distinct_types": 3,
                     "cumulative_daily_types": 20,
@@ -78,8 +78,8 @@ def test_dashboard_job_benchmarks_selected_policies(monkeypatch, tmp_path: Path)
     try:
         created = app.start_job(
             "question",
-            ["greedy", "alns"],
-            {"greedy": {"max_targets": 3}},
+            ["local_search", "alns"],
+            {"local_search": {"passes": 3}},
         )
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
@@ -248,8 +248,8 @@ def test_dashboard_practice_suite_runs_all_resettable_maps(
     )
 
     def fake_suite(methods, env_path, state_dir, report_dir, **kwargs):
-        assert methods == ["greedy"]
-        assert kwargs["hyperparameters"] == {"greedy": {"max_targets": 3}}
+        assert methods == ["local_search"]
+        assert kwargs["hyperparameters"] == {"local_search": {"passes": 3}}
         kwargs["progress"]({"status": "finished_map", "map": 1, "maps": 1})
         return {
             "schema_version": 1,
@@ -267,8 +267,8 @@ def test_dashboard_practice_suite_runs_all_resettable_maps(
     try:
         created = app.start_job(
             "all",
-            ["greedy"],
-            {"greedy": {"max_targets": 3}},
+            ["local_search"],
+            {"local_search": {"passes": 3}},
             mode="practice_suite",
         )
         deadline = time.monotonic() + 2
