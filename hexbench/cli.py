@@ -13,7 +13,7 @@ from .api import (
     practice_benchmark,
     practice_suite,
 )
-from .generator import generate_suite
+from .generator import HARD_TIERS, generate_hard_suite, generate_suite
 from .runner import grade_suite
 from .tuning import SEED_PROFILES, tune_alns
 
@@ -25,6 +25,26 @@ def build_parser() -> argparse.ArgumentParser:
     generate = subparsers.add_parser("generate", help="generate a deterministic virtual suite")
     generate.add_argument("--suite", choices=("quick", "full"), default="quick")
     generate.add_argument("--out", type=Path, default=Path("cases/quick"))
+
+    hard = subparsers.add_parser(
+        "generate-hard",
+        help="construct the solver-verified graded hard suite (brutal/steady/easy)",
+    )
+    hard.add_argument("--out", type=Path, default=Path("cases/hard"))
+    hard.add_argument("--per-tier", type=int, default=6)
+    hard.add_argument(
+        "--tiers",
+        default=",".join(HARD_TIERS),
+        help="comma-separated subset of " + ",".join(HARD_TIERS),
+    )
+    hard.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="skip ALNS band verification (constructive only; not recommended)",
+    )
+    hard.add_argument("--verify-policy", default="alns")
+    hard.add_argument("--max-attempts", type=int, default=80)
+    hard.add_argument("--binary")
 
     grade = subparsers.add_parser("grade", help="grade a C++ policy locally")
     grade.add_argument("--cases", type=Path, required=True, help="suite manifest.json")
@@ -200,6 +220,18 @@ def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     if args.command == "generate":
         path = generate_suite(args.suite, args.out)
+        print(path)
+    elif args.command == "generate-hard":
+        tiers = tuple(item.strip() for item in args.tiers.split(",") if item.strip())
+        path = generate_hard_suite(
+            args.out,
+            per_tier=args.per_tier,
+            tiers=tiers,
+            binary_path=args.binary,
+            verify=not args.no_verify,
+            verify_policy=args.verify_policy,
+            max_attempts=args.max_attempts,
+        )
         print(path)
     elif args.command == "grade":
         baselines = [item for item in args.baselines.split(",") if item]

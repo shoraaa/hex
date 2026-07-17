@@ -31,6 +31,37 @@ uv run hexbench grade \
   --jobs 8
 ```
 
+### Hard curated suite
+
+The random `quick`/`full` suites are too easy: the reference solver saturates
+the structural optimum of every objective, so the grade cannot separate a
+strong policy from a weak one. `generate-hard` builds a small, solver-verified
+suite with three graded tiers, each engineered so that exactly one objective
+stays below 100% while every higher-priority objective is fully reachable:
+
+| Tier | Target objective held below 100% | How it is made hard |
+| :--- | :--- | :--- |
+| `brutal` | distinct types | large map, every spot a distinct brand spread to far corners, mountain/pond terrain, minimal fuel/agents/steps — even one bowl of every type is impossible |
+| `steady` | cumulative daily types | brands reachable across the whole match, but no single day can touch every brand |
+| `easy` | total servings | every brand every day is reachable, but high stocks and many spots outrun the fleet |
+
+```sh
+uv run hexbench generate-hard --out cases/hard --per-tier 6
+uv run hexbench grade \
+  --cases cases/hard/manifest.json \
+  --method alns --baselines greedy,local_search \
+  --report reports/hard --jobs 8
+```
+
+Each candidate is verified with the strongest policy (ALNS by default): only
+cases whose measured percentages land in the tier's target band are kept, so the
+suite is genuinely discriminating rather than merely nominally "hard". The
+generator writes one grade-ready sub-suite per tier
+(`cases/hard/<tier>/manifest.json`) plus a combined `cases/hard/manifest.json`
+that grades every tier at once; each case records its verified percentages under
+`verification`. Pass `--tiers brutal,steady` to build a subset or `--no-verify`
+for a fast constructive-only draft.
+
 To tune ALNS locally, evaluate a deterministic grid of explicit ALNS iteration
 budgets on the same manifest:
 

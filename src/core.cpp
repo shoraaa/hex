@@ -8,11 +8,13 @@
 #include <cmath>
 #include <cstdlib>
 #include <functional>
+#include <iomanip>
 #include <iterator>
 #include <limits>
 #include <numeric>
 #include <queue>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <tuple>
@@ -2209,7 +2211,8 @@ std::optional<ActionPlan> decode_lns_skeleton(
     const MapConfig& config, const DayInfo& day, const AgentTypes& types,
     const AcoGraph& graph, const std::vector<AcoMeetingList>& meeting_cache,
     const LnsSkeleton& skeleton,
-    const AlnsTravelChoices* travel_choices = nullptr) {
+    const AlnsTravelChoices* travel_choices = nullptr,
+    bool strict_travel = true) {
   const int horizon = config.day_steps[day.day];
   const std::size_t count = day.agents.size();
   const std::size_t nodes = graph.nodes.size();
@@ -2394,9 +2397,14 @@ std::optional<ActionPlan> decode_lns_skeleton(
       } else {
         append_path(patrol, *direct);
       }
-    } else if (travel_choices) {
+    } else if (travel_choices && strict_travel) {
       return std::nullopt;
     }
+    // When strict_travel is false an unreachable leg is simply skipped: the
+    // patrol keeps its position/fuel and the decoder realizes the feasible
+    // subsequence of the skeleton instead of discarding the whole candidate.
+    // This is what lets the ALNS loop produce valid candidates under tight
+    // fuel, where fuel-blind repair routinely over-fills a route.
   }
 
   ActionPlan plan(count);
@@ -3991,7 +3999,8 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
   };
   const int repair_operator_count =
       (features & AlnsSisrRecreate) != 0U ? 5 : 4;
-  for (int destroy = 0; destroy < 5; ++destroy) {
+  constexpr int destroy_operator_count = 6;
+  for (int destroy = 0; destroy < destroy_operator_count; ++destroy) {
     const int destroy_node = add_node(0);
     for (int repair = 0; repair < repair_operator_count; ++repair) {
       const int repair_node = add_node(destroy_node);
@@ -4062,8 +4071,19 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
   long double reheat_temperature = 0.0L;
   std::uniform_real_distribution<long double> unit(0.0L, 1.0L);
 
+  // Opt-in instrumentation (HEXUDON_ALNS_TRACE): diagnoses why ALNS stalls on
+  // hard instances without altering the deterministic search trajectory.
+  static const bool alns_trace = std::getenv("HEXUDON_ALNS_TRACE") != nullptr;
+  int trace_iterations = 0;
+  int trace_invalid = 0;
+  int trace_accepted = 0;
+  int trace_global_improvements = 0;
+  int trace_last_improvement = -1;
+  int trace_restarts = 0;
+
   for (int iteration = 0; iteration < alns_maximum; ++iteration) {
     if (expired()) break;
+    ++trace_iterations;
     const int destroy_node = select_mcts_child(0);
     const int repair_node = select_mcts_child(destroy_node);
     const int travel_node = select_mcts_child(repair_node);
@@ -4085,6 +4105,7 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
     // instances need coordinated route changes that cannot be reached by
     // repeatedly perturbing only the incumbent.
     AlnsSolution candidate = current.solution;
+    const CandidateEvaluation* source_evaluation = &current.evaluation;
     const int elite_exploration_period = std::max(8, diversify_after / 3);
     if (elite.size() > 1 &&
         (stagnation >= elite_exploration_period || random() % 100U < 12U)) {
@@ -4092,17 +4113,19 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
       const std::size_t source =
           static_cast<std::size_t>(random() % source_limit);
       candidate = elite[source].solution;
+      source_evaluation = &elite[source].evaluation;
     }
     int visits = 0;
     for (const auto& route : candidate.skeleton.routes) visits += route.size();
     if (visits > 0) {
       const bool diversify = stagnation >= diversify_after;
-      constexpr std::array<std::pair<double, double>, 5> removal_ranges{{
+      constexpr std::array<std::pair<double, double>, 6> removal_ranges{{
           {0.10, 0.35},  // random removal
           {0.18, 0.45},  // contiguous route segment
           {0.10, 0.28},  // related-neighborhood removal
           {0.14, 0.36},  // rare-brand / saving removal
           {0.24, 0.50},  // longest-route removal
+          {0.14, 0.36},  // refuel-bottleneck removal
       }};
       const auto [minimum_fraction, maximum_fraction] =
           removal_ranges[static_cast<std::size_t>(destroy)];
@@ -4113,15 +4136,25 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
                               (random() % 101) / 100.0;
       const int removed =
           std::max(1, static_cast<int>(std::ceil(visits * fraction)));
-      destroy_lns_skeleton(config, history, graph, candidate.skeleton, destroy,
-                           removed, random);
+      // Mode 5 unloads the busiest refuel car's patrols so repair can re-route
+      // them through a different meeting.  It is a no-op when the current plan
+      // has no refuel events (e.g. all-patrol tight-fuel maps), so fall back to
+      // random removal to keep the iteration productive.
+      if (destroy != 5 ||
+          !destroy_alns_refuel_bottleneck(candidate.skeleton,
+                                          source_evaluation->trace, removed,
+                                          random)) {
+        destroy_lns_skeleton(config, history, graph, candidate.skeleton,
+                             destroy == 5 ? 0 : destroy, removed, random);
+      }
     }
     repair_lns_skeleton(config, day, history, types, graph,
                         candidate.skeleton, repair, random);
     repair_alns_travel(candidate, travel, random,
                        (features & AlnsStableTravel) != 0U);
     auto plan = decode_lns_skeleton(config, day, types, graph, meeting_cache,
-                                    candidate.skeleton, &candidate.travel);
+                                    candidate.skeleton, &candidate.travel,
+                                    /*strict_travel=*/false);
     std::optional<CandidateEvaluation> evaluation;
     if (plan) evaluation = evaluate_candidate(config, day, history, *plan);
     std::optional<CandidateValue> value =
@@ -4185,9 +4218,12 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
         best_value = *value;
         best_evaluation = *evaluation;
         stagnation = 0;
+        ++trace_global_improvements;
+        trace_last_improvement = iteration;
       } else {
         ++stagnation;
       }
+      if (accepted) ++trace_accepted;
       if (new_elite) {
         elite.push_back(
             {candidate, *plan, *value, *evaluation, hash});
@@ -4228,6 +4264,7 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
       backpropagate_mcts(mcts_path, std::min(1.5, reward));
     } else {
       ++stagnation;
+      ++trace_invalid;
       backpropagate_mcts(mcts_path, 0.0);
     }
     ++since_restart;
@@ -4247,11 +4284,46 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
       current = *selected;
       since_restart = 0;
       reheat_temperature = 0.5L * initial_temperature;
+      ++trace_restarts;
     }
     if (iteration + 1 >= minimum && limits.stagnation_iterations > 0 &&
         stagnation >= limits.stagnation_iterations) {
       break;
     }
+  }
+  if (alns_trace) {
+    auto official = alns_official_value(best_value);
+    std::ostringstream line;
+    line << "ALNSTRACE day=" << day.day << " maxit=" << alns_maximum
+         << " run=" << trace_iterations << " invalid=" << trace_invalid
+         << " accepted=" << trace_accepted
+         << " global_impr=" << trace_global_improvements
+         << " last_impr=" << trace_last_improvement
+         << " restarts=" << trace_restarts << " elite=" << elite.size()
+         << " best=(" << std::get<0>(official) << "," << std::get<1>(official)
+         << "," << std::get<2>(official) << ")";
+    line << std::fixed << std::setprecision(3);
+    for (int destroy = 0; destroy < destroy_operator_count; ++destroy) {
+      const int dnode = mcts[0].children[static_cast<std::size_t>(destroy)];
+      const double dv = std::max(1, mcts[dnode].visits);
+      line << " D" << destroy << "=" << mcts[dnode].visits << "v/"
+           << mcts[dnode].reward / dv << "r";
+    }
+    for (int repair = 0; repair < repair_operator_count; ++repair) {
+      int visits = 0;
+      double reward = 0.0;
+      for (int destroy = 0; destroy < destroy_operator_count; ++destroy) {
+        const int dnode = mcts[0].children[static_cast<std::size_t>(destroy)];
+        const int rnode =
+            mcts[dnode].children[static_cast<std::size_t>(repair)];
+        visits += mcts[rnode].visits;
+        reward += mcts[rnode].reward;
+      }
+      line << " R" << repair << "=" << visits << "v/"
+           << reward / std::max(1, visits) << "r";
+    }
+    std::fprintf(stderr, "%s\n", line.str().c_str());
+    std::fflush(stderr);
   }
   if (allow_continuation && config.players == 1 &&
       day.day + 2 == static_cast<int>(config.day_steps.size()) &&
