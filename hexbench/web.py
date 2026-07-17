@@ -14,6 +14,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from .api import (
     BASE_URL,
+    _official_score_key,
+    _score_detail,
     _suite_map_summary,
     discover_assigned_games,
     discover_practice_questions,
@@ -193,12 +195,96 @@ class DashboardApp:
         try:
             board = client.get("/game/board", game_id)
             resolved = str(board.get("game_id", game_id))
-            if not board.get("is_practice"):
-                raise ValueError("replay is only available for practice games")
             if team_id:
                 question_id = resolved.split(":", 1)[0]
                 resolved = f"{question_id}:{team_id}"
-            return {"game_id": resolved, "replay": client.get("/game/practice/peer", resolved)}
+                endpoint = "/game/practice/peer"
+            else:
+                endpoint = "/game/replay"
+            return {"game_id": resolved, "replay": client.get(endpoint, resolved)}
+        finally:
+            client.close()
+
+    def standings(self, game_id: str) -> dict[str, Any]:
+        """Build the official practice ranking for every configured match team."""
+        from .api import GameClient
+
+        token = load_token(self.env_path)
+        games = discover_assigned_games(token, self.base_url)
+        descriptor = next(
+            (game for game in games if game.get("question_id") == game_id),
+            None,
+        )
+        if descriptor is None:
+            raise ValueError("game not found")
+        if not descriptor.get("is_practice"):
+            raise ValueError("peer standings are only available for practice games")
+        client = GameClient(token, self.base_url)
+        try:
+            board = client.get("/game/board", game_id)
+            resolved = str(board.get("game_id", game_id))
+            question_id, own_team_id = resolved.rsplit(":", 1)
+            detail: dict[str, dict[str, Any]] = {}
+            errors: dict[str, str] = {}
+            zero = {
+                "distinct_types": 0,
+                "cumulative_daily_types": 0,
+                "total_servings": 0,
+                "cumulative_response_time": 0.0,
+            }
+            for team_id in descriptor.get("team_ids", []):
+                team_id = str(team_id)
+                composite = f"{question_id}:{team_id}"
+                try:
+                    detail[team_id] = {
+                        **zero,
+                        **_score_detail(
+                            client.get("/game/practice/score", composite),
+                            composite,
+                        ),
+                    }
+                except RuntimeError as error:
+                    detail[team_id] = dict(zero)
+                    errors[team_id] = str(error)
+            ranking = sorted(
+                detail,
+                key=lambda team_id: _official_score_key(detail[team_id]),
+                reverse=True,
+            )
+            return {
+                "ranking": ranking,
+                "detail": detail,
+                "teams": descriptor.get("teams", []),
+                "own_team_id": own_team_id,
+                "errors": errors,
+            }
+        finally:
+            client.close()
+
+    def answers(self, game_id: str) -> dict[str, Any]:
+        from .api import GameClient
+
+        client = GameClient(load_token(self.env_path), self.base_url)
+        try:
+            board = client.get("/game/board", game_id)
+            resolved = str(board.get("game_id", game_id))
+            return {"game_id": resolved, **client.get("/game/actions", resolved)}
+        finally:
+            client.close()
+
+    def reset_game(self, game_id: str) -> dict[str, Any]:
+        from .api import GameClient
+
+        client = GameClient(load_token(self.env_path), self.base_url)
+        try:
+            board = client.get("/game/board", game_id)
+            if not board.get("is_practice") or board.get("no_reset"):
+                raise ValueError("only resettable practice games can be reset")
+            resolved = str(board.get("game_id", game_id))
+            self._competition.cancel_game_sessions(resolved)
+            response = client.post("/game/practice/reset", {"game_id": resolved})
+            self._competition.clear_game_journal(resolved)
+            return response
         finally:
             client.close()
 
@@ -207,8 +293,17 @@ class DashboardApp:
         game_id: str,
         method: str,
         hyperparameters: dict[str, int | float] | None = None,
+        *,
+        execution_mode: str = "manual",
+        target_day: int | None = None,
     ) -> dict[str, Any]:
-        return self._competition.start_session(game_id, method, hyperparameters)
+        return self._competition.start_session(
+            game_id,
+            method,
+            hyperparameters,
+            execution_mode=execution_mode,
+            target_day=target_day,
+        )
 
     def get_competition(self, session_id: str) -> dict[str, Any] | None:
         return self._competition.get_session(session_id)
@@ -221,6 +316,38 @@ class DashboardApp:
     ) -> dict[str, Any]:
         return self._competition.approve(
             session_id, fingerprint=fingerprint, allow_fallback=allow_fallback
+        )
+
+    def submit_competition(
+        self,
+        session_id: str,
+        fingerprint: str,
+        *,
+        types: list[int] | None = None,
+        actions: list[list[int]] | None = None,
+        allow_fallback: bool = False,
+    ) -> dict[str, Any]:
+        return self._competition.submit_proposal(
+            session_id,
+            fingerprint=fingerprint,
+            types=types,
+            actions=actions,
+            allow_fallback=allow_fallback,
+        )
+
+    def competition_curl(
+        self,
+        session_id: str,
+        fingerprint: str,
+        *,
+        types: list[int] | None = None,
+        actions: list[list[int]] | None = None,
+    ) -> dict[str, Any]:
+        return self._competition.curl_command(
+            session_id,
+            fingerprint=fingerprint,
+            types=types,
+            actions=actions,
         )
 
     def control_competition(self, session_id: str, action: str) -> dict[str, Any]:
@@ -614,7 +741,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         parsed = urlparse(self.path)
         path = parsed.path
-        if path == "/":
+        if path == "/" or path.startswith("/competition/game/"):
             self._html()
             return
         if path.startswith("/assets/"):
@@ -681,6 +808,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except (RuntimeError, ValueError) as error:
                 self._json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
             return
+        if path.startswith("/api/games/") and path.endswith("/standings"):
+            game_id = unquote(path.removeprefix("/api/games/").removesuffix("/standings")).strip("/")
+            try:
+                self._json(HTTPStatus.OK, self.app.standings(game_id))
+            except (RuntimeError, ValueError) as error:
+                self._json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+            return
         if path.startswith("/api/games/") and path.endswith("/replay"):
             game_id = unquote(path.removeprefix("/api/games/").removesuffix("/replay")).strip("/")
             team_id = parse_qs(parsed.query).get("team_id", [None])[0]
@@ -689,11 +823,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except (RuntimeError, ValueError) as error:
                 self._json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
             return
-        if path == "/api/competition/sessions":
+        if path.startswith("/api/games/") and path.endswith("/answers"):
+            game_id = unquote(path.removeprefix("/api/games/").removesuffix("/answers")).strip("/")
+            try:
+                self._json(HTTPStatus.OK, self.app.answers(game_id))
+            except (RuntimeError, ValueError) as error:
+                self._json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+            return
+        if path in {"/api/competition/sessions", "/api/play/sessions"}:
             self._json(HTTPStatus.OK, {"sessions": self.app.competition_sessions()})
             return
-        if path.startswith("/api/competition/sessions/"):
-            session = self.app.get_competition(path.removeprefix("/api/competition/sessions/"))
+        if path.startswith("/api/competition/sessions/") or path.startswith("/api/play/sessions/"):
+            prefix = "/api/play/sessions/" if path.startswith("/api/play/") else "/api/competition/sessions/"
+            session = self.app.get_competition(path.removeprefix(prefix))
             if session is None:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "session not found"})
             else:
@@ -707,7 +849,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "/api/jobs",
             "/api/practice/runs",
             "/api/competition/sessions",
-        } and not path.startswith("/api/competition/sessions/"):
+            "/api/play/sessions",
+        } and not path.startswith("/api/competition/sessions/") and not path.startswith("/api/play/sessions/") and not (
+            path.startswith("/api/games/") and path.endswith("/reset")
+        ):
             self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
             return
         try:
@@ -719,19 +864,34 @@ class DashboardHandler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length))
             if not isinstance(payload, dict):
                 raise ValueError("request body must be an object")
-            if path == "/api/competition/sessions":
+            if path.startswith("/api/games/") and path.endswith("/reset"):
+                game_id = unquote(path.removeprefix("/api/games/").removesuffix("/reset")).strip("/")
+                self._json(HTTPStatus.OK, self.app.reset_game(game_id))
+                return
+            if path in {"/api/competition/sessions", "/api/play/sessions"}:
                 game_id = payload.get("game_id")
-                method = payload.get("method", "local_search")
+                method = payload.get("method", "alns")
                 hyperparameters = payload.get("hyperparameters")
+                execution_mode = payload.get("execution_mode", "manual")
+                target_day = payload.get("target_day")
                 if not isinstance(game_id, str) or not isinstance(method, str):
                     raise ValueError("game_id and method are required")
                 if hyperparameters is not None and not isinstance(hyperparameters, dict):
                     raise ValueError("hyperparameters must be an object")
-                session = self.app.start_competition(game_id, method, hyperparameters)
+                if not isinstance(execution_mode, str):
+                    raise ValueError("execution_mode must be a string")
+                session = self.app.start_competition(
+                    game_id,
+                    method,
+                    hyperparameters,
+                    execution_mode=execution_mode,
+                    target_day=target_day,
+                )
                 self._json(HTTPStatus.ACCEPTED, session)
                 return
-            if path.startswith("/api/competition/sessions/"):
-                session_id = path.removeprefix("/api/competition/sessions/").removesuffix("/approve").removesuffix("/control").strip("/")
+            if path.startswith("/api/competition/sessions/") or path.startswith("/api/play/sessions/"):
+                prefix = "/api/play/sessions/" if path.startswith("/api/play/") else "/api/competition/sessions/"
+                session_id = path.removeprefix(prefix).removesuffix("/approve").removesuffix("/submit").removesuffix("/curl").removesuffix("/control").strip("/")
                 if path.endswith("/approve"):
                     fingerprint = payload.get("fingerprint")
                     if not isinstance(fingerprint, str):
@@ -740,6 +900,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         session_id,
                         fingerprint,
                         bool(payload.get("allow_fallback", False)),
+                    )
+                elif path.endswith("/submit"):
+                    fingerprint = payload.get("fingerprint")
+                    if not isinstance(fingerprint, str):
+                        raise ValueError("fingerprint is required")
+                    session = self.app.submit_competition(
+                        session_id,
+                        fingerprint,
+                        types=payload.get("types"),
+                        actions=payload.get("actions"),
+                        allow_fallback=bool(payload.get("allow_fallback", False)),
+                    )
+                elif path.endswith("/curl"):
+                    fingerprint = payload.get("fingerprint")
+                    if not isinstance(fingerprint, str):
+                        raise ValueError("fingerprint is required")
+                    session = self.app.competition_curl(
+                        session_id,
+                        fingerprint,
+                        types=payload.get("types"),
+                        actions=payload.get("actions"),
                     )
                 elif path.endswith("/control"):
                     action = payload.get("action")

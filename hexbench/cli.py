@@ -15,7 +15,7 @@ from .api import (
 )
 from .generator import generate_suite
 from .runner import grade_suite
-from .tuning import tune_alns
+from .tuning import SEED_PROFILES, tune_alns
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -146,6 +146,9 @@ def build_parser() -> argparse.ArgumentParser:
     time_curve.add_argument("--env", type=Path, default=Path(".env"))
     time_curve.add_argument("--binary")
     time_curve.add_argument("--base-url", default=BASE_URL)
+    time_curve.add_argument(
+        "--seed-profile", choices=tuple(SEED_PROFILES), default="production"
+    )
 
     tune = subparsers.add_parser(
         "alns-tune",
@@ -163,10 +166,21 @@ def build_parser() -> argparse.ArgumentParser:
         default="0",
         help="comma-separated stopping-after-stagnation values; 0 disables it",
     )
+    tune.add_argument(
+        "--seed-profiles",
+        default="production",
+        help="comma-separated seed profiles: " + ",".join(SEED_PROFILES),
+    )
     tune.add_argument("--report", type=Path, default=Path("reports/alns-tuning"))
     tune.add_argument("--binary")
     tune.add_argument("--jobs", type=int, default=0, help="parallel workers; 0=auto")
     tune.add_argument("--timeout", type=float, default=60, help="per case timeout in seconds")
+    tune.add_argument(
+        "--case-stride",
+        type=int,
+        default=1,
+        help="evaluate every Nth manifest case; 1 evaluates the complete suite",
+    )
 
     web = subparsers.add_parser(
         "web", help="serve the Practice and Competition operations console"
@@ -322,6 +336,7 @@ def main(argv: list[str] | None = None) -> None:
             jobs=args.jobs,
             binary_path=args.binary,
             base_url=args.base_url,
+            seed_profile=args.seed_profile,
         )
         print(
             json.dumps(
@@ -342,9 +357,13 @@ def main(argv: list[str] | None = None) -> None:
             alns_iterations=parse_values(args.alns_iterations),
             min_iterations=parse_values(args.min_iterations),
             stagnation_iterations=parse_values(args.stagnation_iterations),
+            seed_profiles=[
+                item.strip() for item in args.seed_profiles.split(",") if item.strip()
+            ],
             binary_path=args.binary,
             jobs=None if args.jobs == 0 else args.jobs,
             timeout=args.timeout,
+            case_stride=args.case_stride,
         )
         print(json.dumps({"report": str(args.report / "report.json"), "best": report["best"]["parameters"]}))
     elif args.command == "web":

@@ -26,6 +26,7 @@ BASE_URL = "https://hexudon.hairbui76.id.vn/api"
 # starts and passed to the C++ planner only for the named policy. Empty entries
 # preserve that policy's compiled defaults.
 ALNS_HYPERPARAMETERS = (
+    {"key": "alns_restarts", "label": "Independent ALNS restarts", "type": "integer", "min": 1, "max": 3, "step": 1, "recommended": 2, "help": "Independent same-day ALNS chains; production uses two and protects restart 0 on ties."},
     {"key": "time_limit_ms", "label": "ALNS wall-clock limit", "unit": "ms", "type": "integer", "min": 50, "step": 50, "ui_max": 10_000, "help": "Timed mode; mutually exclusive with ALNS iterations."},
     {"key": "alns_iterations", "label": "ALNS iterations on days 1–6", "unit": "iterations/day", "type": "integer", "min": 1, "step": 1, "ui_min": 32, "ui_max": 12_000, "ui_step": 32, "recommended": 1_536, "help": "Literal untimed ALNS loop count on every non-final day; exact-search nodes are additional work."},
     {"key": "final_alns_iterations", "label": "ALNS iterations on final day", "unit": "iterations", "type": "integer", "min": 1, "max": 12_000, "step": 1, "recommended": 1_024, "help": "Literal final-day ALNS loop count. Leave blank to reuse the non-final count."},
@@ -842,7 +843,10 @@ def _question_data(question: dict[str, Any]) -> dict[str, Any]:
 
 
 def _game_descriptor(
-    question: dict[str, Any], data: dict[str, Any], own_team_id: str | None
+    question: dict[str, Any],
+    data: dict[str, Any],
+    own_team_id: str | None,
+    match_teams: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """Normalize a manager question into a safe UI-facing game descriptor.
 
@@ -851,6 +855,11 @@ def _game_descriptor(
     must be operated exactly like a live competition.
     """
     teams = [str(team.get("team_id")) for team in data.get("teams", []) if isinstance(team, dict)]
+    names = {
+        str(team.get("id")): str(team.get("name"))
+        for team in match_teams or []
+        if isinstance(team, dict) and team.get("id") is not None and team.get("name")
+    }
     if own_team_id is not None and teams and own_team_id not in teams:
         return None
     game_map = data.get("map", {}) if isinstance(data.get("map"), dict) else {}
@@ -874,6 +883,10 @@ def _game_descriptor(
         "day_steps": list(data.get("daySteps", [])),
         "players": data.get("players"),
         "team_ids": teams,
+        "teams": [
+            {"id": team_id, "name": names.get(team_id, f"Team {team_id}")}
+            for team_id in teams
+        ],
         "starts_at": data.get("startsAt"),
         "capabilities": {
             "reset": practice_lab,
@@ -911,10 +924,38 @@ def discover_assigned_games(
 
     own_team_id = _token_team_id(token)
     discovered: list[dict[str, Any]] = []
+    matches: dict[str, list[dict[str, Any]]] = {}
     for question in questions:
         if not isinstance(question, dict):
             continue
-        descriptor = _game_descriptor(question, _question_data(question), own_team_id)
+        match_id = question.get("match_id")
+        if match_id is None and isinstance(question.get("match"), dict):
+            match_id = question["match"].get("id")
+        match_key = str(match_id) if match_id is not None else ""
+        if match_key and match_key not in matches:
+            try:
+                match_response = httpx.get(
+                    f"{_manager_authority(base_url)}/manager/api/match/{match_key}",
+                    headers={"Authorization": token},
+                    timeout=15,
+                )
+                match_response.raise_for_status()
+                match_payload = match_response.json()
+                if isinstance(match_payload, dict) and isinstance(match_payload.get("data"), dict):
+                    match_payload = match_payload["data"]
+                matches[match_key] = (
+                    match_payload.get("teams", [])
+                    if isinstance(match_payload, dict)
+                    else []
+                )
+            except (httpx.HTTPError, ValueError):
+                matches[match_key] = []
+        descriptor = _game_descriptor(
+            question,
+            _question_data(question),
+            own_team_id,
+            matches.get(match_key, []),
+        )
         if descriptor is not None:
             discovered.append(descriptor)
     return discovered
@@ -1200,10 +1241,15 @@ def lns_time_benchmark(
     jobs: int = 0,
     binary_path: str | None = None,
     base_url: str = BASE_URL,
+    seed_profile: str = "production",
 ) -> dict[str, Any]:
     """Measure an LNS-family score curve as its daily budget grows."""
     if method not in {"lns", "alns"}:
         raise ValueError("time benchmark method must be lns or alns")
+    from .tuning import SEED_PROFILES
+
+    if seed_profile not in SEED_PROFILES:
+        raise ValueError(f"unknown ALNS seed profile: {seed_profile}")
     if (
         not math.isfinite(fuel_multiplier)
         or fuel_multiplier <= 0
@@ -1263,6 +1309,17 @@ def lns_time_benchmark(
             "min_iterations": 1,
             "max_iterations": 10_000_000,
             "stagnation_iterations": 0,
+            **{
+                {
+                    "acoAnts": "aco_ants",
+                    "acoIterations": "aco_iterations",
+                    "useAcoSeed": "use_aco_seed",
+                    "useLegacySeed": "use_legacy_seed",
+                    "useLocalSearchSeed": "use_local_search_seed",
+                    "alnsRestarts": "alns_restarts",
+                }[key]: value
+                for key, value in SEED_PROFILES[seed_profile].items()
+            },
         }
         started = time.perf_counter()
         result = run_core(
@@ -1280,7 +1337,12 @@ def lns_time_benchmark(
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         evaluated = list(executor.map(evaluate, tasks))
     wall_seconds = time.perf_counter() - wall_started
-    for case in cases:
+    fixture_dir = report_dir / "cases"
+    fixture_dir.mkdir(parents=True, exist_ok=True)
+    for case_index, case in enumerate(cases):
+        fixture_path = fixture_dir / f"case-{case_index:04d}.json"
+        fixture_path.write_text(json.dumps(case["scenario"], indent=2) + "\n")
+        case["scenario_path"] = str(fixture_path.relative_to(report_dir))
         case["results"] = {}
         case.pop("scenario", None)
     for case_index, budget, result in evaluated:
@@ -1326,6 +1388,7 @@ def lns_time_benchmark(
         "schema_version": 1,
         "kind": "lns-time-curve",
         "method": method,
+        "seed_profile": seed_profile,
         "fuel_multiplier": fuel_multiplier,
         "time_limits_ms": list(budgets),
         "map_count": len(cases),

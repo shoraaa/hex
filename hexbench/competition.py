@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import shlex
 import threading
 import time
 import uuid
@@ -49,15 +50,18 @@ def _fingerprint(value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()[:16]
 
 
-def _history_for_planner(journal: dict[str, Any]) -> dict[str, Any]:
+def _history_for_planner(
+    journal: dict[str, Any], before_day: int | None = None
+) -> dict[str, Any]:
     submitted = journal.get("submitted_days", {})
+    days = sorted(
+        int(day)
+        for day in submitted
+        if before_day is None or int(day) < before_day
+    )
     return {
         "distinct_brands": list(journal.get("distinct_brands", [])),
-        "submitted_actions": [
-            submitted[str(day)]
-            for day in range(len(submitted))
-            if str(day) in submitted
-        ],
+        "submitted_actions": [submitted[str(day)] for day in days],
     }
 
 
@@ -153,12 +157,73 @@ class CompetitionSessionManager:
             value = self._sessions.get(session_id)
             return copy.deepcopy(value) if value is not None else None
 
+    def cancel_game_sessions(self, game_id: str, *, timeout: float = 5.0) -> list[str]:
+        """Stop every local controller before a reset mutates the remote game."""
+        cancelled: list[str] = []
+        threads: list[threading.Thread] = []
+        with self._lock:
+            for session_id, session in self._sessions.items():
+                if session.get("game_id") != game_id or session.get("state") in {
+                    "finished",
+                    "cancelled",
+                    "failed",
+                }:
+                    continue
+                session.update(
+                    state="cancelled",
+                    proposal=None,
+                    approval=None,
+                    error=None,
+                    progress={"status": "cancelled"},
+                    updated_at=_now(),
+                )
+                session.setdefault("events", []).append(
+                    {"at": session["updated_at"], "status": "cancelled"}
+                )
+                _write_json(self._session_path(session_id), session)
+                event = self._events.get(session_id)
+                if event is not None:
+                    event.set()
+                thread = self._threads.get(session_id)
+                if thread is not None and thread.is_alive():
+                    threads.append(thread)
+                cancelled.append(session_id)
+        deadline = time.monotonic() + timeout
+        for thread in threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        if any(thread.is_alive() for thread in threads):
+            raise RuntimeError("planner session is still stopping; retry reset")
+        return cancelled
+
+    def clear_game_journal(self, game_id: str) -> None:
+        digest = hashlib.sha256(game_id.encode()).hexdigest()[:24]
+        _write_json(
+            self.state_dir / f"{digest}.json",
+            {
+                "types": None,
+                "submitted_days": {},
+                "day_snapshots": {},
+                "distinct_brands": [],
+            },
+        )
+
     def start_session(
         self,
         game_id: str,
         method: str,
         hyperparameters: dict[str, int | float] | None = None,
+        *,
+        execution_mode: str = "manual",
+        target_day: int | None = None,
     ) -> dict[str, Any]:
+        if execution_mode not in {"manual", "auto", "curl"}:
+            raise ValueError("execution_mode must be manual, auto, or curl")
+        if target_day is not None and (
+            isinstance(target_day, bool) or not isinstance(target_day, int) or target_day < 0
+        ):
+            raise ValueError("target_day must be a non-negative integer")
+        if execution_mode == "auto" and target_day is not None:
+            raise ValueError("auto mode cannot target an earlier practice day")
         if method not in POLICY_HYPERPARAMETERS:
             raise ValueError(f"unknown policy: {method}")
         normalized = normalize_hyperparameters([method], {method: hyperparameters or {}}).get(method, {})
@@ -188,10 +253,15 @@ class CompetitionSessionManager:
                 "competition_kind": "practice_competition" if board.get("is_practice") else "competition",
                 "is_practice": bool(board.get("is_practice")),
                 "no_reset": bool(board.get("no_reset")),
-                "capabilities": {"reset": False, "submit": True},
+                "capabilities": {
+                    "reset": bool(board.get("is_practice") and not board.get("no_reset")),
+                    "submit": True,
+                },
             }
-        if descriptor["mode"] != "competition":
-            raise ValueError("resettable practice games belong in Practice mode")
+        if target_day is not None and (
+            not descriptor.get("is_practice") or descriptor.get("no_reset")
+        ):
+            raise ValueError("target_day is only available for resettable practice games")
         canonical = str(snapshot.get("game_id", game_id))
         with self._lock:
             for row in self._sessions.values():
@@ -207,6 +277,8 @@ class CompetitionSessionManager:
                 "game_id": canonical,
                 "method": method,
                 "hyperparameters": normalized,
+                "execution_mode": execution_mode,
+                "target_day": target_day,
                 "state": "starting",
                 "snapshot": snapshot,
                 "proposal": None,
@@ -261,6 +333,174 @@ class CompetitionSessionManager:
             self._events[session_id].set()
             return copy.deepcopy(session)
 
+    def submit_proposal(
+        self,
+        session_id: str,
+        *,
+        fingerprint: str,
+        types: list[int] | None = None,
+        actions: list[list[int]] | None = None,
+        allow_fallback: bool = False,
+    ) -> dict[str, Any]:
+        """Validate the exact editor value and queue one authoritative submission."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise ValueError("session not found")
+            proposal = session.get("proposal")
+            if session.get("state") not in {
+                "awaiting_role_approval",
+                "awaiting_plan_approval",
+            } or not proposal:
+                raise ValueError("session is not waiting for a proposal")
+            if fingerprint != proposal.get("fingerprint"):
+                raise ValueError("proposal is stale; refresh before submitting")
+            if proposal.get("fallback") and not allow_fallback:
+                raise ValueError("fallback wait requires explicit allow_fallback")
+            if proposal["kind"] == "agent_types":
+                candidate = proposal.get("types") if types is None else types
+                if not isinstance(candidate, list):
+                    raise ValueError("types must be an array")
+                try:
+                    validate_agent_types(
+                        candidate, len(session["snapshot"]["config"]["agents"])
+                    )
+                except Exception as error:
+                    raise ValueError(str(error)) from None
+                proposal["types"] = [int(value) for value in candidate]
+            else:
+                candidate = proposal.get("actions") if actions is None else actions
+                if not isinstance(candidate, list):
+                    raise ValueError("actions must be an array")
+                day = session.get("snapshot", {}).get("day")
+                if not isinstance(day, dict):
+                    day = proposal.get("day_snapshot")
+                config = session.get("snapshot", {}).get("config")
+                if not isinstance(day, dict) or not isinstance(config, dict):
+                    raise ValueError("proposal no longer has a day snapshot")
+                try:
+                    validate_action_shape(candidate, len(day.get("agents", [])))
+                except Exception as error:
+                    raise ValueError(str(error)) from None
+                _, journal = self._journal(session["game_id"])
+                history = _history_for_planner(journal, int(day["day"]))
+                check = run_core(
+                    "check",
+                    session["method"],
+                    {
+                        "config": config,
+                        "day_info": day,
+                        "history": history,
+                        "actions": candidate,
+                    },
+                    binary=find_binary(self.binary_path),
+                )
+                if not check.get("valid"):
+                    raise ValueError(str(check.get("error") or "invalid action plan"))
+                proposal.update(
+                    actions=candidate,
+                    validation=check,
+                    trace=trace_action_plan(
+                        config,
+                        day,
+                        history,
+                        candidate,
+                        binary_path=self.binary_path,
+                    ),
+                    fallback=False,
+                    planner_error=None,
+                )
+            proposal["fingerprint"] = _fingerprint(
+                {key: value for key, value in proposal.items() if key != "fingerprint"}
+            )
+            session["proposal"] = proposal
+            session["approval"] = {
+                "fingerprint": proposal["fingerprint"],
+                "allow_fallback": bool(allow_fallback),
+                "approved_at": _now(),
+            }
+            session["progress"] = {"status": "approval_received"}
+            session["updated_at"] = _now()
+            session.setdefault("events", []).append(
+                {"at": session["updated_at"], "status": "approval_received"}
+            )
+            _write_json(self._session_path(session_id), session)
+            self._events[session_id].set()
+            return copy.deepcopy(session)
+
+    def curl_command(
+        self,
+        session_id: str,
+        *,
+        fingerprint: str,
+        types: list[int] | None = None,
+        actions: list[list[int]] | None = None,
+    ) -> dict[str, Any]:
+        """Return an explicitly requested, executable command. Never persist the token."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None or not session.get("proposal"):
+                raise ValueError("session has no proposal")
+            proposal = copy.deepcopy(session["proposal"])
+            if fingerprint != proposal.get("fingerprint"):
+                raise ValueError("proposal is stale; refresh before generating curl")
+            if proposal["kind"] == "agent_types":
+                candidate = proposal.get("types") if types is None else types
+                try:
+                    validate_agent_types(
+                        candidate, len(session["snapshot"]["config"]["agents"])
+                    )
+                except Exception as error:
+                    raise ValueError(str(error)) from None
+                body = {
+                    "game_id": proposal["submission_game_id"],
+                    "types": candidate,
+                }
+            else:
+                candidate = proposal.get("actions") if actions is None else actions
+                if actions is not None:
+                    # Reuse the exact manual validation path without approving it.
+                    day = session.get("snapshot", {}).get("day")
+                    config = session.get("snapshot", {}).get("config")
+                    try:
+                        validate_action_shape(candidate, len(day.get("agents", [])))
+                    except Exception as error:
+                        raise ValueError(str(error)) from None
+                    _, journal = self._journal(session["game_id"])
+                    check = run_core(
+                        "check",
+                        session["method"],
+                        {
+                            "config": config,
+                            "day_info": day,
+                            "history": _history_for_planner(journal, int(day["day"])),
+                            "actions": candidate,
+                        },
+                        binary=find_binary(self.binary_path),
+                    )
+                    if not check.get("valid"):
+                        raise ValueError(str(check.get("error") or "invalid action plan"))
+                body = {
+                    "game_id": proposal["submission_game_id"],
+                    "day": int(proposal["day"]),
+                    "actions": candidate,
+                }
+            token = load_token(self.env_path)
+            url = f"{self.base_url.rstrip('/')}{proposal['submission_endpoint']}"
+            command = " ".join(
+                (
+                    "curl --fail-with-body -X POST",
+                    shlex.quote(url),
+                    "-H",
+                    shlex.quote(f"Authorization: Bearer {token}"),
+                    "-H",
+                    shlex.quote("Content-Type: application/json"),
+                    "--data-raw",
+                    shlex.quote(json.dumps(body, separators=(",", ":"))),
+                )
+            )
+            return {"command": command, "endpoint": proposal["submission_endpoint"]}
+
     def control(self, session_id: str, action: str) -> dict[str, Any]:
         if action not in {"pause", "resume", "cancel", "replan"}:
             raise ValueError("control action must be pause, resume, cancel, or replan")
@@ -308,6 +548,8 @@ class CompetitionSessionManager:
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
+                return
+            if session.get("state") == "cancelled" and values.get("state") != "cancelled":
                 return
             updated_at = _now()
             previous_state = session.get("state")
@@ -363,6 +605,131 @@ class CompetitionSessionManager:
         journal.setdefault("types", None)
         return path, journal
 
+    def _sync_actions(
+        self,
+        client: GameClient,
+        resolved_id: str,
+        journal: dict[str, Any],
+    ) -> None:
+        """Import accepted actions, including submissions made by copied curl."""
+        try:
+            response = client.get("/game/actions", resolved_id)
+        except Exception:
+            # This read-only synchronization is optional on older hosts.
+            return
+        team_id = resolved_id.rsplit(":", 1)[-1]
+        for row in response.get("actions", []):
+            if str(row.get("team_id")) != team_id or not isinstance(row.get("plan"), list):
+                continue
+            journal["submitted_days"][str(int(row["day"]))] = row["plan"]
+
+    @staticmethod
+    def _accepted_action(
+        client: GameClient, resolved_id: str, day: int
+    ) -> dict[str, Any] | None:
+        try:
+            response = client.get("/game/actions", resolved_id)
+        except Exception:
+            return None
+        team_id = resolved_id.rsplit(":", 1)[-1]
+        return next(
+            (
+                row
+                for row in response.get("actions", [])
+                if str(row.get("team_id")) == team_id
+                and int(row.get("day", -1)) == day
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _action_marker(row: dict[str, Any] | None) -> tuple[Any, ...] | None:
+        if row is None:
+            return None
+        return (
+            row.get("submit_count"),
+            row.get("submitted_at"),
+            json.dumps(row.get("plan"), sort_keys=True),
+        )
+
+    def _historical_day(
+        self,
+        client: GameClient,
+        resolved_id: str,
+        config: dict[str, Any],
+        target_day: int,
+        journal: dict[str, Any],
+    ) -> dict[str, Any]:
+        replay = client.get("/game/replay", resolved_id)
+        replay_day = next(
+            (row for row in replay.get("days", []) if int(row.get("day", -1)) == target_day),
+            None,
+        )
+        if replay_day is None:
+            raise ValueError(f"replay does not contain day {target_day + 1}")
+        team_id = resolved_id.rsplit(":", 1)[-1]
+        team = next(
+            (row for row in replay_day.get("teams", []) if str(row.get("team_id")) == team_id),
+            None,
+        )
+        if team is None or not team.get("frames"):
+            raise ValueError("replay does not contain this team's starting frame")
+        frame = team["frames"][0]
+        journal["submitted_days"] = {
+            key: value
+            for key, value in journal.get("submitted_days", {}).items()
+            if int(key) < target_day
+        }
+        journal["day_snapshots"] = {
+            key: value
+            for key, value in journal.get("day_snapshots", {}).items()
+            if int(key) < target_day
+        }
+        brands: set[int] = set()
+        spot_brand = {int(spot["pos"]): int(spot["brand"]) for spot in config.get("spots", [])}
+        for prior in replay.get("days", []):
+            if int(prior.get("day", -1)) >= target_day:
+                continue
+            own = next(
+                (row for row in prior.get("teams", []) if str(row.get("team_id")) == team_id),
+                None,
+            )
+            for prior_frame in (own or {}).get("frames", []):
+                for position in prior_frame.get("collected", []):
+                    if int(position) in spot_brand:
+                        brands.add(spot_brand[int(position)])
+        journal["distinct_brands"] = sorted(brands)
+        agents = [
+            {
+                "kind": 1 if agent.get("type") == "refuel" else 0,
+                "pos": int(agent["cell"]),
+                "fuel": agent.get("fuel"),
+            }
+            for agent in frame.get("agents", [])
+        ]
+        return {
+            "day": target_day,
+            "steps": int(replay_day.get("steps", config["daySteps"][target_day])),
+            "agents": agents,
+            "others": [],
+            "traffics": [
+                {"pos": int(pos), "status": int(value)}
+                for pos, value in replay_day.get("road_condition", {}).items()
+            ],
+            "endsAt": None,
+        }
+
+    @staticmethod
+    def _decorate_proposal(
+        proposal: dict[str, Any], endpoint: str, game_id: str
+    ) -> dict[str, Any]:
+        proposal["submission_endpoint"] = endpoint
+        proposal["submission_game_id"] = game_id
+        proposal["fingerprint"] = _fingerprint(
+            {key: value for key, value in proposal.items() if key != "fingerprint"}
+        )
+        return proposal
+
     def _plan_search(self, session: dict[str, Any], config: dict[str, Any], day: dict[str, Any]) -> dict[str, int]:
         params = session.get("hyperparameters", {})
         budget = planning_budget(
@@ -395,7 +762,7 @@ class CompetitionSessionManager:
     ) -> dict[str, Any]:
         binary = find_binary(self.binary_path)
         types = [int(agent["kind"]) for agent in day["agents"]]
-        history = _history_for_planner(journal)
+        history = _history_for_planner(journal, int(day["day"]))
         payload = {
             "config": config,
             "day_info": day,
@@ -454,6 +821,7 @@ class CompetitionSessionManager:
         proposal = {
             "kind": "day_plan",
             "day": int(day["day"]),
+            "day_snapshot": copy.deepcopy(day),
             "actions": actions,
             "validation": check,
             "trace": trace,
@@ -485,6 +853,103 @@ class CompetitionSessionManager:
             )
             config = client.get("/game/config", resolved_id)
             state_path, journal = self._journal(resolved_id)
+            self._sync_actions(client, resolved_id, journal)
+            _write_json(state_path, journal)
+            if session.get("target_day") is not None:
+                target_day = int(session["target_day"])
+                if target_day >= len(config.get("daySteps", [])):
+                    raise ValueError("target_day is outside the configured match")
+                historical_day = self._historical_day(
+                    client, resolved_id, config, target_day, journal
+                )
+                _write_json(state_path, journal)
+                historical_snapshot = {
+                    **session.get("snapshot", {}),
+                    "config": config,
+                    "day": historical_day,
+                    "state": {"status": "in_progress", "day": target_day},
+                    "fetched_at": _now(),
+                }
+                proposal = self._decorate_proposal(
+                    self._build_proposal(session, config, historical_day, journal),
+                    "/game/practice/actions",
+                    resolved_id,
+                )
+                self._update(
+                    session_id,
+                    state="awaiting_plan_approval",
+                    snapshot=historical_snapshot,
+                    proposal=proposal,
+                    progress={"status": "awaiting_plan_approval", "day": target_day},
+                )
+                baseline_action = self._action_marker(
+                    self._accepted_action(client, resolved_id, target_day)
+                )
+                while not self._closed:
+                    current = self.get_session(session_id)
+                    if current is None or current.get("state") in {"cancelled", "failed"}:
+                        return
+                    if current.get("approval"):
+                        active = current["proposal"]
+                        response = client.post(
+                            "/game/practice/actions",
+                            {
+                                "game_id": resolved_id,
+                                "day": target_day,
+                                "actions": active["actions"],
+                            },
+                        )
+                        journal["submitted_days"][str(target_day)] = active["actions"]
+                        journal["day_snapshots"][str(target_day)] = {
+                            "day_info": historical_day,
+                            "actions": active["actions"],
+                            "validation": active["validation"],
+                            "trace": active.get("trace"),
+                            "submitted_at": _now(),
+                        }
+                        _write_json(state_path, journal)
+                        self._update(
+                            session_id,
+                            state="submitted",
+                            target_day=None,
+                            proposal=None,
+                            approval=None,
+                            last_submission={
+                                "day": target_day,
+                                "endpoint": "/game/practice/actions",
+                                "response": response,
+                                "submitted_at": _now(),
+                            },
+                            progress={"status": "submitted", "day": target_day},
+                        )
+                        break
+                    if current.get("execution_mode") == "curl":
+                        accepted = self._accepted_action(
+                            client, resolved_id, target_day
+                        )
+                        marker = self._action_marker(accepted)
+                        if marker is not None and marker != baseline_action:
+                            journal["submitted_days"][str(target_day)] = accepted["plan"]
+                            _write_json(state_path, journal)
+                            self._update(
+                                session_id,
+                                state="submitted",
+                                target_day=None,
+                                proposal=None,
+                                approval=None,
+                                last_submission={
+                                    "day": target_day,
+                                    "endpoint": "/game/practice/actions",
+                                    "external": True,
+                                    "submitted_at": _now(),
+                                },
+                                progress={
+                                    "status": "external_submission_detected",
+                                    "day": target_day,
+                                },
+                            )
+                            break
+                    self._wait(session_id, 1.0)
             competitive_selection_initialized = False
             while not self._closed:
                 current = self.get_session(session_id)
@@ -505,6 +970,17 @@ class CompetitionSessionManager:
                     )
                 else:
                     status = client.get("/game/state", resolved_id)
+                    previous_snapshot = current.get("snapshot", {})
+                    previous_day = previous_snapshot.get("day")
+                    previous_state = previous_snapshot.get("state", {})
+                    if (
+                        isinstance(previous_day, dict)
+                        and isinstance(previous_state, dict)
+                        and int(previous_day.get("day", -1))
+                        == int(status.get("day", -2))
+                        == int(previous_state.get("day", -3))
+                    ):
+                        day = previous_day
                 current_snapshot = {
                     "requested_game_id": current.get("requested_game_id"),
                     "game_id": resolved_id,
@@ -517,6 +993,8 @@ class CompetitionSessionManager:
                 if competitive_state is not None:
                     current_snapshot["competitive_state"] = competitive_state
                 self._update(session_id, snapshot=current_snapshot)
+                self._sync_actions(client, resolved_id, journal)
+                _write_json(state_path, journal)
                 if status.get("status") == "reset_incomplete":
                     raise RuntimeError(str(status.get("error")))
                 day_count = len(config.get("daySteps", []))
@@ -614,11 +1092,23 @@ class CompetitionSessionManager:
                         "types": types,
                         "created_at": _now(),
                     }
-                    proposal["fingerprint"] = _fingerprint(proposal)
+                    proposal = self._decorate_proposal(
+                        proposal, "/game/agent-types", api_game_id
+                    )
+                    automatic = current.get("execution_mode") == "auto"
                     self._update(
                         session_id,
                         state="awaiting_role_approval",
                         proposal=proposal,
+                        approval=(
+                            {
+                                "fingerprint": proposal["fingerprint"],
+                                "allow_fallback": False,
+                                "approved_at": _now(),
+                            }
+                            if automatic
+                            else None
+                        ),
                         progress={"status": "awaiting_role_approval"},
                     )
                     self._wait(session_id, 1.0)
@@ -636,7 +1126,26 @@ class CompetitionSessionManager:
                     self._wait(session_id, self.poll_interval)
                     continue
                 key = str(day_index)
-                if key in journal.get("submitted_days", {}):
+                active_proposal = current.get("proposal") or {}
+                if (
+                    active_proposal.get("kind") == "day_plan"
+                    and int(active_proposal.get("day", -1)) != day_index
+                ):
+                    self._update(
+                        session_id,
+                        state="waiting_for_day",
+                        proposal=None,
+                        approval=None,
+                        progress={"status": "day_advanced", "day": day_index},
+                    )
+                    current = self.get_session(session_id) or current
+                last_day = (current.get("last_submission") or {}).get("day")
+                submitted_by_session = (
+                    last_day is not None and int(last_day) == day_index
+                )
+                if key in journal.get("submitted_days", {}) and (
+                    current.get("execution_mode") == "auto" or submitted_by_session
+                ):
                     self._update(session_id, state="waiting_for_day", progress={"status": "submitted", "day": day_index})
                     self._wait(session_id, self.poll_interval)
                     continue
@@ -645,11 +1154,37 @@ class CompetitionSessionManager:
                     current_snapshot["day"] = day
                     self._update(session_id, snapshot=current_snapshot)
                 if current.get("state") != "awaiting_plan_approval" or not current.get("proposal"):
-                    proposal = self._build_proposal(current, config, day, journal)
+                    endpoint = (
+                        "/game/competitive/actions"
+                        if competitive_practice
+                        else (
+                            "/game/practice/actions"
+                            if current["game"].get("is_practice")
+                            else "/game/actions"
+                        )
+                    )
+                    proposal = self._decorate_proposal(
+                        self._build_proposal(current, config, day, journal),
+                        endpoint,
+                        api_game_id,
+                    )
+                    automatic = (
+                        current.get("execution_mode") == "auto"
+                        and not proposal.get("fallback")
+                    )
                     self._update(
                         session_id,
                         state="awaiting_plan_approval",
                         proposal=proposal,
+                        approval=(
+                            {
+                                "fingerprint": proposal["fingerprint"],
+                                "allow_fallback": False,
+                                "approved_at": _now(),
+                            }
+                            if automatic
+                            else None
+                        ),
                         progress={"status": "awaiting_plan_approval", "day": day_index},
                     )
                     self._wait(session_id, 1.0)
@@ -670,16 +1205,15 @@ class CompetitionSessionManager:
                     continue
                 proposal = current["proposal"]
                 self._update(session_id, state="submitting", progress={"status": "submitting", "day": day_index})
-                endpoint = (
-                    "/game/competitive/actions"
-                    if competitive_practice
-                    else (
-                        "/game/practice/actions"
-                        if current["game"].get("is_practice")
-                        else "/game/actions"
-                    )
+                endpoint = proposal["submission_endpoint"]
+                response = client.post(
+                    endpoint,
+                    {
+                        "game_id": proposal["submission_game_id"],
+                        "day": day_index,
+                        "actions": proposal["actions"],
+                    },
                 )
-                response = client.post(endpoint, {"game_id": api_game_id, "day": day_index, "actions": proposal["actions"]})
                 journal["submitted_days"][key] = proposal["actions"]
                 journal["day_snapshots"][key] = {
                     "day_info": day,

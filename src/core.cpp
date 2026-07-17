@@ -584,6 +584,8 @@ bool is_routing_policy(const std::string& policy) {
          policy == "aco_ls";
 }
 
+thread_local std::size_t alns_restart_worker_count = 1;
+
 std::size_t configured_workers(std::size_t tasks) {
   if (tasks <= 1) return tasks;
   std::size_t requested = 0;
@@ -596,6 +598,8 @@ std::size_t configured_workers(std::size_t tasks) {
   } else {
     requested = std::max(1u, std::thread::hardware_concurrency());
   }
+  requested = std::max<std::size_t>(
+      1, requested / std::max<std::size_t>(1, alns_restart_worker_count));
   return std::min({tasks, requested, std::size_t{8}});
 }
 
@@ -628,6 +632,34 @@ auto parallel_indexed(std::size_t count, Function function) {
     }
     for (auto& thread : threads) thread.join();
   }
+  std::vector<Result> result;
+  result.reserve(count);
+  for (std::size_t index = 0; index < count; ++index) {
+    if (errors[index]) std::rethrow_exception(errors[index]);
+    result.push_back(std::move(*slots[index]));
+  }
+  return result;
+}
+
+template <class Function>
+auto parallel_alns_restarts(std::size_t count, Function function) {
+  using Result = std::invoke_result_t<Function, std::size_t>;
+  std::vector<std::optional<Result>> slots(count);
+  std::vector<std::exception_ptr> errors(count);
+  std::vector<std::thread> threads;
+  threads.reserve(count);
+  for (std::size_t index = 0; index < count; ++index) {
+    threads.emplace_back([&, index] {
+      alns_restart_worker_count = count;
+      try {
+        slots[index] = function(index);
+      } catch (...) {
+        errors[index] = std::current_exception();
+      }
+      alns_restart_worker_count = 1;
+    });
+  }
+  for (auto& thread : threads) thread.join();
   std::vector<Result> result;
   result.reserve(count);
   for (std::size_t index = 0; index < count; ++index) {
@@ -3600,7 +3632,8 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
                            const AgentTypes& types,
                            const SearchLimits& limits,
                            unsigned features,
-                           bool allow_continuation = true) {
+                           bool allow_continuation = true,
+                           std::uint64_t restart_salt = 0) {
   const auto started = std::chrono::steady_clock::now();
   const bool timed = limits.time_limit_ms >= 0;
   const auto deadline =
@@ -3629,7 +3662,8 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
     seeds.push_back(
         build_routing_plan(policy, config, day, history, types, {}, limits));
   }
-  if (!expired() && (features & AlnsAcoSeed) != 0U &&
+  if (!expired() && limits.use_aco_seed &&
+      (features & AlnsAcoSeed) != 0U &&
       (!timed || limits.time_limit_ms >= 50)) {
     SearchLimits aco_limits = limits;
     if (timed && limits.time_limit_ms < 1000) {
@@ -3660,7 +3694,8 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
     seeds.insert(seeds.begin(),
                  build_lns_plan(config, day, history, types, legacy_limits));
   }
-  if (!expired() && (!timed || limits.time_limit_ms >= 500)) {
+  if (!expired() && limits.use_local_search_seed &&
+      (!timed || limits.time_limit_ms >= 500)) {
     seeds.push_back(build_local_search_plan(config, day, history, types, limits));
   }
 
@@ -3757,7 +3792,8 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
   AcoGraph graph = build_aco_graph(config, day);
   if (expired()) return best;
   std::optional<std::vector<AcoMeetingList>> shared_meeting_cache;
-  if ((features & AlnsSharedPreprocessing) != 0U &&
+  if (limits.use_legacy_seed && limits.seed_iterations > 0 &&
+      (features & AlnsSharedPreprocessing) != 0U &&
       (!timed || limits.time_limit_ms >= 250)) {
     shared_meeting_cache = build_aco_meeting_cache(graph);
     SearchLimits legacy_limits = limits;
@@ -3853,7 +3889,8 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
   std::sort(elite.begin(), elite.end(), elite_order);
   const std::size_t elite_limit = 12U;
   if (elite.size() > elite_limit) elite.resize(elite_limit);
-  std::mt19937_64 random(lns_seed(config, day, history) ^ 0x414c4e53ULL);
+  std::mt19937_64 random(lns_seed(config, day, history) ^ 0x414c4e53ULL ^
+                         restart_salt);
   // Re-initialise seed travel choices with the real deterministic generator.
   for (auto& item : elite) repair_alns_travel(item.solution, 0, random);
   Elite current = elite.front();
@@ -4180,7 +4217,7 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
         next.traffics = road_status_for_day(config, traffic_history, 1);
         auto projected_plan = build_alns_plan(
             config, next, next_history, types, projection_limits, features,
-            false);
+            false, restart_salt);
         auto evaluation =
             evaluate_candidate(config, next, next_history, projected_plan);
         if (!evaluation) return std::nullopt;
@@ -4295,6 +4332,72 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
         best_value = exact.value;
         best_evaluation = std::move(*exact_evaluation);
       }
+    }
+  }
+  return best;
+}
+
+ActionPlan build_alns_multirestart_plan(
+    const MapConfig& config, const DayInfo& day,
+    const PolicyHistory& history, const AgentTypes& types,
+    const SearchLimits& limits, unsigned features) {
+  const int restart_count = std::clamp(limits.alns_restarts, 1, 3);
+  if (restart_count == 1) {
+    return build_alns_plan(config, day, history, types, limits, features);
+  }
+
+  std::vector<SearchLimits> restart_limits(
+      static_cast<std::size_t>(restart_count), limits);
+  if (restart_count >= 3) {
+    auto& reduced = restart_limits[2];
+    reduced.aco_ants = 4;
+    reduced.aco_iterations = 4;
+    reduced.use_local_search_seed = false;
+    reduced.alns_restarts = 1;
+  }
+  for (auto& restart : restart_limits) restart.alns_restarts = 1;
+
+  constexpr std::array<std::uint64_t, 3> restart_salts{
+      0ULL, 0x9e3779b97f4a7c15ULL, 0xbf58476d1ce4e5b9ULL};
+  auto plans = parallel_alns_restarts(
+      restart_limits.size(), [&](std::size_t index) {
+        return build_alns_plan(config, day, history, types,
+                               restart_limits[index], features, true,
+                               restart_salts[index]);
+      });
+
+  ActionPlan best = plans.front();
+  auto best_evaluation = evaluate_candidate(config, day, history, best);
+  const bool final_day =
+      day.day + 1 >= static_cast<int>(config.day_steps.size());
+  auto continuation_equivalent = [&](const CandidateEvaluation& left,
+                                     const CandidateEvaluation& right) {
+    if (left.ending_positions != right.ending_positions ||
+        left.ending_fuel != right.ending_fuel ||
+        left.road_traffic != right.road_traffic) {
+      return false;
+    }
+    auto resulting_brands = [&](const CandidateEvaluation& evaluation) {
+      std::set<int> brands = history.distinct_brands;
+      for (const auto& acquisition : evaluation.trace.acquisitions) {
+        if (const Spot* spot = spot_at(config, acquisition.spot_pos)) {
+          brands.insert(spot->brand);
+        }
+      }
+      return brands;
+    };
+    return resulting_brands(left) == resulting_brands(right);
+  };
+  for (std::size_t index = 1; index < plans.size(); ++index) {
+    auto evaluation = evaluate_candidate(config, day, history, plans[index]);
+    if (!evaluation) continue;
+    if (!best_evaluation ||
+        (alns_official_value(evaluation->value) >
+             alns_official_value(best_evaluation->value) &&
+         (final_day ||
+          continuation_equivalent(*evaluation, *best_evaluation)))) {
+      best = std::move(plans[index]);
+      best_evaluation = std::move(evaluation);
     }
   }
   return best;
@@ -5111,8 +5214,13 @@ ActionPlan plan_day_online(const std::string& policy, const MapConfig& config,
     return build_local_search_plan(config, day, history, fixed_types, limits);
   }
   if (policy == "lns" || policy == "alns") {
-    return build_alns_plan(config, day, history, fixed_types, limits,
-                           alns_features_for_policy(policy));
+    SearchLimits resolved_limits = limits;
+    if (resolved_limits.alns_restarts == 0) {
+      resolved_limits.alns_restarts = policy == "alns" ? 2 : 1;
+    }
+    return build_alns_multirestart_plan(
+        config, day, history, fixed_types, resolved_limits,
+        alns_features_for_policy(policy));
   }
   if (policy == "aco") {
     return build_aco_plan(config, day, history, fixed_types, false, limits);

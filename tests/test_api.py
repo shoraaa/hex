@@ -51,6 +51,25 @@ def test_game_descriptor_keeps_resettable_practice_in_lab() -> None:
     assert descriptor["capabilities"]["reset"] is True
 
 
+def test_game_descriptor_uses_authoritative_match_team_names() -> None:
+    descriptor = api._game_descriptor(
+        {"id": "practice", "name": "Practice", "match_id": 11},
+        {
+            "is_practice": True,
+            "teams": [{"team_id": "13"}, {"team_id": "8"}],
+            "daySteps": [40],
+        },
+        "13",
+        [{"id": 13, "name": "banned214"}, {"id": 8, "name": "BGNA"}],
+    )
+
+    assert descriptor is not None
+    assert descriptor["teams"] == [
+        {"id": "13", "name": "banned214"},
+        {"id": "8", "name": "BGNA"},
+    ]
+
+
 def test_hyperparameters_are_validated_per_selected_method() -> None:
     assert api.normalize_hyperparameters(
         ["lns"], {"lns": {"min_iterations": 4, "max_iterations": 8}}
@@ -186,11 +205,13 @@ def test_search_hyperparameter_metadata_guides_the_dashboard() -> None:
         "aco_ants",
         "aco_iterations",
         "aco_evaporation",
+        "alns_restarts",
     } <= fields.keys()
     assert fields["final_alns_iterations"]["recommended"] == 1_024
     assert fields["seed_iterations"]["recommended"] == 2_048
     assert fields["exact_nodes"]["recommended"] == 512
     assert fields["final_exact_nodes"]["recommended"] == 1_024
+    assert fields["alns_restarts"]["recommended"] == 2
 
 
 def test_fuel_stress_variants_preserve_authoritative_config_except_fuel() -> None:

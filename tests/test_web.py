@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from hexbench import web
+from hexbench import api, web
 
 
 def test_dashboard_job_benchmarks_selected_policies(monkeypatch, tmp_path: Path) -> None:
@@ -285,43 +285,102 @@ def test_dashboard_practice_suite_runs_all_resettable_maps(
 
 
 def test_dashboard_page_has_selection_and_result_regions() -> None:
-    assert 'id="game"' in web.DASHBOARD_HTML
-    assert 'id="policies"' in web.DASHBOARD_HTML
-    assert 'id="results"' in web.DASHBOARD_HTML
-    assert 'id="hyperparameters"' in web.DASHBOARD_HTML
-    assert 'id="fuel-run"' in web.DASHBOARD_HTML
-    assert 'id="fuel-results"' in web.DASHBOARD_HTML
-    assert 'id="fuel-multipliers"' in web.DASHBOARD_HTML
-    assert 'id="time-run"' in web.DASHBOARD_HTML
-    assert 'id="time-results"' in web.DASHBOARD_HTML
-    assert 'id="suite-run"' in web.DASHBOARD_HTML
-    assert 'id="suite-results"' in web.DASHBOARD_HTML
-    assert 'data-mode="practice"' in web.DASHBOARD_HTML
-    assert 'data-mode="competition"' in web.DASHBOARD_HTML
-    assert 'id="competition-map"' in web.DASHBOARD_HTML
-    assert 'id="approve-proposal"' in web.DASHBOARD_HTML
+    assert 'id="app"' in web.DASHBOARD_HTML
+    assert 'id="locale-button"' in web.DASHBOARD_HTML
+    assert 'id="modal-root"' in web.DASHBOARD_HTML
+    assert "PROCON 2026" in web.DASHBOARD_HTML
     assert '<script type="module" src="/assets/app.js"></script>' in web.DASHBOARD_HTML
 
 
 def test_dashboard_parameter_ui_has_prefills_sliders_and_preview() -> None:
     script = (web.STATIC_ROOT / "app.js").read_text()
 
-    assert "ensureParameterValues" in script
-    assert 'class="parameter-slider"' in script
-    assert 'data-parameter-preview=' in script
-    assert "data-parameter-recommended" in script
-    assert "data-parameter-clear" in script
+    assert "plannerParameters" in script
+    assert 'data-param=' in script
+    assert 'state.bootstrap.policies.includes("alns")' in script
+    assert "collectParams" in script
 
 
 def test_competition_refresh_clears_historical_session_ui_and_stale_polls() -> None:
     script = (web.STATIC_ROOT / "app.js").read_text()
 
-    assert "resetCompetitionView" in script
-    assert "renderCompetitionSnapshot" in script
-    assert "competitionPollGeneration" in script
-    assert "generation !== state.competitionPollGeneration" in script
-    assert "Server reset incomplete" in script
-    assert 'status === "reset_incomplete"' in script
+    assert "restoreSession" in script
+    assert "scheduleSessionPoll" in script
+    assert "syncProposal" in script
+    assert "reset_incomplete" in script
+    assert 'terminal.has(state.session.state)' in script
+
+
+def test_play_ui_exposes_manual_auto_curl_and_original_game_features() -> None:
+    script = (web.STATIC_ROOT / "app.js").read_text()
+
+    assert '["manual","auto","curl"]' in script
+    assert 'post("/api/play/sessions"' in script
+    assert "/submit`" in script
+    assert "/curl`" in script
+    assert "showReplay" in script
+    assert "showAnswers" in script
+    assert "showConfig" in script
+    assert "resetGame" in script
+    assert "renderMap" in script
+    assert "hex-locale" in script
+
+
+def test_day_transition_reuses_the_active_play_session() -> None:
+    script = (web.STATIC_ROOT / "app.js").read_text()
+
+    assert "state.selectedDay=Number(proposal.day)" in script
+    assert "if(expected===day)" in script
+    assert 'await api(`/api/play/sessions/${state.session.id}`)' in script
+    assert 'await controlSession("cancel",false)' in script
+
+
+def test_reset_does_not_restore_or_race_an_interrupted_planner_session() -> None:
+    script = (web.STATIC_ROOT / "app.js").read_text()
+
+    assert '"cancelled","interrupted"' in script
+    cancel = 'await post(`/api/play/sessions/${state.session.id}/control`,{action:"cancel"})'
+    reset = 'await post(`/api/games/${encodeURIComponent(state.game.question_id)}/reset`,{})'
+    assert cancel in script
+    assert script.index(cancel) < script.index(reset)
+    assert 'state.proposalFingerprint=null' in script
+    assert "state.session&&!terminal.has(state.session.state)?state.session.proposal" in script
+
+
+def test_game_map_and_replay_follow_the_official_visual_geometry() -> None:
+    script = (web.STATIC_ROOT / "app.js").read_text()
+    styles = (web.STATIC_ROOT / "styles.css").read_text()
+
+    assert "viewWidth:(width+1.5)*w" in script
+    assert "viewHeight:(height+1)*1.5*radius+radius" in script
+    assert '<svg class="hex-map" width="${g.viewWidth}" height="${g.viewHeight}"' in script
+    assert 'stroke-dasharray="1 4" opacity=".55"' in script
+    assert "replayTrail" in script
+    assert "replay?team_id=" in script
+    assert '<div class="map-canvas">${renderMap(' in script
+    assert ".map-canvas{display:flex;width:fit-content;margin:0 auto}" in styles
+    assert ".hex-map{display:block;flex:none;min-width:0;margin:0}" in styles
+
+
+def test_replay_slider_updates_in_place_and_collection_is_a_count() -> None:
+    script = (web.STATIC_ROOT / "app.js").read_text()
+
+    assert '$("#replay-range").oninput' in script
+    assert "queueReplayFrame()" in script
+    assert "requestAnimationFrame(updateReplayFrame)" in script
+    assert "collectedNow=(frame.collected||[]).length" in script
+    assert 'collectedNow>0?`+${collectedNow}`:"—"' in script
+    assert '(frame.collected||[]).join' not in script
+
+
+def test_scoreboard_loads_named_peer_results() -> None:
+    script = (web.STATIC_ROOT / "app.js").read_text()
+
+    assert "/standings`" in script
+    assert "peer.ranking.map" in script
+    assert "cumulative_daily_types" in script
+    assert "cumulative_response_time" in script
+    assert "team.name" in script
 
 
 def test_dashboard_policy_list_includes_aco() -> None:
@@ -329,3 +388,129 @@ def test_dashboard_policy_list_includes_aco() -> None:
     assert "aco_ls" in web.POLICIES
     assert "lns" in web.POLICIES
     assert "alns" in web.POLICIES
+
+
+def test_game_ui_proxies_replay_answers_and_safe_practice_reset(
+    monkeypatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[str, str, object]] = []
+
+    class FakeClient:
+        def __init__(self, token: str, base_url: str):
+            assert token == "token"
+
+        def get(self, path: str, game_id: str):
+            calls.append(("GET", path, game_id))
+            if path == "/game/board":
+                return {
+                    "game_id": f"{game_id}:13",
+                    "is_practice": game_id == "practice",
+                    "no_reset": False,
+                }
+            if path == "/game/replay":
+                return {"days": [{"day": 0}]}
+            if path == "/game/actions":
+                return {"actions": [{"day": 0, "team_id": "13", "plan": [[-4]]}]}
+            raise AssertionError(path)
+
+        def post(self, path: str, payload: dict):
+            calls.append(("POST", path, payload))
+            return {"accepted": True}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(web, "load_token", lambda path: "token")
+    monkeypatch.setattr(api, "GameClient", FakeClient)
+    app = web.DashboardApp(
+        tmp_path / ".env", tmp_path / "state", tmp_path / "reports"
+    )
+    try:
+        assert app.replay("live")["replay"]["days"][0]["day"] == 0
+        assert app.answers("live")["actions"][0]["team_id"] == "13"
+        app._competition._sessions["stale"] = {
+            "id": "stale",
+            "game_id": "practice:13",
+            "state": "interrupted",
+            "proposal": {"kind": "day_plan"},
+            "events": [],
+        }
+        assert app.reset_game("practice") == {"accepted": True}
+        stale = app._competition.get_session("stale")
+        assert stale is not None
+        assert stale["state"] == "cancelled"
+        assert stale["proposal"] is None
+        journal_path, journal = app._competition._journal("practice:13")
+        assert journal_path.exists()
+        assert journal["submitted_days"] == {}
+        assert journal["day_snapshots"] == {}
+        with pytest.raises(ValueError, match="resettable practice"):
+            app.reset_game("live")
+        assert (
+            "POST",
+            "/game/practice/reset",
+            {"game_id": "practice:13"},
+        ) in calls
+    finally:
+        app.close()
+
+
+def test_practice_standings_include_named_peers_in_official_order(
+    monkeypatch, tmp_path: Path
+) -> None:
+    class FakeClient:
+        def __init__(self, token: str, base_url: str):
+            pass
+
+        def get(self, path: str, game_id: str):
+            if path == "/game/board":
+                return {"game_id": "practice:13", "is_practice": True}
+            if path == "/game/practice/score":
+                team_id = game_id.rsplit(":", 1)[-1]
+                scores = {
+                    "13": {
+                        "distinct_types": 4,
+                        "cumulative_daily_types": 5,
+                        "total_servings": 10,
+                        "cumulative_response_time": 2.0,
+                    },
+                    "8": {
+                        "distinct_types": 4,
+                        "cumulative_daily_types": 6,
+                        "total_servings": 1,
+                        "cumulative_response_time": 100.0,
+                    },
+                }
+                return {"detail": {team_id: scores[team_id]}}
+            raise AssertionError((path, game_id))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(web, "load_token", lambda _: "token")
+    monkeypatch.setattr(api, "GameClient", FakeClient)
+    monkeypatch.setattr(
+        web,
+        "discover_assigned_games",
+        lambda *_: [
+            {
+                "question_id": "practice",
+                "is_practice": True,
+                "team_ids": ["13", "8"],
+                "teams": [
+                    {"id": "13", "name": "banned214"},
+                    {"id": "8", "name": "BGNA"},
+                ],
+            }
+        ],
+    )
+    app = web.DashboardApp(
+        tmp_path / ".env", tmp_path / "state", tmp_path / "reports"
+    )
+    try:
+        result = app.standings("practice")
+        assert result["ranking"] == ["8", "13"]
+        assert result["teams"][1] == {"id": "8", "name": "BGNA"}
+        assert result["own_team_id"] == "13"
+    finally:
+        app.close()

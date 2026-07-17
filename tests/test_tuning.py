@@ -9,11 +9,26 @@ from hexbench import tuning
 def test_parameter_grid_validates_and_deduplicates() -> None:
     candidates = tuning.parameter_grid([128, 128, 256], [32], [0, 0])
     assert [candidate.as_dict() for candidate in candidates] == [
-        {"alns_iterations": 128, "min_iterations": 32, "stagnation_iterations": 0},
-        {"alns_iterations": 256, "min_iterations": 32, "stagnation_iterations": 0},
+        {"alns_iterations": 128, "min_iterations": 32, "stagnation_iterations": 0, "seed_profile": "production"},
+        {"alns_iterations": 256, "min_iterations": 32, "stagnation_iterations": 0, "seed_profile": "production"},
     ]
     with pytest.raises(ValueError, match="cannot exceed"):
         tuning.parameter_grid([8], [16])
+    with pytest.raises(ValueError, match="unknown ALNS seed profile"):
+        tuning.parameter_grid([128], [32], [0], ["missing"])
+
+
+def test_seed_profiles_map_to_search_switches() -> None:
+    parameters = tuning.ALNSParameters(128, 32, 0, "reduced_minimal")
+    assert parameters.as_search() == {
+        "minIterations": 32,
+        "maxIterations": 128,
+        "stagnationIterations": 0,
+        "acoAnts": 4,
+        "acoIterations": 4,
+        "useLocalSearchSeed": False,
+        "useLegacySeed": False,
+    }
 
 
 def test_tune_alns_ranks_lexicographic_scores(monkeypatch, tmp_path: Path) -> None:

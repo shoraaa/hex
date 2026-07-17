@@ -1,92 +1,29 @@
 <!doctype html>
-<html lang="en">
+<html lang="vi">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#0e1716">
-  <title>HEXUDON Operations Console</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#ffffff">
+  <title>HEXUDON Planner</title>
   <link rel="stylesheet" href="/assets/styles.css">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="/" aria-label="HEXUDON operations home">
-      <span class="brand-mark" aria-hidden="true">⬡</span>
-      <span><strong>HEXUDON</strong><small>operations console</small></span>
-    </a>
-    <nav class="mode-switch" aria-label="Console mode">
-      <button class="mode-button active" data-mode="practice">Practice <span>lab</span></button>
-      <button class="mode-button" data-mode="competition">Competition <span>live</span></button>
-    </nav>
-    <div class="connection" id="connection"><i></i><span>Connecting</span></div>
+    <button class="icon-button mobile-menu" aria-label="Menu">☰</button>
+    <a class="procon-brand" href="/"><span class="procon-mark">PRO<br>CON</span><strong>PROCON 2026</strong></a>
+    <a class="competition-link" href="/">Competition</a>
+    <span class="top-spacer"></span>
+    <span id="connection" class="connection"><i></i><span>API</span></span>
+    <button id="locale-button" class="locale-button">🇻🇳 <span>vi</span></button>
+    <span id="team-badge" class="team-badge">HEX</span>
   </header>
 
-  <main class="app-shell">
-    <aside class="sidebar" aria-label="Game roster">
-      <div class="sidebar-heading"><div><span class="kicker">Assigned games</span><h2 id="roster-title">Practice lab</h2></div><button id="refresh" class="icon-button" title="Refresh games" aria-label="Refresh games">↻</button></div>
-      <label class="search"><span aria-hidden="true">⌕</span><input id="game-filter" type="search" placeholder="Filter games"></label>
-      <div id="game-list" class="game-list"><div class="skeleton"></div><div class="skeleton"></div></div>
-      <div class="sidebar-foot"><span class="legend-dot practice"></span><span>Resettable experiments</span><span class="legend-dot competition"></span><span>Live / no-reset</span></div>
-    </aside>
-
-    <section class="workspace">
-      <section class="hero-row">
-        <div><span class="kicker" id="mode-kicker">Practice operations</span><h1 id="page-title">See the whole match.</h1><p id="page-lede">Benchmark policies on identical maps, then replay every route and rank the result.</p></div>
-        <div class="hero-actions"><button id="history-button" class="ghost-button">Run history</button><button id="snapshot-button" class="ghost-button">Refresh snapshot</button></div>
-      </section>
-
-      <section id="empty-state" class="empty-state panel"><div class="empty-icon">⬡</div><h2>Select an assigned game</h2><p>Choose a map from the roster to inspect its topology, policies, and current state.</p></section>
-
-      <section id="game-overview" class="overview panel hidden">
-        <div class="overview-title"><div><span class="kicker" id="game-kind">PRACTICE MAP</span><h2 id="selected-game-name">—</h2><p id="selected-game-meta" class="muted">—</p></div><div id="selected-game-badges" class="badges"></div></div>
-        <div id="overview-metrics" class="metric-strip"></div>
-      </section>
-
-      <section id="practice-view" class="mode-view hidden">
-        <div class="two-column">
-          <section class="panel configure-panel">
-            <div class="panel-heading"><div><span class="kicker">Practice lab</span><h2>Design an experiment</h2></div><span class="safe-note">Resets are serialized</span></div>
-            <label class="field-title" for="game">Map</label><select id="game" disabled></select>
-            <div class="field-title split-title"><span>Policies</span><button id="select-defaults" class="text-button">Recommended</button></div>
-            <div id="policies" class="policy-grid"></div>
-            <div class="field-title">Per-policy controls</div><p class="help">Quality-tuned values are prefilled where available. Use a slider or preset, then review the effective request below.</p><div id="hyperparameters" class="parameter-stack"><p class="muted">Select a policy to configure optional controls.</p></div>
-            <details class="advanced"><summary>Stress and anytime experiments</summary>
-              <label class="field-title" for="fuel-multipliers">Fuel multipliers</label><input id="fuel-multipliers" class="text-input" value="1.0, 0.5, 0.25"><p class="help">The authoritative server value is included automatically.</p>
-              <div class="inline-fields"><label><span>Time budgets (ms)</span><input id="time-limits" class="text-input" value="25, 100, 500, 2000, 10000"></label><label><span>Curve fuel</span><input id="time-fuel" class="text-input" type="number" min="0.01" max="3" step="0.05" value="0.5"></label></div>
-            </details>
-            <div class="action-grid"><button id="run" disabled>Benchmark policies</button><button id="suite-run" class="secondary" disabled>All-map suite</button><button id="fuel-run" class="secondary" disabled>Fuel stress</button><button id="time-run" class="secondary" disabled>LNS time curve</button></div>
-            <p class="warning">Server benchmark resets this map before each policy and leaves the best completed run. Fuel and time experiments are read-only.</p>
-          </section>
-          <section class="panel map-panel"><div class="panel-heading"><div><span class="kicker">Map intelligence</span><h2>Topology and routes</h2></div><div class="map-tools"><button id="load-replay" class="icon-button" title="Load submitted replay">Replay</button><button class="icon-button" data-map-action="fit" title="Fit map">⌖</button><button class="icon-button" data-map-action="zoom-in" title="Zoom in">＋</button><button class="icon-button" data-map-action="zoom-out" title="Zoom out">－</button></div></div><div class="map-wrap"><svg id="map" role="img" aria-label="Hex map visualization" viewBox="0 0 800 600"></svg><div id="map-tooltip" class="map-tooltip" hidden></div></div><div id="practice-replay-controls" class="trace-heading hidden"><strong>Submitted replay</strong><select id="replay-day" aria-label="Replay day"></select><input id="replay-step" type="range" min="0" max="0" value="0"><span id="replay-step-label">Step 0</span></div><div class="layer-controls"><label><input type="checkbox" data-layer="terrain" checked>Terrain</label><label><input type="checkbox" data-layer="spots" checked>Spots</label><label><input type="checkbox" data-layer="traffic" checked>Traffic</label><label><input type="checkbox" data-layer="agents" checked>Agents</label><label><input type="checkbox" data-layer="routes" checked>Routes</label></div></section>
-        </div>
-      </section>
-
-      <section id="competition-view" class="mode-view hidden">
-        <div class="two-column competition-columns">
-          <section class="panel configure-panel"><div class="panel-heading"><div><span class="kicker">Competition control room</span><h2>Prepare the next decision</h2></div><span class="armed-note" id="approval-note">Approval required</span></div>
-            <label class="field-title" for="competition-game">Match</label><select id="competition-game" disabled></select>
-            <label class="field-title" for="competition-policy">Policy</label><select id="competition-policy"></select>
-            <div class="field-title">Policy controls</div><p class="help">Recommended values are prefilled where available and remain editable before starting the session.</p><div id="competition-hyperparameters" class="parameter-stack"><p class="muted">Select a policy to expose controls.</p></div>
-            <div class="action-grid one"><button id="start-competition" disabled>Start supervised session</button></div>
-            <div class="safety-box"><strong>Nothing submits automatically.</strong><span>Each role assignment and each day plan will be shown on the map and must be approved while its fingerprint is current.</span></div>
-          </section>
-          <section class="panel live-panel"><div class="panel-heading"><div><span class="kicker">Live telemetry</span><h2 id="live-state-title">Waiting for a session</h2></div><span id="live-countdown" class="countdown">—</span></div><div id="live-metrics" class="metric-strip"></div><div id="live-map-wrap" class="map-wrap"><svg id="competition-map" role="img" aria-label="Live competition hex map" viewBox="0 0 800 600"></svg><div id="competition-map-empty" class="map-empty">Start a session to reveal the live map.</div></div><div class="layer-controls"><label><input type="checkbox" data-layer="terrain" checked>Terrain</label><label><input type="checkbox" data-layer="spots" checked>Spots</label><label><input type="checkbox" data-layer="traffic" checked>Traffic</label><label><input type="checkbox" data-layer="agents" checked>Own agents</label><label><input type="checkbox" data-layer="opponents" checked>Opponents</label></div></section>
-        </div>
-        <section id="proposal-panel" class="panel proposal-panel hidden"><div class="panel-heading"><div><span class="kicker">Operator gate</span><h2 id="proposal-title">Plan ready for review</h2></div><span id="proposal-fingerprint" class="fingerprint">—</span></div><div id="proposal-summary" class="proposal-summary"></div><div class="proposal-layout"><div id="proposal-agents" class="agent-list"></div><div class="trace-panel"><div class="trace-heading"><strong>Step playback</strong><input id="trace-step" type="range" min="0" max="0" value="0"><span id="trace-step-label">Step 0</span></div><svg id="proposal-map" role="img" aria-label="Proposed route trace" viewBox="0 0 800 600"></svg></div></div><div id="proposal-warning" class="warning"></div><div class="proposal-actions"><button id="approve-proposal" disabled>Approve &amp; submit</button><button id="approve-fallback" class="danger" disabled>Approve safe wait fallback</button><button id="replan-proposal" class="secondary" disabled>Replan</button></div></section>
-        <section id="competition-result" class="panel hidden"><div class="panel-heading"><div><span class="kicker">Official server result</span><h2>Match complete</h2></div><span id="competition-rank" class="badge live">—</span></div><div id="competition-result-metrics" class="metric-strip"></div><details class="advanced"><summary>Raw server result</summary><pre id="competition-result-raw" class="raw-result"></pre></details></section>
-        <section class="panel audit-panel"><div class="panel-heading"><div><span class="kicker">Audit trail</span><h2>Every server interaction</h2></div></div><ol id="audit-log" class="audit-log"><li class="muted">No session events yet.</li></ol></section>
-      </section>
-
-      <section id="status" class="status panel"><div><span class="kicker">Ready</span><h2>Choose a game and a mode</h2><p class="muted">Results, routes, and rankings will appear here.</p></div></section>
-
-      <section id="results" class="results panel hidden"><div class="panel-heading"><div><span class="kicker" id="result-game">Practice result</span><h2>Policy performance</h2></div><button class="ghost-button" data-export="result">Export report</button></div><div id="metrics" class="metric-strip"></div><div class="result-grid"><div><h3>Official comparison</h3><div id="score-chart" class="chart" aria-label="Policy score chart"></div></div><div><h3>Run summary</h3><div id="result-explanation" class="explanation"></div></div></div><div class="table-wrap"><table><thead><tr><th>Rank</th><th>Policy</th><th>Distinct</th><th>Daily</th><th>Servings</th><th>Wall time</th></tr></thead><tbody id="policy-rows"></tbody></table></div><h3>Peer baselines</h3><div class="table-wrap"><table><thead><tr><th>Team</th><th>Status</th><th>Days</th><th>Distinct</th><th>Daily</th><th>Servings</th></tr></thead><tbody id="peer-rows"></tbody></table></div></section>
-      <section id="fuel-results" class="results panel hidden"><div class="panel-heading"><div><span class="kicker">Read-only experiment</span><h2>Fuel stress</h2></div></div><div id="fuel-metrics" class="metric-strip"></div><div id="fuel-chart" class="chart"></div><div class="table-wrap"><table><thead><tr><th>Fuel</th><th>Method</th><th>Distinct</th><th>Daily</th><th>Servings</th><th>Refuels</th><th>Refuel cars</th></tr></thead><tbody id="fuel-rows"></tbody></table></div></section>
-      <section id="time-results" class="results panel hidden"><div class="panel-heading"><div><span class="kicker">Anytime diagnostics</span><h2>LNS score versus time</h2></div></div><div id="time-metrics" class="metric-strip"></div><div id="time-chart" class="chart"></div><div class="table-wrap"><table><thead><tr><th>Budget/day</th><th>Distinct</th><th>Daily</th><th>Servings</th><th>Refuels</th><th>Actual runtime</th></tr></thead><tbody id="time-rows"></tbody></table></div></section>
-      <section id="suite-results" class="results panel hidden"><div class="panel-heading"><div><span class="kicker">Cross-map practice</span><h2>Practice suite</h2></div></div><div id="suite-metrics" class="metric-strip"></div><div class="table-wrap"><table><thead><tr><th>Map</th><th>Best policy</th><th>Distinct</th><th>Daily</th><th>Servings</th><th>Completed rank</th><th>Provisional rank</th></tr></thead><tbody id="suite-rows"></tbody></table></div><div id="suite-errors" class="warning"></div></section>
-
-      <section id="history-panel" class="panel hidden"><div class="panel-heading"><div><span class="kicker">Durable runs</span><h2>History</h2></div><button id="close-history" class="ghost-button">Close</button></div><div id="history-list" class="history-list"></div></section>
-    </section>
+  <main id="app" class="page-shell" aria-live="polite">
+    <section class="loading-screen"><div class="spinner"></div><p>Loading HEXUDON…</p></section>
   </main>
-  <footer class="footer"><span>Token stays server-side.</span><span>Official score remains lexicographic: types → daily types → servings → response time.</span><span id="footer-build">Offline static bundle</span></footer>
+
+  <div id="toast-stack" class="toast-stack" aria-live="assertive"></div>
+  <div id="modal-root"></div>
   <script type="module" src="/assets/app.js"></script>
 </body>
 </html>

@@ -50,6 +50,38 @@ limits so a saved report can be reproduced on another machine. The selected
 configuration and every candidate result are written to `report.json` and
 `report.md`.
 
+Seed construction can be ablated on the same deterministic grid with
+`--seed-profiles`. Profiles isolate the protected ACO seed, the legacy-LNS
+diversification seed, and the standalone local-search seed without requiring
+separate binaries:
+
+```sh
+uv run hexbench alns-tune \
+  --cases cases/quick/manifest.json \
+  --alns-iterations 512 \
+  --seed-profiles production,no_local,no_legacy,no_local_legacy,reduced_aco,reduced_no_local,reduced_no_legacy,reduced_minimal,no_aco \
+  --report reports/alns-seed-ablation
+```
+
+The July 2026 ablation found no seed phase that was globally redundant.
+Reduced ACO without the local-search seed helped Q04 and the 30-case high-depth
+sample, but production remained lexicographically better on the complete
+1,000-case suite and a 100-case stratified 3,072-iteration check. Production
+therefore retains all three seed phases.
+
+Production `alns` runs two independent same-day ALNS chains. Restart zero is
+the protected production search; restart one uses the same seed portfolio with
+an independent deterministic ALNS random stream. Both start from the identical
+revealed day state. A non-final alternative is accepted only when it strictly
+improves the official score while preserving ending positions, fuel, generated
+traffic, and resulting distinct-brand history. On the final day, any strict
+official improvement is accepted. Official ties always retain restart zero.
+The 1,000-case 512-iteration promotion gate produced 27 wins, 973 ties, and no
+losses versus one restart, improving mean normalized servings from 67.4378% to
+67.4468% without changing normalized distinct or daily coverage. Set
+`alns_restarts=1` to reproduce the single-restart control or up to 3 for an
+explicit experiment; `lns` remains single-restart by default.
+
 `quick` contains 30 balanced smoke cases. `full` contains 1,000 cases from a
 deterministic pairwise covering design. Fuel pressure, terrain composition,
 agent count, map shape, match-day count, per-day step horizon, traffic mix,
@@ -256,22 +288,29 @@ uv run hexbench web --host 0.0.0.0 --port 5678
 ```
 
 Open `http://localhost:5678` locally, or use the machine's network address from
-another device. The offline dashboard has two top-level workspaces:
+another device. The offline, bilingual browser interface follows the official
+HEXUDON game layout: choose an assigned game, inspect its configuration and
+map, select agent types, edit day plans, view answers, and play resolved days
+back step by step. Reset and earlier-day resubmission controls are offered only
+for resettable practice games; real matches and `no_reset` practice
+competitions never expose reset.
 
-- **Practice** lists assigned `is_practice=true, no_reset=false` maps. It runs
-  authoritative policy benchmarks, read-only fuel-stress experiments, and
-  LNS/ALNS time curves. Scores are shown against raw and structural maxima,
-  while completed and provisional peer rankings remain separate.
-- **Competition** lists both real matches and `no_reset` practice
-  competitions. It fetches the live map, traffic, agents, fuel and deadline,
-  generates a locally validated role/day proposal, and shows an authoritative
-  step trace. The browser must approve the proposal fingerprint before the
-  server posts agent types or day actions. Competition mode never calls reset.
+The planner panel beside the official-style answer box supports three modes:
 
-Practice reset jobs remain serialized. Job/session records, proposal traces,
-and reports are stored under `reports/web/` and reloaded after a dashboard
-restart. The token stays in the Python process and the static UI uses no CDN or
-internet-hosted assets.
+- **Manual** generates a validated plan with any registered policy, fills the
+  editable JSON box, and submits only when `Submit day plan` is pressed.
+- **Auto** validates and submits normal role/day proposals until the match is
+  complete. It pauses for review instead of silently submitting an all-wait
+  fallback after a planner failure.
+- **curl** validates the current editor value and explicitly reveals an
+  executable command. This command contains the real bearer token, so reveal
+  and copy it only on a trusted machine; the token is excluded from normal UI
+  responses, logs, and durable session files.
+
+Play sessions and proposal traces are stored under `reports/web/` and reloaded
+after a dashboard restart. The static UI uses no CDN or internet-hosted assets.
+The benchmark, fuel-stress, and time-curve workflows remain available through
+their CLI commands even though they are no longer separate dashboard screens.
 Ordinary dashboard server benchmarks use 2,048 ALNS iterations per day for
 LNS/ALNS when neither a time nor ALNS-iteration limit is supplied. This is the
 best full-match ALNS setting found by the local quality sweep: larger iteration

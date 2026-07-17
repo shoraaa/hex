@@ -297,6 +297,59 @@ void test_alns_final_day_quality_is_monotone_with_iteration_budget() {
                      short_score->total_servings}));
 }
 
+void test_alns_same_day_multirestart_protects_single_restart_score() {
+  auto config = small_config();
+  config.day_steps = {14};
+  config.spots = {
+      {0, 1, 2},
+      {1, 4, 2},
+      {2, 8, 2},
+  };
+  hexudon::DayInfo day;
+  day.day = 0;
+  const hexudon::AgentTypes types(config.agents.size(),
+                                  hexudon::AgentKind::Patrol);
+  for (int pos : config.agents) {
+    day.agents.push_back(
+        {hexudon::AgentKind::Patrol, pos, config.fuel_limit});
+  }
+
+  hexudon::SearchLimits single_limits;
+  single_limits.min_iterations = 32;
+  single_limits.max_iterations = 128;
+  single_limits.stagnation_iterations = 0;
+  single_limits.alns_restarts = 1;
+  const auto single_plan =
+      hexudon::plan_day("alns", config, day, {}, types, single_limits);
+  const auto single_score =
+      hexudon::score_action_plan(config, day, {}, single_plan);
+  assert(single_score);
+
+  auto multi_limits = single_limits;
+  multi_limits.alns_restarts = 3;
+  const auto multi_plan =
+      hexudon::plan_day("alns", config, day, {}, types, multi_limits);
+  const auto multi_score =
+      hexudon::score_action_plan(config, day, {}, multi_plan);
+  assert(multi_score);
+  assert((std::tuple{multi_score->distinct_types,
+                     multi_score->cumulative_daily_types,
+                     multi_score->total_servings} >=
+          std::tuple{single_score->distinct_types,
+                     single_score->cumulative_daily_types,
+                     single_score->total_servings}));
+
+  auto automatic_limits = single_limits;
+  automatic_limits.alns_restarts = 0;
+  auto two_restart_limits = single_limits;
+  two_restart_limits.alns_restarts = 2;
+  const auto automatic_plan =
+      hexudon::plan_day("alns", config, day, {}, types, automatic_limits);
+  const auto two_restart_plan =
+      hexudon::plan_day("alns", config, day, {}, types, two_restart_limits);
+  assert(automatic_plan == two_restart_plan);
+}
+
 void test_online_alns_accepts_full_schedule_and_preserves_daily_quality() {
   auto config = small_config();
   config.day_steps = {14, 8, 32, 20};
@@ -405,6 +458,7 @@ int main() {
   test_aco_handles_patrol_starting_on_spot();
   test_high_iteration_alns_reaches_known_daily_optimum();
   test_alns_final_day_quality_is_monotone_with_iteration_budget();
+  test_alns_same_day_multirestart_protects_single_restart_score();
   test_online_alns_accepts_full_schedule_and_preserves_daily_quality();
   test_alns_balances_collections_after_official_score();
   std::cout << "core tests passed\n";

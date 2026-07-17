@@ -98,6 +98,11 @@ struct SearchLimits {
   int aco_ants{};
   int aco_iterations{};
   double aco_evaporation{0.85};
+  bool use_aco_seed{true};
+  bool use_legacy_seed{true};
+  bool use_local_search_seed{true};
+  // Zero selects the policy default: two for ALNS and one for LNS.
+  int alns_restarts{};
 };
 
 MapConfig parse_map_config(const json::value& value);

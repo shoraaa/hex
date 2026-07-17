@@ -4,6 +4,8 @@ import json
 import time
 from pathlib import Path
 
+import pytest
+
 from hexbench import competition
 
 
@@ -239,5 +241,199 @@ def test_waiting_for_result_resumes_safely_after_restart(
             "waiting_for_result",
             "finished",
         ]
+    finally:
+        manager.close()
+
+
+def test_curl_is_explicit_and_token_is_not_persisted(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(competition, "load_token", lambda path: "secret.jwt")
+    manager = competition.CompetitionSessionManager(
+        tmp_path / ".env", tmp_path / "state", tmp_path / "reports"
+    )
+    proposal = {
+        "kind": "agent_types",
+        "types": [0, 0],
+        "submission_endpoint": "/game/agent-types",
+        "submission_game_id": "question:13",
+        "created_at": "now",
+    }
+    proposal["fingerprint"] = competition._fingerprint(proposal)
+    manager._sessions["curl"] = {
+        "id": "curl",
+        "game_id": "question:13",
+        "snapshot": {"config": {"agents": [1, 2]}},
+        "proposal": proposal,
+        "state": "awaiting_role_approval",
+    }
+    try:
+        result = manager.curl_command(
+            "curl", fingerprint=proposal["fingerprint"], types=[0, 1]
+        )
+        assert "Authorization: Bearer secret.jwt" in result["command"]
+        assert '"types":[0,1]' in result["command"]
+        assert "secret.jwt" not in json.dumps(manager.get_session("curl"))
+        assert not manager._session_path("curl").exists()
+    finally:
+        manager.close()
+
+
+def test_manual_editor_value_is_revalidated_before_approval(
+    monkeypatch, tmp_path: Path
+) -> None:
+    manager = competition.CompetitionSessionManager(
+        tmp_path / ".env", tmp_path / "state", tmp_path / "reports"
+    )
+    day = {
+        "day": 0,
+        "steps": 4,
+        "agents": [{"kind": 0, "pos": 0, "fuel": 9}],
+        "others": [],
+        "traffics": [],
+        "endsAt": None,
+    }
+    config = {"agents": [0], "daySteps": [4]}
+    proposal = {
+        "kind": "day_plan",
+        "day": 0,
+        "day_snapshot": day,
+        "actions": [[-4]],
+        "validation": {"valid": True},
+        "trace": {},
+        "fallback": False,
+        "planner_error": None,
+        "submission_endpoint": "/game/practice/actions",
+        "submission_game_id": "question:13",
+        "created_at": "now",
+    }
+    proposal["fingerprint"] = competition._fingerprint(proposal)
+    original_fingerprint = proposal["fingerprint"]
+    session = {
+        "id": "manual",
+        "game_id": "question:13",
+        "method": "greedy",
+        # The polling loop used to transiently replace this with None while
+        # preserving the proposal. Submission must retain the immutable copy.
+        "snapshot": {"config": config, "day": None},
+        "proposal": proposal,
+        "state": "awaiting_plan_approval",
+        "events": [],
+    }
+    manager._sessions["manual"] = session
+    manager._events["manual"] = competition.threading.Event()
+    monkeypatch.setattr(competition, "find_binary", lambda path: tmp_path / "hexudon")
+    monkeypatch.setattr(
+        competition,
+        "run_core",
+        lambda command, method, payload, **kwargs: {
+            "valid": payload["actions"] == [[0, -2]],
+            "error": None,
+        },
+    )
+    monkeypatch.setattr(
+        competition,
+        "trace_action_plan",
+        lambda *args, **kwargs: {"frames": [], "valid": True},
+    )
+    try:
+        approved = manager.submit_proposal(
+            "manual", fingerprint=original_fingerprint, actions=[[0, -2]]
+        )
+        assert approved["proposal"]["actions"] == [[0, -2]]
+        assert approved["approval"]["fingerprint"] == approved["proposal"]["fingerprint"]
+        with pytest.raises(ValueError, match="stale"):
+            manager.submit_proposal(
+                "manual", fingerprint=original_fingerprint, actions=[[-4]]
+            )
+    finally:
+        manager.close()
+
+
+def test_auto_mode_submits_normal_role_proposal_without_manual_approval(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = {"agents": [0, 1], "daySteps": [4], "daySeconds": [60]}
+    descriptor = {
+        "question_id": "practice",
+        "name": "Practice",
+        "mode": "practice",
+        "is_practice": True,
+        "no_reset": False,
+        "total_days": 1,
+    }
+
+    class FakeClient:
+        posts: list[tuple[str, dict]] = []
+        selected = False
+
+        def __init__(self, token: str, base_url: str):
+            pass
+
+        def get(self, path: str, game_id: str):
+            if path == "/game/config":
+                return config
+            if path == "/game/actions":
+                raise RuntimeError("not visible yet")
+            if path == "/game/state":
+                return (
+                    {"status": "finished", "day": 1}
+                    if self.selected
+                    else {"status": "selecting_agents", "day": -1}
+                )
+            if path == "/game/practice/score":
+                return {"detail": {"13": {"total_servings": 0}}}
+            raise AssertionError(path)
+
+        def post(self, path: str, payload: dict):
+            self.posts.append((path, payload))
+            self.selected = True
+            return {"accepted": True}
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(competition, "load_token", lambda path: "token")
+    monkeypatch.setattr(competition, "discover_assigned_games", lambda *args: [descriptor])
+    monkeypatch.setattr(
+        competition,
+        "fetch_game_snapshot",
+        lambda *args: {
+            "game_id": "practice:13",
+            "board": {"game_id": "practice:13", "is_practice": True, "no_reset": False},
+            "config": config,
+            "state": {"status": "selecting_agents", "day": -1},
+            "day": None,
+        },
+    )
+    monkeypatch.setattr(competition, "GameClient", FakeClient)
+    monkeypatch.setattr(competition, "find_binary", lambda path: tmp_path / "hexudon")
+    monkeypatch.setattr(
+        competition,
+        "run_core",
+        lambda command, method, payload, **kwargs: [0, 1]
+        if command == "types"
+        else (_ for _ in ()).throw(AssertionError(command)),
+    )
+    manager = competition.CompetitionSessionManager(
+        tmp_path / ".env", tmp_path / "state", tmp_path / "reports", poll_interval=0.01
+    )
+    try:
+        session = manager.start_session(
+            "practice", "greedy", execution_mode="auto"
+        )
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not FakeClient.posts:
+            time.sleep(0.01)
+        assert FakeClient.posts == [
+            ("/game/agent-types", {"game_id": "practice:13", "types": [0, 1]})
+        ]
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            current = manager.get_session(session["id"])
+            if current and current["state"] == "finished":
+                break
+            time.sleep(0.01)
+        assert current["state"] == "finished"
     finally:
         manager.close()

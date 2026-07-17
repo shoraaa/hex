@@ -27,6 +27,38 @@ from .runner import (
 )
 
 
+SEED_PROFILES: dict[str, dict[str, int | bool]] = {
+    "production": {},
+    "single": {"alnsRestarts": 1},
+    "no_local": {"useLocalSearchSeed": False},
+    "no_legacy": {"useLegacySeed": False},
+    "no_local_legacy": {
+        "useLocalSearchSeed": False,
+        "useLegacySeed": False,
+    },
+    "reduced_aco": {"acoAnts": 4, "acoIterations": 4},
+    "reduced_no_local": {
+        "acoAnts": 4,
+        "acoIterations": 4,
+        "useLocalSearchSeed": False,
+    },
+    "reduced_no_legacy": {
+        "acoAnts": 4,
+        "acoIterations": 4,
+        "useLegacySeed": False,
+    },
+    "reduced_minimal": {
+        "acoAnts": 4,
+        "acoIterations": 4,
+        "useLocalSearchSeed": False,
+        "useLegacySeed": False,
+    },
+    "no_aco": {"useAcoSeed": False},
+    "multi2": {"alnsRestarts": 2},
+    "multi3": {"alnsRestarts": 3},
+}
+
+
 @dataclass(frozen=True, order=True)
 class ALNSParameters:
     """Explicit deterministic ALNS controls evaluated by :func:`tune_alns`."""
@@ -34,6 +66,7 @@ class ALNSParameters:
     alns_iterations: int
     min_iterations: int = 32
     stagnation_iterations: int = 0
+    seed_profile: str = "production"
 
     def __post_init__(self) -> None:
         if self.alns_iterations < 1:
@@ -44,19 +77,23 @@ class ALNSParameters:
             raise ValueError("min_iterations cannot exceed alns_iterations")
         if self.stagnation_iterations < 0:
             raise ValueError("stagnation_iterations cannot be negative")
+        if self.seed_profile not in SEED_PROFILES:
+            raise ValueError(f"unknown ALNS seed profile: {self.seed_profile}")
 
-    def as_search(self) -> dict[str, int]:
+    def as_search(self) -> dict[str, int | bool]:
         return {
             "minIterations": self.min_iterations,
             "maxIterations": self.alns_iterations,
             "stagnationIterations": self.stagnation_iterations,
+            **SEED_PROFILES[self.seed_profile],
         }
 
-    def as_dict(self) -> dict[str, int]:
+    def as_dict(self) -> dict[str, int | str]:
         return {
             "alns_iterations": self.alns_iterations,
             "min_iterations": self.min_iterations,
             "stagnation_iterations": self.stagnation_iterations,
+            "seed_profile": self.seed_profile,
         }
 
 
@@ -71,17 +108,22 @@ def parameter_grid(
     alns_iterations: Iterable[int],
     min_iterations: Iterable[int] = (32,),
     stagnation_iterations: Iterable[int] = (0,),
+    seed_profiles: Iterable[str] = ("production",),
 ) -> list[ALNSParameters]:
     """Build and validate the Cartesian product of ALNS iteration counts."""
 
     iterations = _values(alns_iterations, "alns_iterations")
     minimum = _values(min_iterations, "min_iterations")
     stagnation = _values(stagnation_iterations, "stagnation_iterations")
+    profiles = tuple(dict.fromkeys(str(value) for value in seed_profiles))
+    if not profiles:
+        raise ValueError("seed_profiles must contain at least one value")
     candidates: list[ALNSParameters] = []
     for budget in iterations:
         for lower in minimum:
             for stagnant in stagnation:
-                candidates.append(ALNSParameters(budget, lower, stagnant))
+                for profile in profiles:
+                    candidates.append(ALNSParameters(budget, lower, stagnant, profile))
     return candidates
 
 
@@ -135,9 +177,11 @@ def tune_alns(
     alns_iterations: Iterable[int] = (128, 256, 512, 1024, 2048, 3072, 4096, 6000),
     min_iterations: Iterable[int] = (32,),
     stagnation_iterations: Iterable[int] = (0,),
+    seed_profiles: Iterable[str] = ("production",),
     binary_path: str | None = None,
     jobs: int | None = None,
     timeout: float = 60,
+    case_stride: int = 1,
 ) -> dict[str, Any]:
     """Evaluate ALNS parameter candidates and persist a tuning report.
 
@@ -153,10 +197,15 @@ def tune_alns(
     cases = manifest.get("cases", [])
     if not cases:
         raise ValueError("manifest contains no cases")
+    if case_stride < 1:
+        raise ValueError("case_stride must be positive")
+    cases = cases[::case_stride]
     scenarios = [
         json.loads((manifest_path.parent / case["path"]).read_text()) for case in cases
     ]
-    candidates = parameter_grid(alns_iterations, min_iterations, stagnation_iterations)
+    candidates = parameter_grid(
+        alns_iterations, min_iterations, stagnation_iterations, seed_profiles
+    )
     binary = find_binary(binary_path)
     worker_count = max(1, jobs or min(os.cpu_count() or 1, 8))
     tasks = [
@@ -206,6 +255,7 @@ def tune_alns(
     report: dict[str, Any] = {
         "schema_version": 1,
         "suite": manifest.get("suite"),
+        "case_stride": case_stride,
         "method": "alns",
         "case_count": len(scenarios),
         "candidate_count": len(candidates),
@@ -242,17 +292,18 @@ def tune_alns(
         f"- ALNS iterations: `{best['parameters']['alns_iterations']}`",
         f"- minimum iterations: `{best['parameters']['min_iterations']}`",
         f"- stagnation iterations: `{best['parameters']['stagnation_iterations']}`",
+        f"- seed profile: `{best['parameters']['seed_profile']}`",
         f"- mean score: `{best['mean_distinct_percent']:.3f}% / {best['mean_daily_percent']:.3f}% / {best['mean_servings_percent']:.3f}%`",
         "",
         "## Candidate ranking",
         "",
-        "| Rank | Fixed | Minimum | Stagnation | Distinct | Daily | Servings | Runtime (s) |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Rank | Profile | Fixed | Minimum | Stagnation | Distinct | Daily | Servings | Runtime (s) |",
+        "|---:|:---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for rank, candidate in enumerate(report["candidates"], start=1):
         parameters = candidate["parameters"]
         lines.append(
-            f"| {rank} | {parameters['alns_iterations']} | {parameters['min_iterations']} | {parameters['stagnation_iterations']} | "
+            f"| {rank} | {parameters['seed_profile']} | {parameters['alns_iterations']} | {parameters['min_iterations']} | {parameters['stagnation_iterations']} | "
             f"{candidate['mean_distinct_percent']:.3f}% | {candidate['mean_daily_percent']:.3f}% | "
             f"{candidate['mean_servings_percent']:.3f}% | {candidate['runtime_seconds']:.3f} |"
         )
