@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -29,6 +30,15 @@ from .api import (
     practice_suite,
 )
 from .competition import CompetitionSessionManager
+from .runner import (
+    ROOT,
+    find_binary,
+    normalized_performance,
+    run_core,
+    structural_optimum,
+)
+
+LOCAL_CASE_ROOT = ROOT / "cases"
 
 POLICIES = (
     "local_search",
@@ -179,6 +189,96 @@ class DashboardApp:
     def list_all_games(self) -> list[dict[str, Any]]:
         token = load_token(self.env_path)
         return discover_assigned_games(token, self.base_url)
+
+    def local_cases(self) -> dict[str, Any]:
+        """Return only manifest-declared local cases, grouped for the UI."""
+        groups: dict[str, dict[str, Any]] = {}
+        manifests = sorted(LOCAL_CASE_ROOT.glob("*/manifest.json"))
+        for manifest_path in manifests:
+            try:
+                manifest = json.loads(manifest_path.read_text())
+            except (OSError, ValueError):
+                continue
+            suite = str(manifest.get("suite") or manifest_path.parent.name)
+            for entry in manifest.get("cases", []):
+                if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+                    continue
+                relative = (manifest_path.parent.relative_to(LOCAL_CASE_ROOT) / entry["path"])
+                case_id = relative.as_posix()
+                tier = str(entry.get("tier") or suite)
+                group_id = f"{suite}/{tier}" if tier != suite else suite
+                group = groups.setdefault(
+                    group_id,
+                    {
+                        "id": group_id,
+                        "suite": suite,
+                        "tier": tier,
+                        "target": entry.get("target") or manifest.get("target"),
+                        "cases": [],
+                    },
+                )
+                group["cases"].append(
+                    {
+                        "id": case_id,
+                        "name": Path(entry["path"]).stem,
+                        "seed": entry.get("seed"),
+                        "target": entry.get("target"),
+                        "design": entry.get("design"),
+                        "verification": entry.get("verification"),
+                    }
+                )
+        return {"groups": list(groups.values()), "case_count": sum(len(row["cases"]) for row in groups.values())}
+
+    def _local_case_path(self, case_id: str) -> Path:
+        allowed = {
+            case["id"]
+            for group in self.local_cases()["groups"]
+            for case in group["cases"]
+        }
+        if case_id not in allowed:
+            raise ValueError("unknown local case")
+        path = (LOCAL_CASE_ROOT / case_id).resolve()
+        if not path.is_relative_to(LOCAL_CASE_ROOT.resolve()) or not path.is_file():
+            raise ValueError("local case is unavailable")
+        return path
+
+    def local_case(self, case_id: str) -> dict[str, Any]:
+        scenario = json.loads(self._local_case_path(case_id).read_text())
+        return {
+            "id": case_id,
+            "scenario": scenario,
+            "optimum_score": structural_optimum(scenario),
+        }
+
+    def run_local_case(
+        self,
+        case_id: str,
+        method: str,
+        hyperparameters: dict[str, int | float] | None = None,
+    ) -> dict[str, Any]:
+        if method not in POLICIES:
+            raise ValueError(f"unknown policy: {method}")
+        normalized = normalize_hyperparameters(
+            [method], {method: hyperparameters or {}}
+        ).get(method, {})
+        scenario = json.loads(self._local_case_path(case_id).read_text())
+        if normalized:
+            scenario["hyperparameters"] = normalized
+        binary = find_binary(self.binary_path)
+        started = time.perf_counter()
+        result = run_core(
+            "visualize", method, scenario, binary=binary, timeout=180
+        )
+        result["runtime_seconds"] = time.perf_counter() - started
+        optimum = structural_optimum(scenario)
+        result.update(normalized_performance(result, optimum))
+        return {
+            "case_id": case_id,
+            "method": method,
+            "hyperparameters": normalized,
+            "scenario": scenario,
+            "result": result,
+        }
 
     def snapshot(self, game_id: str) -> dict[str, Any]:
         return fetch_game_snapshot(load_token(self.env_path), game_id, self.base_url)
@@ -738,7 +838,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         parsed = urlparse(self.path)
         path = parsed.path
-        if path == "/" or path.startswith("/competition/game/"):
+        if path in {"/", "/local"} or path.startswith("/competition/game/"):
             self._html()
             return
         if path.startswith("/assets/"):
@@ -748,19 +848,36 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.OK, {"status": "ok"})
             return
         if path == "/api/bootstrap":
+            online_error = None
             try:
-                self._json(
-                    HTTPStatus.OK,
-                    {
-                        "schema_version": 2,
-                        "games": self.app.list_all_games(),
-                        "policies": POLICIES,
-                        "hyperparameters": POLICY_HYPERPARAMETERS,
-                        "modes": {"practice": True, "competition": True},
-                    },
-                )
+                games = self.app.list_all_games()
             except RuntimeError as error:
-                self._json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+                # The LOCAL workspace is deliberately usable without a token or
+                # network connection; surface the online failure without making
+                # the whole static application fail to boot.
+                games = []
+                online_error = str(error)
+            self._json(
+                HTTPStatus.OK,
+                {
+                    "schema_version": 3,
+                    "games": games,
+                    "online_error": online_error,
+                    "policies": POLICIES,
+                    "hyperparameters": POLICY_HYPERPARAMETERS,
+                    "modes": {"practice": True, "competition": True, "local": True},
+                },
+            )
+            return
+        if path == "/api/local/cases":
+            self._json(HTTPStatus.OK, self.app.local_cases())
+            return
+        if path == "/api/local/case":
+            try:
+                case_id = parse_qs(parsed.query).get("case_id", [""])[0]
+                self._json(HTTPStatus.OK, self.app.local_case(case_id))
+            except (OSError, ValueError, json.JSONDecodeError) as error:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
             return
         if path == "/api/games":
             try:
@@ -847,6 +964,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "/api/practice/runs",
             "/api/competition/sessions",
             "/api/play/sessions",
+            "/api/local/run",
         } and not path.startswith("/api/competition/sessions/") and not path.startswith("/api/play/sessions/") and not (
             path.startswith("/api/games/") and path.endswith("/reset")
         ):
@@ -861,6 +979,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length))
             if not isinstance(payload, dict):
                 raise ValueError("request body must be an object")
+            if path == "/api/local/run":
+                case_id = payload.get("case_id")
+                method = payload.get("method", "alns")
+                hyperparameters = payload.get("hyperparameters")
+                if not isinstance(case_id, str) or not isinstance(method, str):
+                    raise ValueError("case_id and method are required")
+                if hyperparameters is not None and not isinstance(hyperparameters, dict):
+                    raise ValueError("hyperparameters must be an object")
+                self._json(
+                    HTTPStatus.OK,
+                    self.app.run_local_case(case_id, method, hyperparameters),
+                )
+                return
             if path.startswith("/api/games/") and path.endswith("/reset"):
                 game_id = unquote(path.removeprefix("/api/games/").removesuffix("/reset")).strip("/")
                 self._json(HTTPStatus.OK, self.app.reset_game(game_id))

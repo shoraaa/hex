@@ -336,6 +336,13 @@ back step by step. Reset and earlier-day resubmission controls are offered only
 for resettable practice games; real matches and `no_reset` practice
 competitions never expose reset.
 
+The `LOCAL` tab does not require a server token. It discovers the checked-in
+manifest suites (`brutal`, `steady`, `easy`, `quick`, and `full`), runs a
+selected compiled policy on an exact case, and displays achieved/structural
+maximum scores plus authoritative day-by-day simulator playback. The timeline
+shows route trails, agent fuel, collected spots, traffic, and the generated
+action plan for every day.
+
 The planner panel beside the official-style answer box supports three modes:
 
 - **Manual** generates a validated plan with any registered policy, fills the

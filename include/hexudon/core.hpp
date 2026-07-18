@@ -151,5 +151,11 @@ json::value trace_action_plan(const MapConfig& config, const DayInfo& day,
 EvaluationResult evaluate_scenario(const json::value& scenario,
                                    const std::string& policy,
                                    const SearchLimits& limits = {});
+// Evaluate a complete local scenario and retain the authoritative per-step
+// simulator frames for the primary policy.  This is intentionally separate
+// from evaluate_scenario so large benchmark grades do not carry replay data.
+json::value evaluate_scenario_replay(const json::value& scenario,
+                                     const std::string& policy,
+                                     const SearchLimits& limits = {});
 
 }  // namespace hexudon
