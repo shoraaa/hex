@@ -37,6 +37,21 @@ hexudon::ActionPlan parse_actions(const boost::json::value& value) {
   return result;
 }
 
+boost::json::value incumbent_rank_to_json(
+    const hexudon::IncumbentRank& rank) {
+  if (!rank.available) return nullptr;
+  boost::json::array congestion;
+  for (int value : rank.congestion) congestion.push_back(value);
+  boost::json::array workload;
+  for (int value : rank.workload) workload.push_back(value);
+  return boost::json::object{
+      {"congestion_mode", rank.congestion_mode},
+      {"congestion", std::move(congestion)},
+      {"workload", std::move(workload)},
+      {"patrol_fuel", rank.patrol_fuel},
+  };
+}
+
 hexudon::SearchLimits parse_search_limits(const boost::json::object& object) {
   hexudon::SearchLimits limits;
   bool explicit_time_limit = false;
@@ -170,8 +185,8 @@ int main(int argc, char** argv) {
                             parse_search_limits(object)));
     } else if (command == "solve") {
       // Anytime streaming: run the planner to its deadline and print one NDJSON
-      // line per improving incumbent as {"score":[distinct,daily,servings],
-      // "actions":[[...]]}. The last line is the plan the caller should submit.
+      // line per improving incumbent with its official score, exact internal
+      // tie-break rank, and actions. The last line is the plan to submit.
       const auto& object = input.as_object();
       const auto config = hexudon::parse_map_config(object.at("config"));
       const auto day = hexudon::parse_day_info(object.at("day_info"));
@@ -182,11 +197,13 @@ int main(int argc, char** argv) {
       const auto limits = parse_search_limits(object);
       bool emitted = false;
       const hexudon::ImprovementSink sink =
-          [&](const hexudon::ActionPlan& plan, const hexudon::Score& score) {
+          [&](const hexudon::ActionPlan& plan, const hexudon::Score& score,
+              const hexudon::IncumbentRank& internal_rank) {
             boost::json::object line{
                 {"score", boost::json::array{score.distinct_types,
                                              score.cumulative_daily_types,
                                              score.total_servings}},
+                {"internal_rank", incumbent_rank_to_json(internal_rank)},
                 {"actions", hexudon::to_json(plan)}};
             std::cout << boost::json::serialize(line) << '\n';
             std::cout.flush();
@@ -201,7 +218,7 @@ int main(int argc, char** argv) {
         if (auto scored = hexudon::score_action_plan(config, day, history, best)) {
           score = *scored;
         }
-        sink(best, score);
+        sink(best, score, {});
       }
       return 0;
     } else if (command == "eval") {

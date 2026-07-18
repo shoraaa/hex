@@ -105,11 +105,44 @@ def test_no_reset_practice_competition_streams_and_autosubmits(
     captured: dict = {}
 
     def fake_stream_core(method, payload, *, binary, on_improve, timeout, should_stop=None, core_threads=None):
-        # The core streams improving incumbents; simulate two and keep the best.
+        # The core streams every improvement. A rapid middle incumbent is
+        # visible in convergence history even when network debounce coalesces it.
         captured["payload"] = payload
         captured["method"] = method
-        on_improve({"score": [0, 0, 0], "actions": [[0, -2]]})
-        best = {"score": [1, 1, 1], "actions": [[1, 5]]}
+        on_improve(
+            {
+                "score": [0, 0, 0],
+                "internal_rank": {
+                    "congestion_mode": "current",
+                    "congestion": [0, 0, -5, -9, 0, 0],
+                    "workload": [1, -2, -4],
+                    "patrol_fuel": 5,
+                },
+                "actions": [[0, -2]],
+            }
+        )
+        on_improve(
+            {
+                "score": [0, 0, 1],
+                "internal_rank": {
+                    "congestion_mode": "current",
+                    "congestion": [0, 0, -4, -8, 0, 0],
+                    "workload": [1, -2, -4],
+                    "patrol_fuel": 5,
+                },
+                "actions": [[0, -1, -1]],
+            }
+        )
+        best = {
+            "score": [1, 1, 1],
+            "internal_rank": {
+                "congestion_mode": "current",
+                "congestion": [0, 0, -4, -8, 0, 0],
+                "workload": [1, -1, -1],
+                "patrol_fuel": 6,
+            },
+            "actions": [[1, 5]],
+        }
         on_improve(best)
         return best
 
@@ -157,6 +190,48 @@ def test_no_reset_practice_competition_streams_and_autosubmits(
             time.sleep(0.01)
         assert current["state"] == "finished"
         assert current["result"]["standings"]["timeline"]["distinct_types"] == 1
+        assert [row["score"] for row in current["incumbents"]] == [
+            [0, 0, 0],
+            [0, 0, 1],
+            [1, 1, 1],
+        ]
+        assert [row["day_sequence"] for row in current["incumbents"]] == [1, 2, 3]
+        assert current["incumbents"][1]["internal_rank"]["congestion"] == [
+            0,
+            0,
+            -4,
+            -8,
+            0,
+            0,
+        ]
+        assert (
+            current["incumbents"][0]["elapsed_seconds"]
+            <= current["incumbents"][1]["elapsed_seconds"]
+            <= current["incumbents"][2]["elapsed_seconds"]
+        )
+        assert [row["submitted"] for row in current["incumbents"]] == [
+            True,
+            False,
+            True,
+        ]
+        assert [row["submission_status"] for row in current["incumbents"]] == [
+            "submitted",
+            "superseded",
+            "submitted",
+        ]
+        assert [
+            row.get("submission_count") for row in current["incumbents"]
+        ] == [1, None, 2]
+        persisted = json.loads(
+            (
+                tmp_path
+                / "reports"
+                / "sessions"
+                / session["id"]
+                / "session.json"
+            ).read_text()
+        )
+        assert persisted["incumbents"] == current["incumbents"]
     finally:
         manager.close()
 

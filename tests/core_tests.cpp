@@ -127,16 +127,24 @@ void test_solve_streams_monotone_improvements() {
   limits.max_iterations = 200;
   limits.stagnation_iterations = 0;
   std::vector<std::tuple<int, int, int>> scores;
+  std::vector<hexudon::IncumbentRank> internal_ranks;
   std::vector<hexudon::ActionPlan> plans;
   hexudon::ImprovementSink sink =
-      [&](const hexudon::ActionPlan& plan, const hexudon::Score& score) {
+      [&](const hexudon::ActionPlan& plan, const hexudon::Score& score,
+          const hexudon::IncumbentRank& internal_rank) {
         plans.push_back(plan);
         scores.emplace_back(score.distinct_types, score.cumulative_daily_types,
                             score.total_servings);
+        internal_ranks.push_back(internal_rank);
       };
   const auto best =
       hexudon::plan_day("alns", config, day, {}, types, limits, &sink);
   assert(!scores.empty());
+  assert(internal_ranks.size() == scores.size());
+  for (const auto& rank : internal_ranks) {
+    assert(rank.available);
+    assert(rank.congestion_mode == "current");
+  }
   for (const auto& plan : plans) {
     assert(!hexudon::validate_action_plan(config, day, plan));
   }

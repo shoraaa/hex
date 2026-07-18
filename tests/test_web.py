@@ -319,6 +319,16 @@ def test_play_ui_exposes_streaming_console_and_original_game_features() -> None:
     assert "time-limit" in script
     assert "time_limit_seconds" in script
     assert "autoSubmitInfo" in script
+    assert "convergenceMarkup" in script
+    assert "incumbents" in script
+    assert "elapsed_seconds" in script
+    assert "internalRankMarkup" in script
+    assert "internal_rank" in script
+    assert "trafficRank" in script
+    assert "workloadRank" in script
+    assert "patrolFuel" in script
+    assert "sincePrevious" in script
+    assert 'role="img"' in script
     assert 'post("/api/play/sessions"' in script
     assert "showReplay" in script
     assert "showAnswers" in script

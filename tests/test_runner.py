@@ -20,20 +20,27 @@ def test_stream_core_reports_each_improvement_and_returns_best(tmp_path: Path) -
     body = (
         "import sys, json\n"
         "sys.stdin.read()\n"
-        "print(json.dumps({'score': [1, 1, 1], 'actions': [[-4]]}), flush=True)\n"
-        "print(json.dumps({'score': [2, 2, 2], 'actions': [[0, -3]]}), flush=True)\n"
+        "rank = {'congestion_mode': 'current', 'congestion': [0, 0, -2, -3, 0, 0], "
+        "'workload': [1, -1, -1], 'patrol_fuel': 7}\n"
+        "print(json.dumps({'score': [1, 1, 1], 'internal_rank': rank, 'actions': [[-4]]}), flush=True)\n"
+        "rank['patrol_fuel'] = 8\n"
+        "print(json.dumps({'score': [2, 2, 2], 'internal_rank': rank, 'actions': [[0, -3]]}), flush=True)\n"
     )
     binary = _fake_binary(tmp_path, body)
-    seen: list[tuple[int, int, int]] = []
+    seen: list[dict] = []
     last = stream_core(
         "alns",
         {"config": {}},
         binary=binary,
-        on_improve=lambda record: seen.append(tuple(record["score"])),
+        on_improve=seen.append,
         timeout=10,
     )
-    assert seen == [(1, 1, 1), (2, 2, 2)]
+    assert [tuple(record["score"]) for record in seen] == [
+        (1, 1, 1),
+        (2, 2, 2),
+    ]
     assert last is not None and last["score"] == [2, 2, 2]
+    assert last["internal_rank"]["patrol_fuel"] == 8
     assert last["actions"] == [[0, -3]]
 
 
