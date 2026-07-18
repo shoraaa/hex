@@ -359,6 +359,18 @@ nodes only. The report directory receives `report.json` with per-epoch metrics
 and `model.pt` with the best-validation checkpoint, dataset digest, and feature schema.
 Use `--device cpu` for a CPU-only run or leave `auto` to use an available GPU.
 
+PyTorch is intentionally resolved from the normal Python package index rather than
+being pinned to an AMD ROCm wheel. On Linux this provides the standard CUDA-enabled
+PyTorch build; on other platforms uv selects the compatible published wheel. If an
+AMD machine needs ROCm, install the matching official ROCm wheels after `uv sync`,
+for example:
+
+```sh
+uv pip install \\
+  --index-url https://download.pytorch.org/whl/rocm6.3 \\
+  torch torchvision torchaudio pytorch-triton-rocm
+```
+
 ## Web dashboard
 
 Start the browser interface on the competition machine with:
