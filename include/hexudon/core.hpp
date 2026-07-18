@@ -3,6 +3,7 @@
 #include <boost/json.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <set>
@@ -70,6 +71,12 @@ struct Score {
   int total_servings{};
 };
 
+// Anytime callback invoked whenever a solver finds a strictly better plan for
+// the current day.  The competition scores each day by the last valid
+// submission, so a streaming solver reports every improving incumbent and the
+// caller resubmits it.  The reported score is the authoritative day triple.
+using ImprovementSink = std::function<void(const ActionPlan&, const Score&)>;
+
 struct EvaluationResult {
   Score score;
   int valid_days{};
@@ -120,10 +127,14 @@ void validate_config(const MapConfig& config);
 
 AgentTypes select_agent_types(const std::string& policy,
                               const MapConfig& config);
+// When `on_improve` is non-null the ALNS policies run as a single sequential
+// anytime search and invoke the sink on every strictly better incumbent; other
+// policies are unaffected (the caller emits their single result).
 ActionPlan plan_day(const std::string& policy, const MapConfig& config,
                     const DayInfo& day, const PolicyHistory& history,
                     const AgentTypes& fixed_types,
-                    const SearchLimits& limits = {});
+                    const SearchLimits& limits = {},
+                    const ImprovementSink* on_improve = nullptr);
 std::optional<std::string> validate_action_plan(const MapConfig& config,
                                                 const DayInfo& day,
                                                 const ActionPlan& plan);

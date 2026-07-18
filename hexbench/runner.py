@@ -4,10 +4,11 @@ import hashlib
 import json
 import os
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 OBJECTIVES = (
@@ -57,6 +58,75 @@ def run_core(
     if completed.returncode:
         raise RuntimeError(completed.stderr.strip() or "hexudon core failed")
     return json.loads(completed.stdout)
+
+
+def stream_core(
+    policy: str,
+    payload: dict[str, Any],
+    *,
+    binary: Path,
+    on_improve: Callable[[dict[str, Any]], None],
+    timeout: float = 60,
+    should_stop: Callable[[], bool] | None = None,
+    core_threads: int | None = None,
+) -> dict[str, Any] | None:
+    """Run the anytime `solve` command, calling `on_improve` per NDJSON line.
+
+    The core streams one ``{"score": [...], "actions": [...]}`` record for every
+    improving incumbent and terminates itself at ``search.timeLimitMs``.  The
+    ``timeout`` is a backstop watchdog: it should exceed the solver deadline plus
+    a margin.  Returns the final (best) record, or ``None`` if nothing streamed.
+    """
+    environment = None
+    if core_threads is not None:
+        environment = dict(os.environ)
+        environment["HEXUDON_THREADS"] = str(max(1, core_threads))
+    process = subprocess.Popen(
+        [str(binary), "solve", policy],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=environment,
+    )
+    timed_out = threading.Event()
+
+    def _kill() -> None:
+        timed_out.set()
+        process.kill()
+
+    watchdog = threading.Timer(max(0.1, timeout), _kill)
+    watchdog.start()
+    last: dict[str, Any] | None = None
+    stopped = False
+    try:
+        assert process.stdin is not None and process.stdout is not None
+        # The core reads all of stdin before producing output, so writing the
+        # whole payload and closing the pipe cannot deadlock against stdout.
+        process.stdin.write(json.dumps(payload))
+        process.stdin.close()
+        for raw_line in process.stdout:
+            line = raw_line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            last = record
+            on_improve(record)
+            if should_stop is not None and should_stop():
+                stopped = True
+                process.kill()
+                break
+        process.wait()
+    finally:
+        watchdog.cancel()
+    if timed_out.is_set() or stopped:
+        # A backstop kill (deadline overrun) or a caller-requested stop leaves the
+        # last streamed plan as the best answer we have.
+        return last
+    if process.returncode:
+        stderr = (process.stderr.read() if process.stderr else "").strip()
+        raise RuntimeError(stderr or "hexudon core solve failed")
+    return last
 
 
 def structural_optimum(scenario: dict[str, Any]) -> dict[str, int]:

@@ -9,7 +9,7 @@ import pytest
 from hexbench import competition
 
 
-def test_no_reset_practice_competition_requires_day_approval(
+def test_no_reset_practice_competition_streams_and_autosubmits(
     monkeypatch, tmp_path: Path
 ) -> None:
     config = {
@@ -23,15 +23,6 @@ def test_no_reset_practice_competition_requires_day_approval(
         "players": 1,
         "busyThreshold": 2,
         "jammedThreshold": 4,
-    }
-    day = {
-        # Practice endpoints remain usable after their display deadline. The
-        # supervised controller must not treat this as a live-match cutoff.
-        "endsAt": time.time() - 60,
-        "day": 0,
-        "agents": [{"kind": 0, "pos": 0, "fuel": 10}],
-        "others": [],
-        "traffics": [],
     }
     descriptor = {
         "question_id": "practice-comp",
@@ -105,26 +96,24 @@ def test_no_reset_practice_competition_requires_day_approval(
             },
             "config": config,
             "state": {"status": "in_progress", "day": 0},
-            "day": day,
+            "day": None,
         },
     )
     monkeypatch.setattr(competition, "GameClient", FakeClient)
     monkeypatch.setattr(competition, "find_binary", lambda path: tmp_path / "hexudon")
 
-    def fake_core(command, method, payload, **kwargs):
-        if command == "plan":
-            assert payload["search"]["timeLimitMs"] == 49_300
-            assert kwargs["timeout"] >= 58
-            return [[-4]]
-        if command == "check":
-            return {
-                "valid": True,
-                "error": None,
-                "score": {"distinct_types": 0, "daily_types": 0, "servings": 0},
-            }
-        raise AssertionError(command)
+    captured: dict = {}
 
-    monkeypatch.setattr(competition, "run_core", fake_core)
+    def fake_stream_core(method, payload, *, binary, on_improve, timeout, should_stop=None, core_threads=None):
+        # The core streams improving incumbents; simulate two and keep the best.
+        captured["payload"] = payload
+        captured["method"] = method
+        on_improve({"score": [0, 0, 0], "actions": [[0, -2]]})
+        best = {"score": [1, 1, 1], "actions": [[1, 5]]}
+        on_improve(best)
+        return best
+
+    monkeypatch.setattr(competition, "stream_core", fake_stream_core)
     monkeypatch.setattr(
         competition,
         "trace_action_plan",
@@ -142,25 +131,23 @@ def test_no_reset_practice_competition_requires_day_approval(
         tmp_path / ".env", tmp_path / "state", tmp_path / "reports", poll_interval=0.01
     )
     try:
-        session = manager.start_session("practice-comp", "greedy")
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
-            current = manager.get_session(session["id"])
-            assert current is not None
-            if current["state"] == "awaiting_plan_approval":
-                break
-            time.sleep(0.01)
-        assert current["state"] == "awaiting_plan_approval"
-        assert FakeClient.posts == []
-
-        manager.approve(
-            session["id"], fingerprint=current["proposal"]["fingerprint"]
+        # A short practice override must reach the core as the search deadline.
+        session = manager.start_session(
+            "practice-comp", "alns", time_limit_seconds=5
         )
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline and not FakeClient.posts:
             time.sleep(0.01)
+        # No approval gate: the best streamed plan is submitted autonomously.
+        assert FakeClient.posts
         assert FakeClient.posts[0][0] == "/game/competitive/actions"
+        assert FakeClient.posts[-1][1] == {
+            "game_id": "practice-comp",
+            "day": 0,
+            "actions": [[1, 5]],
+        }
         assert all(path != "/game/practice/reset" for path, _ in FakeClient.posts)
+        assert captured["payload"]["search"]["timeLimitMs"] == 5000
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             current = manager.get_session(session["id"])
@@ -170,12 +157,6 @@ def test_no_reset_practice_competition_requires_day_approval(
             time.sleep(0.01)
         assert current["state"] == "finished"
         assert current["result"]["standings"]["timeline"]["distinct_types"] == 1
-        waiting_events = [
-            event
-            for event in current["events"]
-            if event.get("status") == "waiting_for_result"
-        ]
-        assert len(waiting_events) <= 1
     finally:
         manager.close()
 

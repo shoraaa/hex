@@ -205,13 +205,12 @@ def test_search_hyperparameter_metadata_guides_the_dashboard() -> None:
         "aco_ants",
         "aco_iterations",
         "aco_evaporation",
-        "alns_restarts",
     } <= fields.keys()
+    assert "alns_restarts" not in fields
     assert fields["final_alns_iterations"]["recommended"] == 1_024
     assert fields["seed_iterations"]["recommended"] == 2_048
     assert fields["exact_nodes"]["recommended"] == 512
     assert fields["final_exact_nodes"]["recommended"] == 1_024
-    assert fields["alns_restarts"]["recommended"] == 2
 
 
 def test_fuel_stress_variants_preserve_authoritative_config_except_fuel() -> None:

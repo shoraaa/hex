@@ -2131,13 +2131,131 @@ ActionPlan build_aco_plan(const MapConfig& config, const DayInfo& day,
                           const AgentTypes& types, bool apply_local_search,
                           const SearchLimits& limits);
 
+// Refuel-escort seed. Pair the refuel car with one patrol: the car drives to the
+// patrol, then both follow an identical route so the patrol is refuelled to full
+// every step and can reach distant new-brand spots that its tight initial fuel
+// would otherwise strand. Other agents idle; ALNS refines from here. Returns an
+// empty plan when there is no refuel car (the caller then skips this seed).
+//
+// This closes a real gap: on hard fuel-constrained maps the ordinary seeds strand
+// patrols after ~one tank and collect only the 2-3 nearest brands, while an
+// escorted patrol can sweep the map. Because refuel cars do not burn fuel, an
+// escorted patrol has effectively unlimited range.
+ActionPlan build_escort_plan(const MapConfig& config, const DayInfo& day,
+                             const PolicyHistory& history,
+                             const AgentTypes& types) {
+  const int horizon = config.day_steps[day.day];
+  const std::size_t n = day.agents.size();
+  ActionPlan result(n, std::vector<int>{-horizon});
+  int refuel = -1;
+  for (std::size_t i = 0; i < n; ++i) {
+    if (types[i] == AgentKind::Refuel) {
+      refuel = static_cast<int>(i);
+      break;
+    }
+  }
+  if (refuel < 0) return {};
+
+  // Escort the patrol closest to an as-yet-unreached brand; otherwise any patrol.
+  const std::set<int>& reached = history.distinct_brands;
+  int patrol = -1;
+  int best_reach = std::numeric_limits<int>::max();
+  for (std::size_t i = 0; i < n; ++i) {
+    if (types[i] != AgentKind::Patrol) continue;
+    for (const auto& spot : config.spots) {
+      if (reached.contains(spot.brand)) continue;
+      const int cost =
+          shortest_path(config, day.agents[i].pos, spot.pos, day.traffics).cost;
+      if (cost < best_reach) {
+        best_reach = cost;
+        patrol = static_cast<int>(i);
+      }
+    }
+  }
+  if (patrol < 0) {
+    for (std::size_t i = 0; i < n; ++i) {
+      if (types[i] == AgentKind::Patrol) {
+        patrol = static_cast<int>(i);
+        break;
+      }
+    }
+  }
+  if (patrol < 0) return {};
+
+  auto leg_time = [&](int from, const std::vector<int>& directions) {
+    int time = 0;
+    int cursor = from;
+    for (int direction : directions) {
+      time += terrain_time(config, cursor, day.traffics);
+      cursor = *neighbor(config, cursor, direction);
+    }
+    return time;
+  };
+
+  // Rendezvous: the refuel car drives to the patrol while the patrol waits.
+  const auto rendezvous =
+      shortest_path(config, day.agents[refuel].pos, day.agents[patrol].pos,
+                    day.traffics);
+  const int rendezvous_time =
+      leg_time(day.agents[refuel].pos, rendezvous.directions);
+  if (rendezvous_time > horizon) return {};
+
+  // Greedily chain the nearest still-fitting spot, preferring unreached brands.
+  const int route_budget = horizon - rendezvous_time;
+  std::vector<int> route;
+  int cursor = day.agents[patrol].pos;
+  int route_time = 0;
+  std::set<int> visited;
+  std::set<int> chased = reached;
+  while (true) {
+    const Spot* choice = nullptr;
+    std::vector<int> choice_dirs;
+    std::pair<int, int> choice_key{2, std::numeric_limits<int>::max()};
+    for (const auto& spot : config.spots) {
+      if (visited.contains(spot.pos)) continue;
+      auto path = shortest_path(config, cursor, spot.pos, day.traffics);
+      const int time = leg_time(cursor, path.directions);
+      if (route_time + time > route_budget) continue;
+      const std::pair<int, int> key{chased.contains(spot.brand) ? 1 : 0, time};
+      if (key < choice_key) {
+        choice = &spot;
+        choice_dirs = std::move(path.directions);
+        choice_key = key;
+      }
+    }
+    if (choice == nullptr) break;
+    route.insert(route.end(), choice_dirs.begin(), choice_dirs.end());
+    route_time += choice_key.second;
+    cursor = choice->pos;
+    visited.insert(choice->pos);
+    chased.insert(choice->brand);
+  }
+
+  std::vector<int> patrol_actions;
+  if (rendezvous_time > 0) patrol_actions.push_back(-rendezvous_time);
+  patrol_actions.insert(patrol_actions.end(), route.begin(), route.end());
+  std::vector<int> refuel_actions = rendezvous.directions;
+  refuel_actions.insert(refuel_actions.end(), route.begin(), route.end());
+  const int remaining = horizon - rendezvous_time - route_time;
+  if (remaining > 0) {
+    patrol_actions.push_back(-remaining);
+    refuel_actions.push_back(-remaining);
+  }
+  if (patrol_actions.empty()) patrol_actions.push_back(-horizon);
+  if (refuel_actions.empty()) refuel_actions.push_back(-horizon);
+  result[patrol] = std::move(patrol_actions);
+  result[refuel] = std::move(refuel_actions);
+  return result;
+}
+
 ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
                            const PolicyHistory& history,
                            const AgentTypes& types,
                             const SearchLimits& limits,
                             unsigned features,
                             bool allow_continuation,
-                            std::uint64_t restart_salt) {
+                            std::uint64_t restart_salt,
+                            const ImprovementSink* on_improve) {
   const auto started = std::chrono::steady_clock::now();
   const bool timed = limits.time_limit_ms >= 0;
   const auto deadline =
@@ -2210,6 +2328,30 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
   seed_evaluations.reserve(seeds.size());
   for (const auto& seed : seeds) {
     seed_evaluations.push_back(evaluate_candidate(config, day, history, seed));
+  }
+  // Single-team refuel-escort seed. It joins the pool only when it strictly
+  // beats every ordinary seed's official score, so it lifts tight-fuel maps
+  // (where patrols would otherwise strand) without perturbing the search on
+  // maps where fuel is ample and the escort is dominated.
+  if (!expired() && config.players == 1) {
+    if (auto escort = build_escort_plan(config, day, history, types);
+        !escort.empty()) {
+      if (auto escort_eval = evaluate_candidate(config, day, history, escort)) {
+        std::tuple<int, int, int> best_seed{std::numeric_limits<int>::min(),
+                                            std::numeric_limits<int>::min(),
+                                            std::numeric_limits<int>::min()};
+        for (const auto& evaluation : seed_evaluations) {
+          if (evaluation) {
+            best_seed = std::max(best_seed,
+                                 alns_official_value(evaluation->value));
+          }
+        }
+        if (alns_official_value(escort_eval->value) > best_seed) {
+          seeds.push_back(std::move(escort));
+          seed_evaluations.push_back(std::move(escort_eval));
+        }
+      }
+    }
   }
   ActionPlan best = seeds.front();
   CandidateEvaluation best_evaluation = *seed_evaluations.front();
@@ -2497,6 +2639,16 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
   int trace_last_improvement = -1;
   int trace_restarts = 0;
 
+  // Anytime streaming: report the incumbent whenever it strictly improves so
+  // the caller can resubmit. A null sink makes this a no-op for batch callers.
+  auto emit_improvement = [&] {
+    if (on_improve == nullptr) return;
+    const auto official = alns_official_value(best_value);
+    (*on_improve)(best, Score{std::get<0>(official), std::get<1>(official),
+                              std::get<2>(official)});
+  };
+  emit_improvement();
+
   for (int iteration = 0; iteration < alns_maximum; ++iteration) {
     if (expired()) break;
     ++trace_iterations;
@@ -2636,6 +2788,7 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
         stagnation = 0;
         ++trace_global_improvements;
         trace_last_improvement = iteration;
+        emit_improvement();
       } else {
         ++stagnation;
       }
@@ -2835,6 +2988,7 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
           best_evaluation = candidate.evaluation;
           best_projection = std::move(projection);
           best_rank = rank;
+          emit_improvement();
         }
       }
       auto consider_continuation = [&](const ActionPlan& candidate_plan) {
@@ -2852,6 +3006,7 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
           best_evaluation = std::move(*evaluation);
           best_projection = std::move(projection);
           best_rank = rank;
+          emit_improvement();
         }
       };
       const std::optional<std::chrono::steady_clock::time_point>
@@ -2888,6 +3043,7 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
           best = std::move(route_exact.plan);
           best_value = route_exact.value;
           best_evaluation = std::move(*route_evaluation);
+          emit_improvement();
         }
       }
     }
@@ -2901,6 +3057,7 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
         best = std::move(exact.plan);
         best_value = exact.value;
         best_evaluation = std::move(*exact_evaluation);
+        emit_improvement();
       }
     }
   }

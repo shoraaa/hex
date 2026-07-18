@@ -291,6 +291,7 @@ class DashboardApp:
         *,
         execution_mode: str = "manual",
         target_day: int | None = None,
+        time_limit_seconds: float | None = None,
     ) -> dict[str, Any]:
         return self._competition.start_session(
             game_id,
@@ -298,6 +299,7 @@ class DashboardApp:
             hyperparameters,
             execution_mode=execution_mode,
             target_day=target_day,
+            time_limit_seconds=time_limit_seconds,
         )
 
     def get_competition(self, session_id: str) -> dict[str, Any] | None:
@@ -869,18 +871,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 hyperparameters = payload.get("hyperparameters")
                 execution_mode = payload.get("execution_mode", "manual")
                 target_day = payload.get("target_day")
+                time_limit_seconds = payload.get("time_limit_seconds")
                 if not isinstance(game_id, str) or not isinstance(method, str):
                     raise ValueError("game_id and method are required")
                 if hyperparameters is not None and not isinstance(hyperparameters, dict):
                     raise ValueError("hyperparameters must be an object")
                 if not isinstance(execution_mode, str):
                     raise ValueError("execution_mode must be a string")
+                if time_limit_seconds is not None and (
+                    isinstance(time_limit_seconds, bool)
+                    or not isinstance(time_limit_seconds, (int, float))
+                ):
+                    raise ValueError("time_limit_seconds must be numeric")
                 session = self.app.start_competition(
                     game_id,
                     method,
                     hyperparameters,
                     execution_mode=execution_mode,
                     target_day=target_day,
+                    time_limit_seconds=time_limit_seconds,
                 )
                 self._json(HTTPStatus.ACCEPTED, session)
                 return

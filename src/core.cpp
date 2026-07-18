@@ -1404,7 +1404,8 @@ ActionPlan plan_day_online(const std::string& policy, const MapConfig& config,
                            const DayInfo& day,
                            const PolicyHistory& history,
                            const AgentTypes& fixed_types,
-                           const SearchLimits& limits) {
+                           const SearchLimits& limits,
+                           const ImprovementSink* on_improve = nullptr) {
   if (day.day < 0 || day.day >= static_cast<int>(config.day_steps.size())) {
     throw std::invalid_argument("day index outside config");
   }
@@ -1450,6 +1451,14 @@ ActionPlan plan_day_online(const std::string& policy, const MapConfig& config,
     if (resolved_limits.alns_restarts == 0) {
       resolved_limits.alns_restarts = policy == "alns" ? 3 : 1;
     }
+    if (on_improve != nullptr) {
+      // Anytime streaming runs one sequential instance so the callback stays
+      // single-threaded; the loop's own diversification uses the full budget.
+      return build_alns_plan(config, day, history, fixed_types, resolved_limits,
+                             alns_features_for_policy(policy),
+                             /*allow_continuation=*/true, /*restart_salt=*/0,
+                             on_improve);
+    }
     return build_alns_multirestart_plan(
         config, day, history, fixed_types, resolved_limits,
         alns_features_for_policy(policy));
@@ -1476,7 +1485,8 @@ ActionPlan plan_day_online(const std::string& policy, const MapConfig& config,
 ActionPlan plan_day(const std::string& policy, const MapConfig& config,
                     const DayInfo& day, const PolicyHistory& history,
                     const AgentTypes& fixed_types,
-                    const SearchLimits& limits) {
+                    const SearchLimits& limits,
+                    const ImprovementSink* on_improve) {
   if (day.day < 0 || day.day >= static_cast<int>(config.day_steps.size())) {
     throw std::invalid_argument("day index outside config");
   }
@@ -1484,7 +1494,8 @@ ActionPlan plan_day(const std::string& policy, const MapConfig& config,
   // Passing the full config lets continuation-aware search optimize ending
   // positions and fuel for the real schedule while still using only the
   // current day's revealed traffic and agent state.
-  return plan_day_online(policy, config, day, history, fixed_types, limits);
+  return plan_day_online(policy, config, day, history, fixed_types, limits,
+                         on_improve);
 }
 
 std::optional<std::string> validate_action_plan(const MapConfig& config,

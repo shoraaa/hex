@@ -26,7 +26,6 @@ BASE_URL = "https://hexudon.hairbui76.id.vn/api"
 # starts and passed to the C++ planner only for the named policy. Empty entries
 # preserve that policy's compiled defaults.
 ALNS_HYPERPARAMETERS = (
-    {"key": "alns_restarts", "label": "Independent ALNS restarts", "type": "integer", "min": 1, "max": 3, "step": 1, "recommended": 2, "help": "Independent same-day ALNS chains; production uses two and protects restart 0 on ties."},
     {"key": "time_limit_ms", "label": "ALNS wall-clock limit", "unit": "ms", "type": "integer", "min": 50, "step": 50, "ui_max": 10_000, "help": "Timed mode; mutually exclusive with ALNS iterations."},
     {"key": "alns_iterations", "label": "ALNS iterations on days 1–6", "unit": "iterations/day", "type": "integer", "min": 1, "step": 1, "ui_min": 32, "ui_max": 12_000, "ui_step": 32, "recommended": 1_536, "help": "Literal untimed ALNS loop count on every non-final day; exact-search nodes are additional work."},
     {"key": "final_alns_iterations", "label": "ALNS iterations on final day", "unit": "iterations", "type": "integer", "min": 1, "max": 12_000, "step": 1, "recommended": 1_024, "help": "Literal final-day ALNS loop count. Leave blank to reuse the non-final count."},
@@ -1316,7 +1315,6 @@ def lns_time_benchmark(
                     "useAcoSeed": "use_aco_seed",
                     "useLegacySeed": "use_legacy_seed",
                     "useLocalSearchSeed": "use_local_search_seed",
-                    "alnsRestarts": "alns_restarts",
                 }[key]: value
                 for key, value in SEED_PROFILES[seed_profile].items()
             },

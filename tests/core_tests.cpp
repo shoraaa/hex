@@ -1,10 +1,12 @@
 #include "hexudon/core.hpp"
+#include "hexudon/internal.hpp"
 
 #include <boost/json.hpp>
 
 #include <cassert>
 #include <iostream>
 #include <tuple>
+#include <vector>
 
 namespace {
 
@@ -104,6 +106,79 @@ void test_trace_action_plan_emits_authoritative_frames() {
          config.day_steps[0]);
   assert(frames.back().as_object().at("agents").as_array().size() ==
          config.agents.size());
+}
+
+void test_solve_streams_monotone_improvements() {
+  // The anytime `solve` path reports every improving incumbent through an
+  // ImprovementSink. Emissions must be valid and non-decreasing in official
+  // score, and the last emission must be the returned plan.
+  auto config = small_config();
+  hexudon::DayInfo day;
+  day.day = 0;
+  day.traffics = {{1, 0}};
+  const auto types = hexudon::select_agent_types("alns", config);
+  day.agents.clear();
+  for (std::size_t index = 0; index < types.size(); ++index) {
+    day.agents.push_back({types[index], config.agents[index], config.fuel_limit});
+  }
+  hexudon::SearchLimits limits;
+  limits.time_limit_ms = -1;
+  limits.min_iterations = 1;
+  limits.max_iterations = 200;
+  limits.stagnation_iterations = 0;
+  std::vector<std::tuple<int, int, int>> scores;
+  std::vector<hexudon::ActionPlan> plans;
+  hexudon::ImprovementSink sink =
+      [&](const hexudon::ActionPlan& plan, const hexudon::Score& score) {
+        plans.push_back(plan);
+        scores.emplace_back(score.distinct_types, score.cumulative_daily_types,
+                            score.total_servings);
+      };
+  const auto best =
+      hexudon::plan_day("alns", config, day, {}, types, limits, &sink);
+  assert(!scores.empty());
+  for (const auto& plan : plans) {
+    assert(!hexudon::validate_action_plan(config, day, plan));
+  }
+  for (std::size_t index = 1; index < scores.size(); ++index) {
+    assert(!(scores[index] < scores[index - 1]));
+  }
+  assert(!hexudon::validate_action_plan(config, day, best));
+}
+
+void test_refuel_escort_reaches_distant_brands() {
+  // A patrol with fuel 2 can move only two plain tiles alone, so the far brand
+  // at pos 8 is out of reach. The refuel-escort seed pairs it with the refuel
+  // car (which burns no fuel), refuelling it every step so it sweeps the line
+  // and collects both brands.
+  hexudon::MapConfig config;
+  config.starts_at = 0;
+  config.day_seconds = {60};
+  config.day_steps = {30};
+  config.height = 1;
+  config.width = 9;
+  config.cells.assign(9, hexudon::Terrain::Plain);
+  config.spots = {{0, 3, 1}, {1, 8, 1}};
+  config.agents = {0, 0};
+  config.fuel_limit = 2;
+  config.players = 1;
+  config.busy_threshold = 2;
+  config.jammed_threshold = 4;
+  hexudon::DayInfo day;
+  day.day = 0;
+  day.agents = {{hexudon::AgentKind::Patrol, 0, 2},
+                {hexudon::AgentKind::Refuel, 0, 2}};
+  const hexudon::AgentTypes types = {hexudon::AgentKind::Patrol,
+                                     hexudon::AgentKind::Refuel};
+  const auto escort = hexudon::build_escort_plan(config, day, {}, types);
+  assert(!escort.empty());
+  assert(!hexudon::validate_action_plan(config, day, escort));
+  const auto escort_score = hexudon::score_action_plan(config, day, {}, escort);
+  assert(escort_score && escort_score->distinct_types == 2);
+  // The full solver keeps the escort incumbent.
+  const auto solved = hexudon::plan_day("alns", config, day, {}, types);
+  const auto solved_score = hexudon::score_action_plan(config, day, {}, solved);
+  assert(solved_score && solved_score->distinct_types == 2);
 }
 
 void test_all_converted_policies_produce_valid_daily_answers() {
@@ -461,5 +536,7 @@ int main() {
   test_alns_same_day_multirestart_protects_single_restart_score();
   test_online_alns_accepts_full_schedule_and_preserves_daily_quality();
   test_alns_balances_collections_after_official_score();
+  test_solve_streams_monotone_improvements();
+  test_refuel_escort_reaches_distant_brands();
   std::cout << "core tests passed\n";
 }
