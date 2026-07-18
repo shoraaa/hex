@@ -293,6 +293,7 @@ class CompetitionSessionManager:
                 "snapshot": snapshot,
                 "proposal": None,
                 "last_submission": None,
+                "incumbents": [],
                 "created_at": _now(),
                 "updated_at": _now(),
                 "progress": {"status": "starting"},
@@ -593,6 +594,90 @@ class CompetitionSessionManager:
                 session["events"] = compacted[-300:]
             _write_json(self._session_path(session_id), session)
 
+    def _record_incumbent(
+        self,
+        session_id: str,
+        *,
+        day: int,
+        score: Any,
+        internal_rank: Any,
+        elapsed_seconds: float,
+    ) -> int | None:
+        """Persist a solver improvement as soon as it is found."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None or session.get("state") in {"cancelled", "failed"}:
+                return None
+            incumbents = session.setdefault("incumbents", [])
+            sequence = len(incumbents) + 1
+            day_sequence = sum(
+                1 for row in incumbents if int(row.get("day", -1)) == day
+            ) + 1
+            found_at = _now()
+            for previous in reversed(incumbents):
+                if int(previous.get("day", -1)) != day:
+                    continue
+                if previous.get("submission_status") == "pending":
+                    previous.update(
+                        submission_status="superseded",
+                        superseded_at=found_at,
+                    )
+                break
+            incumbents.append(
+                {
+                    "sequence": sequence,
+                    "day_sequence": day_sequence,
+                    "day": day,
+                    "score": copy.deepcopy(score),
+                    "internal_rank": copy.deepcopy(internal_rank),
+                    "found_at": found_at,
+                    "elapsed_seconds": round(max(0.0, elapsed_seconds), 6),
+                    "submitted": False,
+                    "submission_status": "pending",
+                }
+            )
+            progress = dict(session.get("progress") or {})
+            progress.update(
+                best_score=copy.deepcopy(score),
+                incumbent_count=day_sequence,
+            )
+            session.update(progress=progress, updated_at=found_at)
+            _write_json(self._session_path(session_id), session)
+            return sequence
+
+    def _mark_incumbent_submitted(
+        self,
+        session_id: str,
+        sequence: int | None,
+        *,
+        submitted_at: str,
+        submission_count: int,
+    ) -> None:
+        if sequence is None:
+            return
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return
+            row = next(
+                (
+                    item
+                    for item in session.get("incumbents", [])
+                    if int(item.get("sequence", -1)) == sequence
+                ),
+                None,
+            )
+            if row is None:
+                return
+            row.update(
+                submitted=True,
+                submission_status="submitted",
+                submitted_at=submitted_at,
+                submission_count=submission_count,
+            )
+            session["updated_at"] = submitted_at
+            _write_json(self._session_path(session_id), session)
+
     def _wait(self, session_id: str, timeout: float | None = None) -> bool:
         event = self._events[session_id]
         signalled = event.wait(timeout)
@@ -890,14 +975,29 @@ class CompetitionSessionManager:
 
         stream_state: dict[str, Any] = {
             "count": 0,
+            "incumbent_count": 0,
             "best": None,
             "best_score": None,
             "pending": None,
             "last_submit": 0.0,
         }
         debounce = 0.25
+        previous_incumbents = (self.get_session(session_id) or {}).get(
+            "incumbents", []
+        )
+        elapsed_offset = max(
+            (
+                float(row.get("elapsed_seconds", 0.0))
+                for row in previous_incumbents
+                if int(row.get("day", -1)) == day_index
+            ),
+            default=0.0,
+        )
+        search_started = time.monotonic()
 
-        def submit(actions: list[list[int]], score: Any) -> None:
+        def submit(
+            actions: list[list[int]], score: Any, incumbent_sequence: int | None = None
+        ) -> None:
             response = client.post(
                 endpoint,
                 {"game_id": api_game_id, "day": day_index, "actions": actions},
@@ -909,6 +1009,13 @@ class CompetitionSessionManager:
             stream_state["pending"] = None
             journal["submitted_days"][key] = actions
             _write_json(state_path, journal)
+            submitted_at = _now()
+            self._mark_incumbent_submitted(
+                session_id,
+                incumbent_sequence,
+                submitted_at=submitted_at,
+                submission_count=stream_state["count"],
+            )
             self._update(
                 session_id,
                 state="streaming",
@@ -916,31 +1023,44 @@ class CompetitionSessionManager:
                     "day": day_index,
                     "endpoint": endpoint,
                     "response": response,
-                    "submitted_at": _now(),
+                    "submitted_at": submitted_at,
                 },
                 progress={
                     "status": "streaming",
                     "day": day_index,
                     "best_score": score,
                     "submission_count": stream_state["count"],
+                    "incumbent_count": stream_state["incumbent_count"],
+                    "budget_seconds": budget,
                 },
             )
 
         def on_improve(record: dict[str, Any]) -> None:
             actions = record.get("actions")
             score = record.get("score")
+            internal_rank = record.get("internal_rank")
             if not isinstance(actions, list):
                 return
             try:
                 validate_action_shape(actions, len(types))
             except Exception:
                 return
+            stream_state["incumbent_count"] += 1
+            incumbent_sequence = self._record_incumbent(
+                session_id,
+                day=day_index,
+                score=score,
+                internal_rank=internal_rank,
+                elapsed_seconds=(
+                    elapsed_offset + time.monotonic() - search_started
+                ),
+            )
             if time.monotonic() - stream_state["last_submit"] >= debounce:
-                submit(actions, score)
+                submit(actions, score, incumbent_sequence)
             else:
                 # Coalesce a burst of rapid improvements; the final flush below
                 # guarantees the best is submitted before the day advances.
-                stream_state["pending"] = (actions, score)
+                stream_state["pending"] = (actions, score, incumbent_sequence)
                 stream_state["best"] = actions
                 stream_state["best_score"] = score
 
@@ -962,6 +1082,7 @@ class CompetitionSessionManager:
                 "day": day_index,
                 "budget_seconds": budget,
                 "submission_count": 0,
+                "incumbent_count": 0,
             },
         )
         payload = {
@@ -1013,6 +1134,8 @@ class CompetitionSessionManager:
                     "status": "stream_paused",
                     "day": day_index,
                     "submission_count": stream_state["count"],
+                    "incumbent_count": stream_state["incumbent_count"],
+                    "budget_seconds": budget,
                 },
             )
             return
@@ -1057,6 +1180,8 @@ class CompetitionSessionManager:
                 "day": day_index,
                 "best_score": stream_state["best_score"],
                 "submission_count": stream_state["count"],
+                "incumbent_count": stream_state["incumbent_count"],
+                "budget_seconds": budget,
             },
         )
 

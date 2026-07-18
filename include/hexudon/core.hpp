@@ -2,6 +2,7 @@
 
 #include <boost/json.hpp>
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -71,11 +72,25 @@ struct Score {
   int total_servings{};
 };
 
+// Exact secondary rank used to distinguish plans with the same official score.
+// Each array is compared lexicographically and higher is better. Congestion
+// mode is "disabled", "current", or "rolling"; the latter includes prior-day
+// self-traffic at the penultimate-day continuation boundary.
+struct IncumbentRank {
+  bool available{};
+  std::string congestion_mode{"disabled"};
+  std::array<int, 6> congestion{};
+  std::array<int, 3> workload{};
+  int patrol_fuel{};
+};
+
 // Anytime callback invoked whenever a solver finds a strictly better plan for
 // the current day.  The competition scores each day by the last valid
 // submission, so a streaming solver reports every improving incumbent and the
-// caller resubmits it.  The reported score is the authoritative day triple.
-using ImprovementSink = std::function<void(const ActionPlan&, const Score&)>;
+// caller resubmits it. The score is the authoritative day triple and the
+// internal rank explains improvements that tie on that triple.
+using ImprovementSink = std::function<void(
+    const ActionPlan&, const Score&, const IncumbentRank&)>;
 
 struct EvaluationResult {
   Score score;

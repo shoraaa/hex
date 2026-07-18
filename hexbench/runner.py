@@ -72,10 +72,10 @@ def stream_core(
 ) -> dict[str, Any] | None:
     """Run the anytime `solve` command, calling `on_improve` per NDJSON line.
 
-    The core streams one ``{"score": [...], "actions": [...]}`` record for every
-    improving incumbent and terminates itself at ``search.timeLimitMs``.  The
-    ``timeout`` is a backstop watchdog: it should exceed the solver deadline plus
-    a margin.  Returns the final (best) record, or ``None`` if nothing streamed.
+    The core streams one record with ``score``, ``internal_rank``, and ``actions``
+    for every improving incumbent and terminates itself at ``search.timeLimitMs``.
+    The ``timeout`` is a backstop watchdog: it should exceed the solver deadline
+    plus a margin. Returns the final (best) record, or ``None`` if nothing streamed.
     """
     environment = None
     if core_threads is not None:

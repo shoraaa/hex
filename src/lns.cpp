@@ -2644,8 +2644,24 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
   auto emit_improvement = [&] {
     if (on_improve == nullptr) return;
     const auto official = alns_official_value(best_value);
+    const auto congestion = congestion_value(best_evaluation);
+    const auto workload = best_evaluation.workload;
+    const IncumbentRank internal_rank{
+        true,
+        config.players != 1
+            ? "disabled"
+            : (day.day + 2 == static_cast<int>(config.day_steps.size())
+                   ? "rolling"
+                   : "current"),
+        {std::get<0>(congestion), std::get<1>(congestion),
+         std::get<2>(congestion), std::get<3>(congestion),
+         std::get<4>(congestion), std::get<5>(congestion)},
+        {std::get<0>(workload), std::get<1>(workload),
+         std::get<2>(workload)},
+        std::get<3>(best_value)};
     (*on_improve)(best, Score{std::get<0>(official), std::get<1>(official),
-                              std::get<2>(official)});
+                              std::get<2>(official)},
+                  internal_rank);
   };
   emit_improvement();
 
