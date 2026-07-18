@@ -202,6 +202,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="evaluate every Nth manifest case; 1 evaluates the complete suite",
     )
 
+    traffic_data = subparsers.add_parser(
+        "traffic-generate",
+        help="generate a reusable traffic dataset with 16 diversely seeded ALNS players",
+    )
+    traffic_data.add_argument("--train-cases", type=int, default=100)
+    traffic_data.add_argument("--validation-cases", type=int, default=20)
+    traffic_data.add_argument("--seed", type=int, default=20260718)
+    traffic_data.add_argument("--alns-iterations", type=int, default=32)
+    traffic_data.add_argument(
+        "--out", type=Path, default=Path("datasets/traffic-gnn")
+    )
+    traffic_data.add_argument("--binary")
+    traffic_data.add_argument("--simulation-timeout", type=float, default=180.0)
+    traffic_data.add_argument("--core-threads", type=int, default=1)
+    traffic_data.add_argument("--jobs", type=int, default=8)
+    traffic_data.add_argument("--overwrite", action="store_true")
+
+    traffic = subparsers.add_parser(
+        "traffic-train",
+        help="train a minimal GNN from a previously generated traffic dataset",
+    )
+    traffic.add_argument(
+        "--dataset",
+        type=Path,
+        default=Path("datasets/traffic-gnn/dataset.pt"),
+    )
+    traffic.add_argument("--epochs", type=int, default=200)
+    traffic.add_argument("--seed", type=int, default=20260718)
+    traffic.add_argument("--hidden-size", type=int, default=128)
+    traffic.add_argument("--layers", type=int, default=4)
+    traffic.add_argument("--learning-rate", type=float, default=1e-3)
+    traffic.add_argument("--batch-size", type=int, default=64)
+    traffic.add_argument("--patience", type=int, default=30)
+    traffic.add_argument("--minimum-epochs", type=int, default=50)
+    traffic.add_argument("--device", default="auto")
+    traffic.add_argument("--report", type=Path, default=Path("reports/traffic-gnn"))
+
     web = subparsers.add_parser(
         "web", help="serve the Practice and Competition operations console"
     )
@@ -398,6 +435,59 @@ def main(argv: list[str] | None = None) -> None:
             case_stride=args.case_stride,
         )
         print(json.dumps({"report": str(args.report / "report.json"), "best": report["best"]["parameters"]}))
+    elif args.command == "traffic-generate":
+        from .traffic_gnn import generate_traffic_dataset
+
+        manifest = generate_traffic_dataset(
+            output_dir=args.out,
+            train_cases=args.train_cases,
+            validation_cases=args.validation_cases,
+            seed=args.seed,
+            alns_iterations=args.alns_iterations,
+            binary_path=args.binary,
+            simulation_timeout=args.simulation_timeout,
+            core_threads=args.core_threads,
+            jobs=args.jobs,
+            overwrite=args.overwrite,
+        )
+        print(
+            json.dumps(
+                {
+                    "dataset": manifest["dataset"],
+                    "manifest": str(args.out / "manifest.json"),
+                    "train_samples": manifest["train_samples"],
+                    "validation_samples": manifest["validation_samples"],
+                }
+            )
+        )
+    elif args.command == "traffic-train":
+        from .traffic_gnn import train_traffic_gnn
+
+        report = train_traffic_gnn(
+            dataset_path=args.dataset,
+            epochs=args.epochs,
+            seed=args.seed,
+            hidden_size=args.hidden_size,
+            layers=args.layers,
+            learning_rate=args.learning_rate,
+            batch_size=args.batch_size,
+            patience=args.patience,
+            minimum_epochs=args.minimum_epochs,
+            device_name=args.device,
+            report_dir=args.report,
+        )
+        print(
+            json.dumps(
+                {
+                    "report": str(args.report / "report.json"),
+                    "checkpoint": report["checkpoint"],
+                    "best_epoch": report["best_epoch"],
+                    "train_loss": report["best_train"]["loss"],
+                    "validation_loss": report["best_validation"]["loss"],
+                    "validation_accuracy": report["best_validation"]["accuracy"],
+                }
+            )
+        )
     elif args.command == "web":
         from .web import serve_dashboard
 

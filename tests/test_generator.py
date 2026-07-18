@@ -412,6 +412,20 @@ def test_new_question_alns_preserves_the_online_graded_baseline() -> None:
     assert result["score"]["total_servings"] >= 218
 
 
+def test_brutal_case_0000_stages_refuel_on_first_day() -> None:
+    scenario_path = (
+        Path(__file__).resolve().parents[1]
+        / "cases/hard/brutal/case-0000.json"
+    )
+    scenario = json.loads(scenario_path.read_text())
+    result = run_core("visualize", "alns", scenario, binary=find_binary())
+    first_day = result["replay"]["days"][0]
+    starts = first_day["all_team_starts"][0]["agents"]
+    actions = first_day["all_team_actions"][0]["actions"]
+    refuel = next(index for index, agent in enumerate(starts) if agent["type"] == 1)
+    assert actions[refuel] != [-scenario["config"]["daySteps"][0]]
+
+
 def test_all_planners_accept_published_future_day_lengths() -> None:
     scenario_path = (
         Path(__file__).resolve().parents[1]

@@ -197,6 +197,9 @@ std::optional<CandidateEvaluation> evaluate_candidate(
 std::optional<CandidateValue> candidate_value(
     const MapConfig& config, const DayInfo& day,
     const PolicyHistory& history, const ActionPlan& plan);
+std::vector<ActionPlan> refuel_staging_variants(
+    const MapConfig& config, const DayInfo& day, const AgentTypes& types,
+    const PolicyHistory& history, const ActionPlan& plan);
 
 AcoGraph build_aco_graph(const MapConfig& config, const DayInfo& day,
                          const std::vector<int>& extra_nodes = {});

@@ -7,8 +7,10 @@ __pycache__/
 .pytest_cache/
 .hypothesis/
 cases/
+datasets/
 reports/
-.hexbench-state/
+.hexbench-state*/
+.claude/
 
 open-source-sisr-routing/
 .kilo

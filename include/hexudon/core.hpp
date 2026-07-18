@@ -120,6 +120,10 @@ struct SearchLimits {
   int aco_ants{};
   int aco_iterations{};
   double aco_evaporation{0.85};
+  // Optional deterministic diversification salt. Zero preserves the canonical
+  // competition trajectory; local multi-player simulations assign one salt per
+  // player so identical ALNS policies do not collapse to identical routes.
+  std::uint64_t random_seed{};
   bool use_aco_seed{true};
   bool use_legacy_seed{true};
   bool use_local_search_seed{true};

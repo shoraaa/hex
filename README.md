@@ -320,6 +320,45 @@ iteration cap, so the soft deadline becomes the stopping rule. A 60-second
 point is applied independently to every day and can therefore take several
 minutes per map. The web dashboard exposes the same curve controls.
 
+## Traffic GNN prototype
+
+Generate the reusable dataset once. Every simulated player uses ALNS with a
+distinct deterministic seed:
+
+```sh
+uv run hexbench traffic-generate \
+  --train-cases 100 \
+  --validation-cases 20 \
+  --alns-iterations 32 \
+  --jobs 8 \
+  --out datasets/traffic-gnn
+```
+
+This is the only stage that runs the authoritative C++ simulator. It writes a
+versioned `dataset.pt` containing CPU tensors and a `manifest.json` containing
+the instance split, label counts, player seeds, distinct-plan counts, byte size,
+and SHA-256 digest. Each completed instance is checkpointed under `shards/`, so
+rerunning the same command resumes interrupted generation. Existing complete
+datasets are protected unless `--overwrite` is passed.
+
+Train repeatedly from those saved tensors without running any simulation:
+
+```sh
+uv run hexbench traffic-train \
+  --dataset datasets/traffic-gnn/dataset.pt \
+  --epochs 200 \
+  --batch-size 64 \
+  --patience 30 \
+  --report reports/traffic-gnn
+```
+
+The model predicts each road's day-`t` smooth/busy/jammed label from map
+features, normalized axial coordinates, all players' start-of-day agents, and
+road statuses through day `t-1`. The loss is unweighted cross entropy over road
+nodes only. The report directory receives `report.json` with per-epoch metrics
+and `model.pt` with the best-validation checkpoint, dataset digest, and feature schema.
+Use `--device cpu` for a CPU-only run or leave `auto` to use an available GPU.
+
 ## Web dashboard
 
 Start the browser interface on the competition machine with:
