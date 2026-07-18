@@ -29,7 +29,6 @@ from .runner import (
 
 SEED_PROFILES: dict[str, dict[str, int | bool]] = {
     "production": {},
-    "single": {"alnsRestarts": 1},
     "no_local": {"useLocalSearchSeed": False},
     "no_legacy": {"useLegacySeed": False},
     "no_local_legacy": {
@@ -54,8 +53,6 @@ SEED_PROFILES: dict[str, dict[str, int | bool]] = {
         "useLegacySeed": False,
     },
     "no_aco": {"useAcoSeed": False},
-    "multi2": {"alnsRestarts": 2},
-    "multi3": {"alnsRestarts": 3},
 }
 
 

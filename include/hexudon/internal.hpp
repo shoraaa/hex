@@ -249,7 +249,12 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
                            const PolicyHistory& history,
                            const AgentTypes& types, const SearchLimits& limits,
                            unsigned features, bool allow_continuation = true,
-                           std::uint64_t restart_salt = 0);
+                           std::uint64_t restart_salt = 0,
+                           const ImprovementSink* on_improve = nullptr);
+// Refuel-escort construction seed (empty when there is no refuel car).
+ActionPlan build_escort_plan(const MapConfig& config, const DayInfo& day,
+                             const PolicyHistory& history,
+                             const AgentTypes& types);
 ActionPlan build_alns_multirestart_plan(const MapConfig& config,
                                         const DayInfo& day,
                                         const PolicyHistory& history,

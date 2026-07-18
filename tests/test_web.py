@@ -311,13 +311,15 @@ def test_competition_refresh_clears_historical_session_ui_and_stale_polls() -> N
     assert 'terminal.has(state.session.state)' in script
 
 
-def test_play_ui_exposes_manual_auto_curl_and_original_game_features() -> None:
+def test_play_ui_exposes_streaming_console_and_original_game_features() -> None:
     script = (web.STATIC_ROOT / "app.js").read_text()
 
-    assert '["manual","auto","curl"]' in script
+    # Autonomous streaming console: policy + practice time-limit + start/stop.
+    assert "start-search" in script
+    assert "time-limit" in script
+    assert "time_limit_seconds" in script
+    assert "autoSubmitInfo" in script
     assert 'post("/api/play/sessions"' in script
-    assert "/submit`" in script
-    assert "/curl`" in script
     assert "showReplay" in script
     assert "showAnswers" in script
     assert "showConfig" in script

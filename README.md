@@ -113,9 +113,9 @@ resulting distinct-brand history. On the final day, any strict official
 improvement is accepted. Official ties always retain restart zero.
 The 1,000-case 512-iteration promotion gate produced 27 wins, 973 ties, and no
 losses versus one restart, improving mean normalized servings from 67.4378% to
-67.4468% without changing normalized distinct or daily coverage. Set
-`alns_restarts=1` to reproduce the single-restart control or `2` to disable the
-SISR diversification chain; `lns` remains single-restart by default.
+67.4468% without changing normalized distinct or daily coverage. The restart
+count is fixed: `alns` always runs all three chains and `lns` remains
+single-restart.
 
 The SISR chain passed the complete 1,000-case 512-iteration promotion gate
 against the protected two-chain solver with `29` wins, `971` ties, and no

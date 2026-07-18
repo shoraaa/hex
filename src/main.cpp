@@ -80,7 +80,6 @@ hexudon::SearchLimits parse_search_limits(const boost::json::object& object) {
     assign_bool(search, "useAcoSeed", limits.use_aco_seed);
     assign_bool(search, "useLegacySeed", limits.use_legacy_seed);
     assign_bool(search, "useLocalSearchSeed", limits.use_local_search_seed);
-    assign(search, "alnsRestarts", limits.alns_restarts);
   }
   if (const auto* value = object.if_contains("hyperparameters")) {
     const auto& hyperparameters = value->as_object();
@@ -108,7 +107,6 @@ hexudon::SearchLimits parse_search_limits(const boost::json::object& object) {
     assign_bool(hyperparameters, "use_legacy_seed", limits.use_legacy_seed);
     assign_bool(hyperparameters, "use_local_search_seed",
                 limits.use_local_search_seed);
-    assign(hyperparameters, "alns_restarts", limits.alns_restarts);
     assign(hyperparameters, "max_targets", limits.max_targets);
     assign(hyperparameters, "fuel_reserve", limits.fuel_reserve);
     assign(hyperparameters, "passes", limits.local_search_passes);
@@ -127,7 +125,6 @@ hexudon::SearchLimits parse_search_limits(const boost::json::object& object) {
       limits.min_iterations > limits.max_iterations || limits.max_targets < 0 ||
       limits.fuel_reserve < 0 || limits.local_search_passes < 0 ||
       limits.aco_ants < 0 || limits.aco_iterations < 0 ||
-      limits.alns_restarts < 0 || limits.alns_restarts > 3 ||
       limits.seed_iterations < 0 || limits.final_alns_iterations < -1 ||
       limits.exact_nodes < 0 || limits.final_exact_nodes < -1 ||
       limits.aco_evaporation <= 0.0 || limits.aco_evaporation >= 1.0) {
@@ -141,7 +138,7 @@ hexudon::SearchLimits parse_search_limits(const boost::json::object& object) {
 int main(int argc, char** argv) {
   try {
     if (argc != 3) {
-      std::cerr << "usage: hexudon <types|plan|check|trace|eval> <policy>\n";
+      std::cerr << "usage: hexudon <types|plan|solve|check|trace|eval> <policy>\n";
       return 2;
     }
     const std::string command = argv[1];
@@ -162,6 +159,42 @@ int main(int argc, char** argv) {
       output = hexudon::to_json(
           hexudon::plan_day(policy, config, day, history, types,
                             parse_search_limits(object)));
+    } else if (command == "solve") {
+      // Anytime streaming: run the planner to its deadline and print one NDJSON
+      // line per improving incumbent as {"score":[distinct,daily,servings],
+      // "actions":[[...]]}. The last line is the plan the caller should submit.
+      const auto& object = input.as_object();
+      const auto config = hexudon::parse_map_config(object.at("config"));
+      const auto day = hexudon::parse_day_info(object.at("day_info"));
+      const auto history = object.if_contains("history")
+                               ? hexudon::parse_history(object.at("history"))
+                               : hexudon::PolicyHistory{};
+      const auto types = parse_types(object.at("types"));
+      const auto limits = parse_search_limits(object);
+      bool emitted = false;
+      const hexudon::ImprovementSink sink =
+          [&](const hexudon::ActionPlan& plan, const hexudon::Score& score) {
+            boost::json::object line{
+                {"score", boost::json::array{score.distinct_types,
+                                             score.cumulative_daily_types,
+                                             score.total_servings}},
+                {"actions", hexudon::to_json(plan)}};
+            std::cout << boost::json::serialize(line) << '\n';
+            std::cout.flush();
+            emitted = true;
+          };
+      const auto best = hexudon::plan_day(policy, config, day, history, types,
+                                          limits, &sink);
+      if (!emitted) {
+        // Policies without streaming support (or an early deadline) still owe
+        // the caller one authoritative plan.
+        hexudon::Score score{};
+        if (auto scored = hexudon::score_action_plan(config, day, history, best)) {
+          score = *scored;
+        }
+        sink(best, score);
+      }
+      return 0;
     } else if (command == "eval") {
       output = hexudon::to_json(
           hexudon::evaluate_scenario(input, policy,
