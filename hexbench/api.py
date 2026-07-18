@@ -73,6 +73,7 @@ POLICY_HYPERPARAMETERS: dict[str, tuple[dict[str, Any], ...]] = {
         {"key": "iterations", "label": "ACO iterations", "type": "integer", "min": 1, "step": 1, "ui_max": 100, "recommended": 20},
         {"key": "evaporation", "label": "Pheromone retention", "type": "number", "exclusive_min": 0, "exclusive_max": 1, "step": 0.01, "ui_min": 0.05, "ui_max": 0.99, "recommended": 0.85},
     ),
+    "stop_bp": ALNS_HYPERPARAMETERS,
 }
 
 

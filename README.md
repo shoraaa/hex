@@ -465,6 +465,7 @@ performed well. The seeded generator keeps this adaptive policy reproducible.
 | `alns` | Explicit alias for the promoted ALNS; its destroy/repair/travel operators are selected by a deterministic UCB tree that backpropagates validated rollout quality. |
 | `aco` | Pure ant-colony search over complete patrol routes and synchronized mobile-refueling rendezvous. |
 | `aco_ls` | ACO whose every ant is refined by one-pass route-substitution local search before ranking and selection. |
+| `stop_bp` (`bp`) | Branch-and-price over fuel-relaxed patrol routes: a set-partition master LP solved with an in-house revised simplex, label-setting pricing with dominance, and lambda-branching. Warm-started from a short ALNS run, which is also returned when the instance exceeds the spot/brand cap or the deadline expires. |
 
 For example:
 

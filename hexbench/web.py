@@ -36,6 +36,7 @@ POLICIES = (
     "alns",
     "aco",
     "aco_ls",
+    "stop_bp",
 )
 # Explicit deterministic profile that preserves the saved New Question 219
 # serving trajectory. ALNS and exact work are separate literal counts.

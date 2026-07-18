@@ -954,7 +954,7 @@ ActionPlan build_lns_plan(const MapConfig& config, const DayInfo& day,
   if (elite.size() > 8) elite.resize(8);
   if (elite.empty()) return best;
 
-  std::mt19937_64 random(lns_seed(config, day, history));
+  std::mt19937_64 random(lns_seed(config, day, history) ^ limits.random_seed);
   std::array<double, 4> destroy_weights{1, 1, 1, 1};
   std::array<double, 3> repair_weights{1, 1, 1};
   auto choose = [&](const auto& weights) {
@@ -2536,7 +2536,7 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
   const std::size_t elite_limit = 12U;
   if (elite.size() > elite_limit) elite.resize(elite_limit);
   std::mt19937_64 random(lns_seed(config, day, history) ^ 0x414c4e53ULL ^
-                         restart_salt);
+                         restart_salt ^ limits.random_seed);
   // Re-initialise seed travel choices with the real deterministic generator.
   for (auto& item : elite) repair_alns_travel(item.solution, 0, random);
   Elite current = elite.front();

@@ -110,6 +110,11 @@ struct SearchLimits {
   bool use_local_search_seed{true};
   // Zero selects the policy default: three for ALNS and one for LNS.
   int alns_restarts{};
+  // Zero keeps the deterministic default RNG; any non-zero value is mixed
+  // (XOR) into every LNS/ALNS seed so the same map yields different, still
+  // reproducible, trajectories. Lets experiments ask "do different seeds
+  // produce different plans on one map?"
+  std::uint64_t random_seed{0};
 };
 
 MapConfig parse_map_config(const json::value& value);

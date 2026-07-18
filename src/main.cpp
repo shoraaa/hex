@@ -61,6 +61,13 @@ hexudon::SearchLimits parse_search_limits(const boost::json::object& object) {
                         std::string_view key, bool& target) {
     if (const auto* item = search.if_contains(key)) target = item->as_bool();
   };
+  auto assign_seed = [](const boost::json::object& search,
+                        std::string_view key, std::uint64_t& target) {
+    if (const auto* item = search.if_contains(key)) {
+      const auto value = item->to_number<std::int64_t>();
+      target = static_cast<std::uint64_t>(value);
+    }
+  };
   if (const auto* value = object.if_contains("search")) {
     const auto& search = value->as_object();
     explicit_time_limit = search.contains("timeLimitMs");
@@ -80,6 +87,7 @@ hexudon::SearchLimits parse_search_limits(const boost::json::object& object) {
     assign_bool(search, "useAcoSeed", limits.use_aco_seed);
     assign_bool(search, "useLegacySeed", limits.use_legacy_seed);
     assign_bool(search, "useLocalSearchSeed", limits.use_local_search_seed);
+    assign_seed(search, "randomSeed", limits.random_seed);
   }
   if (const auto* value = object.if_contains("hyperparameters")) {
     const auto& hyperparameters = value->as_object();
@@ -107,6 +115,7 @@ hexudon::SearchLimits parse_search_limits(const boost::json::object& object) {
     assign_bool(hyperparameters, "use_legacy_seed", limits.use_legacy_seed);
     assign_bool(hyperparameters, "use_local_search_seed",
                 limits.use_local_search_seed);
+    assign_seed(hyperparameters, "random_seed", limits.random_seed);
     assign(hyperparameters, "max_targets", limits.max_targets);
     assign(hyperparameters, "fuel_reserve", limits.fuel_reserve);
     assign(hyperparameters, "passes", limits.local_search_passes);

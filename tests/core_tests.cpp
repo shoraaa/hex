@@ -518,6 +518,121 @@ void test_alns_balances_collections_after_official_score() {
   assert(*std::max_element(collections.begin(), collections.end()) <= 3);
 }
 
+void test_stop_bp_is_alias_and_routes() {
+  // The alias must resolve to a routing policy that selects LNS-style agent
+  // types (same family as alns/lns).
+  const hexudon::MapConfig config = small_config();
+  const auto types = hexudon::select_agent_types("bp", config);
+  assert(types.size() == config.agents.size());
+}
+
+void test_stop_bp_returns_valid_plan() {
+  hexudon::MapConfig config;
+  config.starts_at = 1700000000;
+  config.day_seconds = {60};
+  config.day_steps = {20};
+  config.height = 5;
+  config.width = 5;
+  config.cells.assign(25, hexudon::Terrain::Plain);
+  config.spots = {
+      {0, 1, 1}, {1, 3, 1}, {2, 5, 1}, {3, 9, 1},
+      {4, 15, 1}, {5, 19, 1}, {6, 21, 1}, {7, 23, 1},
+  };
+  config.agents = {0, 4, 20, 24};
+  config.fuel_limit = 40;
+  config.players = 1;
+  config.busy_threshold = 2;
+  config.jammed_threshold = 4;
+
+  hexudon::DayInfo day;
+  day.day = 0;
+  const hexudon::AgentTypes types =
+      hexudon::select_agent_types("stop_bp", config);
+  for (int pos : config.agents) {
+    day.agents.push_back({hexudon::AgentKind::Patrol, pos, config.fuel_limit});
+  }
+  hexudon::SearchLimits limits;
+  limits.final_alns_iterations = 32;  // keep the warm run light in tests
+  const auto plan =
+      hexudon::plan_day("stop_bp", config, day, {}, types, limits);
+  assert(!hexudon::validate_action_plan(config, day, plan));
+  const auto score = hexudon::score_action_plan(config, day, {}, plan);
+  assert(score);
+  assert(score->total_servings > 0);
+}
+
+void test_stop_bp_reaches_known_optimum() {
+  // Two patrols, four single-stock spots of distinct brands placed one step
+  // apart. The optimum serves all four spots (4 servings, 4 distinct brands).
+  hexudon::MapConfig config;
+  config.starts_at = 1700000000;
+  config.day_seconds = {60};
+  config.day_steps = {40};
+  config.height = 3;
+  config.width = 3;
+  config.cells.assign(9, hexudon::Terrain::Plain);
+  config.spots = {{0, 1, 1}, {1, 5, 1}, {2, 7, 1}, {3, 3, 1}};
+  config.agents = {0, 2};
+  config.fuel_limit = 40;
+  config.players = 1;
+  config.busy_threshold = 2;
+  config.jammed_threshold = 4;
+
+  hexudon::DayInfo day;
+  day.day = 0;
+  const hexudon::AgentTypes types(config.agents.size(),
+                                  hexudon::AgentKind::Patrol);
+  for (int pos : config.agents) {
+    day.agents.push_back(
+        {hexudon::AgentKind::Patrol, pos, config.fuel_limit});
+  }
+  hexudon::SearchLimits limits;
+  limits.final_alns_iterations = 32;
+  const auto plan =
+      hexudon::plan_day("stop_bp", config, day, {}, types, limits);
+  assert(!hexudon::validate_action_plan(config, day, plan));
+  const auto trace =
+      hexudon::trace_action_plan(config, day, {}, plan).as_object();
+  assert(trace.at("valid").as_bool());
+  const auto& score = trace.at("score").as_object();
+  // The branch-and-price master upper bound is the structural optimum, so the
+  // returned plan must achieve all four servings.
+  assert(score.at("servings").as_int64() == 4);
+}
+
+void test_stop_bp_falls_back_on_large_instance() {
+  // With more than 14 spots the policy must short-circuit to the warm plan and
+  // still return something valid.
+  hexudon::MapConfig config;
+  config.starts_at = 1700000000;
+  config.day_seconds = {60};
+  config.day_steps = {20};
+  config.height = 5;
+  config.width = 5;
+  config.cells.assign(25, hexudon::Terrain::Plain);
+  std::vector<hexudon::Spot> spots;
+  for (int i = 0; i < 15; ++i) spots.push_back({i, i, 1});
+  config.spots = std::move(spots);
+  config.agents = {0, 4, 20, 24};
+  config.fuel_limit = 40;
+  config.players = 1;
+  config.busy_threshold = 2;
+  config.jammed_threshold = 4;
+
+  hexudon::DayInfo day;
+  day.day = 0;
+  const hexudon::AgentTypes types =
+      hexudon::select_agent_types("stop_bp", config);
+  for (int pos : config.agents) {
+    day.agents.push_back({hexudon::AgentKind::Patrol, pos, config.fuel_limit});
+  }
+  hexudon::SearchLimits limits;
+  limits.final_alns_iterations = 16;
+  const auto plan =
+      hexudon::plan_day("stop_bp", config, day, {}, types, limits);
+  assert(!hexudon::validate_action_plan(config, day, plan));
+}
+
 }  // namespace
 
 int main() {
@@ -538,5 +653,9 @@ int main() {
   test_alns_balances_collections_after_official_score();
   test_solve_streams_monotone_improvements();
   test_refuel_escort_reaches_distant_brands();
+  test_stop_bp_is_alias_and_routes();
+  test_stop_bp_returns_valid_plan();
+  test_stop_bp_reaches_known_optimum();
+  test_stop_bp_falls_back_on_large_instance();
   std::cout << "core tests passed\n";
 }
