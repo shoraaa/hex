@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from tqdm import tqdm
+
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
@@ -480,16 +482,16 @@ def generate_traffic_dataset(
     def shard_path(split: str, instance_seed: int) -> Path:
         return shard_dir / f"{split}-{instance_seed}.pt"
 
-    def generate_one(split: str, instance_seed: int) -> Path:
+    def generate_one(split: str, instance_seed: int) -> tuple[Path, dict[str, Any]]:
         path = shard_path(split, instance_seed)
         if path.exists() and not overwrite:
-            _load_instance_shard(
+            _, cached_summary = _load_instance_shard(
                 path,
                 split=split,
                 seed=instance_seed,
                 alns_iterations=alns_iterations,
             )
-            return path
+            return path, cached_summary
         samples, summaries = simulate_online_samples(
             [instance_seed],
             alns_iterations=alns_iterations,
@@ -505,23 +507,56 @@ def generate_traffic_dataset(
             samples=samples,
             summary=summaries[0],
         )
-        return path
+        return path, summaries[0]
 
-    completed = 0
-    with ThreadPoolExecutor(max_workers=jobs) as executor:
-        futures = {
-            executor.submit(generate_one, split, instance_seed): (split, instance_seed)
-            for split, instance_seed in requested
-        }
-        for future in as_completed(futures):
-            future.result()
-            completed += 1
-            if completed == len(requested) or completed % max(1, len(requested) // 100) == 0:
-                print(
-                    f"traffic generation: {completed}/{len(requested)} instances",
-                    file=sys.stderr,
-                    flush=True,
+    class_totals = [0, 0, 0]
+    total_samples = 0
+    last_status: str = ""
+    progress = tqdm(
+        total=len(requested),
+        desc="traffic generation",
+        unit="inst",
+        dynamic_ncols=True,
+        file=sys.stderr,
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=jobs) as executor:
+            futures = {
+                executor.submit(generate_one, split, instance_seed): (
+                    split,
+                    instance_seed,
                 )
+                for split, instance_seed in requested
+            }
+            for future in as_completed(futures):
+                split, instance_seed = futures[future]
+                exc = future.exception()
+                if exc is not None:
+                    progress.close()
+                    raise exc
+                _, summary = future.result()
+                class_counts = summary.get("class_counts", [0, 0, 0])
+                for index, value in enumerate(class_counts):
+                    class_totals[index] += int(value)
+                total_samples += int(summary.get("samples", 0))
+                last_status = (
+                    f"{split[0]}{instance_seed} "
+                    f"d={summary.get('days', '?')} "
+                    f"s={summary.get('samples', 0)} "
+                    f"roads={summary.get('roads', '?')} "
+                    f"smooth/busy/jam="
+                    f"{class_counts[0]}/{class_counts[1]}/{class_counts[2]}"
+                    + (f" err={summary['error']}" if "error" in summary else "")
+                )
+                progress.set_postfix_str(
+                    f"last[{last_status}] "
+                    f"tot={total_samples} "
+                    f"S/B/J={class_totals[0]}/{class_totals[1]}/{class_totals[2]}",
+                    refresh=True,
+                )
+                progress.update(1)
+    finally:
+        progress.close()
 
     train_samples: list[TrafficGraphSample] = []
     validation_samples: list[TrafficGraphSample] = []
