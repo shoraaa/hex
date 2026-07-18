@@ -189,6 +189,42 @@ void test_refuel_escort_reaches_distant_brands() {
   assert(solved_score && solved_score->distinct_types == 2);
 }
 
+void test_refuel_staging_targets_low_fuel_patrol_endpoints() {
+  hexudon::MapConfig config;
+  config.starts_at = 0;
+  config.day_seconds = {60, 60};
+  config.day_steps = {8, 8};
+  config.height = 3;
+  config.width = 3;
+  config.cells.assign(9, hexudon::Terrain::Plain);
+  config.spots = {{0, 8, 1}};
+  config.agents = {0, 4};
+  config.fuel_limit = 8;
+  config.players = 1;
+  config.busy_threshold = 2;
+  config.jammed_threshold = 4;
+
+  hexudon::DayInfo day;
+  day.day = 0;
+  day.agents = {{hexudon::AgentKind::Refuel, 0, 8},
+                {hexudon::AgentKind::Patrol, 4, 1}};
+  const hexudon::AgentTypes types = {hexudon::AgentKind::Refuel,
+                                     hexudon::AgentKind::Patrol};
+  const hexudon::ActionPlan idle{{-8}, {-8}};
+  const auto idle_evaluation =
+      hexudon::evaluate_candidate(config, day, {}, idle);
+  assert(idle_evaluation);
+
+  const auto variants =
+      hexudon::refuel_staging_variants(config, day, types, {}, idle);
+  assert(std::any_of(variants.begin(), variants.end(), [&](const auto& plan) {
+    const auto evaluation =
+        hexudon::evaluate_candidate(config, day, {}, plan);
+    return evaluation && evaluation->ending_positions[0] == 4 &&
+           evaluation->ending_fuel[1] > idle_evaluation->ending_fuel[1];
+  }));
+}
+
 void test_all_converted_policies_produce_valid_daily_answers() {
   auto config = small_config();
   hexudon::DayInfo day;
@@ -665,5 +701,6 @@ int main() {
   test_stop_bp_returns_valid_plan();
   test_stop_bp_reaches_known_optimum();
   test_stop_bp_falls_back_on_large_instance();
+  test_refuel_staging_targets_low_fuel_patrol_endpoints();
   std::cout << "core tests passed\n";
 }

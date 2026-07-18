@@ -1962,6 +1962,8 @@ struct AlnsRolloutState {
   std::vector<std::map<int, int>> traffic_history;
   int cumulative_daily{};
   int servings{};
+  long double discounted_daily{};
+  long double discounted_servings{};
 };
 
 std::vector<std::map<int, int>> reconstruct_own_traffic(
@@ -1992,13 +1994,39 @@ std::vector<std::map<int, int>> reconstruct_own_traffic(
 struct AlnsMatchScore {
   std::tuple<int, int, int> worst{};
   std::tuple<int, int, int> total{};
+  // Future daily/serving gains are sampled with a geometric discount.  The
+  // official match score remains in `worst`/`total`; this is only a
+  // continuation tie-break that favours useful progress sooner.
+  std::tuple<long double, long double> discounted{};
 };
 
 [[maybe_unused]] AlnsMatchScore alns_match_rollout(
     const MapConfig& config, const DayInfo& day,
     const PolicyHistory& history, const AgentTypes& types,
     const CandidateEvaluation& root, int beam_width,
-    const std::chrono::steady_clock::time_point& deadline) {
+    const std::chrono::steady_clock::time_point& deadline,
+    unsigned projection_features) {
+  // The projection must use the same ALNS family as the real continuation;
+  // cheap greedy routes are useful fallbacks, but alone they routinely rank a
+  // refuel staging move that loses when the actual ALNS resumes next day.
+  SearchLimits projection_limits;
+  projection_limits.time_limit_ms = -1;
+  projection_limits.min_iterations = 64;
+  projection_limits.max_iterations = 64;
+  projection_limits.stagnation_iterations = 0;
+  projection_limits.seed_iterations = 0;
+  projection_limits.exact_nodes = 0;
+  projection_limits.final_alns_iterations = -1;
+  projection_limits.final_exact_nodes = -1;
+  projection_limits.use_aco_seed = false;
+  projection_limits.use_legacy_seed = false;
+  projection_limits.use_local_search_seed = false;
+  projection_limits.alns_restarts = 1;
+  if (deadline != std::chrono::steady_clock::time_point::max()) {
+    // The outer timed look-ahead owns only a small slice of the live budget;
+    // keep the nested ALNS planner from running untimed past that slice.
+    projection_limits.time_limit_ms = 20;
+  }
   AlnsRolloutState initial;
   initial.positions = root.ending_positions;
   initial.fuel = root.ending_fuel;
@@ -2053,6 +2081,10 @@ struct AlnsMatchScore {
           plans.push_back(build_routing_plan(policy, config, next, next_history,
                                              types, {}, {}));
         }
+        plans.push_back(build_alns_plan(
+            config, next, next_history, types, projection_limits,
+            projection_features, false, static_cast<std::uint64_t>(scenario),
+            nullptr));
         for (const auto& plan : plans) {
           if (std::chrono::steady_clock::now() >= deadline) break;
           auto evaluation =
@@ -2061,6 +2093,14 @@ struct AlnsMatchScore {
           AlnsRolloutState child = state;
           child.positions = evaluation->ending_positions;
           child.fuel = evaluation->ending_fuel;
+          const long double discount = std::pow(
+              0.85L, static_cast<long double>(next_day - day.day - 1));
+          child.discounted_daily +=
+              static_cast<long double>(std::get<1>(evaluation->value)) *
+              discount;
+          child.discounted_servings +=
+              static_cast<long double>(std::get<2>(evaluation->value)) *
+              discount;
           child.cumulative_daily += std::get<1>(evaluation->value);
           child.servings += std::get<2>(evaluation->value);
           for (const auto& acquisition : evaluation->trace.acquisitions) {
@@ -2081,10 +2121,12 @@ struct AlnsMatchScore {
         int left_fuel = std::accumulate(left.fuel.begin(), left.fuel.end(), 0);
         int right_fuel =
             std::accumulate(right.fuel.begin(), right.fuel.end(), 0);
-        return std::tuple{left.distinct_brands.size(), left.cumulative_daily,
+        return std::tuple{left.distinct_brands.size(), left.discounted_daily,
+                          left.discounted_servings, left.cumulative_daily,
                           left.servings, left_fuel} >
-               std::tuple{right.distinct_brands.size(), right.cumulative_daily,
-                          right.servings, right_fuel};
+               std::tuple{right.distinct_brands.size(),
+                          right.discounted_daily, right.discounted_servings,
+                          right.cumulative_daily, right.servings, right_fuel};
       });
       std::set<std::tuple<std::vector<int>, std::vector<int>, std::set<int>>>
           signatures;
@@ -2099,16 +2141,20 @@ struct AlnsMatchScore {
     }
     const auto& best = *std::max_element(
         beam.begin(), beam.end(), [](const auto& left, const auto& right) {
-          return std::tuple{left.distinct_brands.size(), left.cumulative_daily,
+          return std::tuple{left.distinct_brands.size(), left.discounted_daily,
+                            left.discounted_servings, left.cumulative_daily,
                             left.servings} <
-                 std::tuple{right.distinct_brands.size(), right.cumulative_daily,
-                            right.servings};
+                 std::tuple{right.distinct_brands.size(),
+                            right.discounted_daily, right.discounted_servings,
+                            right.cumulative_daily, right.servings};
         });
     return std::tuple{static_cast<int>(best.distinct_brands.size()),
-                      best.cumulative_daily, best.servings};
+                      best.cumulative_daily, best.servings,
+                      best.discounted_daily, best.discounted_servings};
   };
 
-  std::vector<std::tuple<int, int, int>> scores;
+  using RolloutScore = std::tuple<int, int, int, long double, long double>;
+  std::vector<RolloutScore> scores;
   if (config.players == 1) {
     scores.push_back(rollout_scenario(0));
   } else {
@@ -2116,14 +2162,25 @@ struct AlnsMatchScore {
       scores.push_back(rollout_scenario(scenario));
     }
   }
-  auto worst = *std::min_element(scores.begin(), scores.end());
+  auto worst = *std::min_element(
+      scores.begin(), scores.end(), [](const RolloutScore& left,
+                                       const RolloutScore& right) {
+        return std::tuple{std::get<0>(left), std::get<1>(left),
+                          std::get<2>(left)} <
+               std::tuple{std::get<0>(right), std::get<1>(right),
+                          std::get<2>(right)};
+      });
   std::tuple<int, int, int> total{};
+  std::tuple<long double, long double> discounted{};
   for (const auto& score : scores) {
     std::get<0>(total) += std::get<0>(score);
     std::get<1>(total) += std::get<1>(score);
     std::get<2>(total) += std::get<2>(score);
+    std::get<0>(discounted) += std::get<3>(score);
+    std::get<1>(discounted) += std::get<4>(score);
   }
-  return {worst, total};
+  return {{std::get<0>(worst), std::get<1>(worst), std::get<2>(worst)},
+          total, discounted};
 }
 
 ActionPlan build_aco_plan(const MapConfig& config, const DayInfo& day,
@@ -2910,6 +2967,122 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
     std::fprintf(stderr, "%s\n", line.str().c_str());
     std::fflush(stderr);
   }
+
+  // A refuel car is normally moved only when the current day's patrol route
+  // needs a rendezvous.  That is good for the daily score, but it can leave
+  // the support car in a poor position for tomorrow.  Generate a small set of
+  // end-of-day staging variants and use a cheap deterministic rollout only as
+  // a tie-break among plans with the same current-day official score.  This
+  // preserves the competition metric while allowing a day-1 move when it
+  // genuinely improves the reachable continuation.
+  static const bool disable_refuel_lookahead =
+      std::getenv("HEXUDON_ALNS_DISABLE_REFUEL_LOOKAHEAD") != nullptr;
+  const bool severe_fuel_pressure =
+      2 * config.fuel_limit <= config.day_steps[day.day];
+  if (allow_continuation && !disable_refuel_lookahead &&
+      severe_fuel_pressure &&
+      day.day + 1 < static_cast<int>(config.day_steps.size()) &&
+      !elite.empty() &&
+      std::find(types.begin(), types.end(), AgentKind::Refuel) != types.end() &&
+      (!timed || std::chrono::steady_clock::now() < deadline)) {
+    const auto current_official = alns_official_value(best_evaluation.value);
+    std::vector<std::pair<ActionPlan, CandidateEvaluation>> sources;
+    sources.emplace_back(best, best_evaluation);
+    for (std::size_t index = 0;
+         index < elite.size() && sources.size() < 3; ++index) {
+      if (alns_official_value(elite[index].value) != current_official) continue;
+      sources.emplace_back(elite[index].plan, elite[index].evaluation);
+    }
+
+    const int lookahead_ms =
+        timed ? std::clamp(limits.time_limit_ms / 20, 20, 200) : 100;
+    const auto lookahead_deadline =
+        timed ? std::min(deadline, std::chrono::steady_clock::now() +
+                                      std::chrono::milliseconds(lookahead_ms))
+              : std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(lookahead_ms);
+    if (!timed || std::chrono::steady_clock::now() < lookahead_deadline) {
+      // Give the incumbent and every staged candidate an equal rollout slice.
+      // A single shared deadline let the incumbent consume the whole budget;
+      // candidates then returned their root score without projecting even one
+      // future day, making the look-ahead incapable of selecting a move.
+      const int projection_ms = timed ? std::max(5, lookahead_ms / 5) : 40;
+      auto projection_deadline = [&] {
+        if (!timed) {
+          return std::chrono::steady_clock::time_point::max();
+        }
+        const auto slice = std::chrono::steady_clock::now() +
+                           std::chrono::milliseconds(projection_ms);
+        return std::min(lookahead_deadline, slice);
+      };
+      auto projection = alns_match_rollout(
+          config, day, history, types, best_evaluation, 1,
+          projection_deadline(), features);
+      auto projected_score_rank = [](const AlnsMatchScore& score) {
+        return std::tuple{score.worst, score.discounted, score.total};
+      };
+      const auto base_projected_score = projected_score_rank(projection);
+      auto continuation_rank = [&](const CandidateEvaluation& evaluation,
+                                   const AlnsMatchScore& score) {
+        return std::tuple{score.worst, score.discounted, score.total,
+                          std::get<3>(evaluation.value),
+                          congestion_value(evaluation), evaluation.workload};
+      };
+      auto best_rank = continuation_rank(best_evaluation, projection);
+      int evaluated_staging = 0;
+      for (const auto& source : sources) {
+        if (evaluated_staging >= 4) break;
+        if (timed && std::chrono::steady_clock::now() >= lookahead_deadline) {
+          break;
+        }
+        for (const auto& staged : refuel_staging_variants(
+                 config, day, types, history, source.first)) {
+          if (evaluated_staging >= 4) break;
+          if (timed && std::chrono::steady_clock::now() >= lookahead_deadline) {
+            break;
+          }
+          ++evaluated_staging;
+          auto evaluation = evaluate_candidate(config, day, history, staged);
+          if (!evaluation ||
+              alns_official_value(evaluation->value) != current_official) {
+            continue;
+          }
+          // A staging route must actually rendezvous with a patrol today.
+          // Moving the support car to an empty spot (or a patrol endpoint that
+          // it never reaches during this plan) only changes traffic/positions
+          // and can damage a later route without providing fuel capacity.
+          if (std::get<3>(evaluation->value) <=
+              std::get<3>(best_evaluation.value)) {
+            continue;
+          }
+          auto staged_projection = alns_match_rollout(
+              config, day, history, types, *evaluation, 1,
+              projection_deadline(), features);
+          auto rank = continuation_rank(*evaluation, staged_projection);
+          // Current-day official score is already held equal above, and this
+          // block runs only on genuinely fuel-starved days. Accept a strict
+          // projected-score gain or a score tie that rescues patrol fuel. On
+          // high-capacity maps proactive staging can perturb a saturated route
+          // and lose a real final-day serving, so it is gated out above.
+          const bool projected_improvement =
+              projected_score_rank(staged_projection) > base_projected_score;
+          const bool severe_fuel_rescue =
+              projected_score_rank(staged_projection) == base_projected_score &&
+              std::get<3>(evaluation->value) >
+                  std::get<3>(best_evaluation.value);
+          if ((projected_improvement || severe_fuel_rescue) &&
+              rank > best_rank) {
+            best = staged;
+            best_value = evaluation->value;
+            best_evaluation = std::move(*evaluation);
+            best_rank = std::move(rank);
+            emit_improvement();
+          }
+        }
+      }
+    }
+  }
+
   if (allow_continuation && config.players == 1 &&
       day.day + 2 == static_cast<int>(config.day_steps.size()) &&
       (!timed || std::chrono::steady_clock::now() < deadline) &&

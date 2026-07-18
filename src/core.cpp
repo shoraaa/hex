@@ -1051,7 +1051,7 @@ std::optional<CandidateValue> candidate_value(
   return evaluated->value;
 }
 
-[[maybe_unused]] std::vector<ActionPlan> refuel_staging_variants(
+std::vector<ActionPlan> refuel_staging_variants(
     const MapConfig& config, const DayInfo& day, const AgentTypes& types,
     const PolicyHistory& history, const ActionPlan& plan) {
   std::vector<ActionPlan> result;
@@ -1064,15 +1064,56 @@ std::optional<CandidateValue> candidate_value(
     }
     const int available = -plan[agent].back();
     const int start = evaluation->ending_positions[agent];
-    for (const auto& spot : config.spots) {
-      auto path = shortest_path(config, start, spot.pos, day.traffics);
-      if (path.cost <= 0 || path.cost > available) continue;
+    struct StageTarget {
+      std::tuple<int, int, int, int> rank;
+      PathResult path;
+    };
+    std::vector<StageTarget> targets;
+    std::set<int> target_positions;
+    auto add_target = [&](int target, int priority, int secondary) {
+      if (!target_positions.insert(target).second) return;
+      auto path = shortest_path(config, start, target, day.traffics);
+      if (path.cost <= 0 || path.cost > available) return;
+      targets.push_back(
+          {{priority, secondary, path.cost, target}, std::move(path)});
+    };
+
+    // First try to rendezvous with the uniquely most fuel-constrained patrol.
+    // If several patrols tie for the minimum, choosing one is speculative: the
+    // other equally urgent patrol can make the next-day route strictly worse.
+    int lowest_patrol_fuel = std::numeric_limits<int>::max();
+    int lowest_patrol_count = 0;
+    for (std::size_t patrol = 0; patrol < types.size(); ++patrol) {
+      if (types[patrol] != AgentKind::Patrol) continue;
+      const int fuel = evaluation->ending_fuel[patrol];
+      if (fuel < lowest_patrol_fuel) {
+        lowest_patrol_fuel = fuel;
+        lowest_patrol_count = 1;
+      } else if (fuel == lowest_patrol_fuel) {
+        ++lowest_patrol_count;
+      }
+    }
+    if (lowest_patrol_count == 1) {
+      for (std::size_t patrol = 0; patrol < types.size(); ++patrol) {
+        if (types[patrol] != AgentKind::Patrol ||
+            evaluation->ending_fuel[patrol] != lowest_patrol_fuel) {
+          continue;
+        }
+        add_target(evaluation->ending_positions[patrol], 0,
+                   lowest_patrol_fuel);
+      }
+    }
+    std::sort(targets.begin(), targets.end(),
+              [](const StageTarget& left, const StageTarget& right) {
+                return left.rank < right.rank;
+              });
+    for (auto& target : targets) {
       ActionPlan staged = plan;
       staged[agent].pop_back();
-      staged[agent].insert(staged[agent].end(), path.directions.begin(),
-                           path.directions.end());
-      if (available > path.cost) {
-        staged[agent].push_back(-(available - path.cost));
+      staged[agent].insert(staged[agent].end(), target.path.directions.begin(),
+                           target.path.directions.end());
+      if (available > target.path.cost) {
+        staged[agent].push_back(-(available - target.path.cost));
       }
       if (!validate_action_plan(config, day, staged)) {
         result.push_back(std::move(staged));
@@ -1594,6 +1635,21 @@ EvaluationResult evaluate_scenario_impl(const json::value& scenario,
   if (static_cast<int>(policies.size()) != config.players) {
     throw std::invalid_argument("scenario opponents do not match players");
   }
+  const bool search_for_all_players =
+      root.if_contains("searchForAllPlayers") != nullptr &&
+      root.at("searchForAllPlayers").as_bool();
+  std::vector<std::uint64_t> player_seeds(policies.size(), 0);
+  if (const auto* seeds = root.if_contains("playerSeeds")) {
+    const auto& values = seeds->as_array();
+    if (values.size() != policies.size()) {
+      throw std::invalid_argument("scenario playerSeeds do not match players");
+    }
+    for (std::size_t index = 0; index < values.size(); ++index) {
+      const auto value = values[index].to_number<std::int64_t>();
+      if (value < 0) throw std::invalid_argument("player seed must be nonnegative");
+      player_seeds[index] = static_cast<std::uint64_t>(value);
+    }
+  }
 
   std::vector<TeamState> teams;
   for (std::size_t team_index = 0; team_index < policies.size(); ++team_index) {
@@ -1621,14 +1677,40 @@ EvaluationResult evaluate_scenario_impl(const json::value& scenario,
       for (const auto& spot : config.spots) team.stock[spot.pos] = spot.stocks;
     }
 
+    json::array all_team_starts;
+    if (replay_days != nullptr) {
+      for (const auto& team : teams) {
+        json::array agents;
+        for (const auto& agent : team.agents) {
+          agents.push_back(json::object{
+              {"cell", agent.pos},
+              {"fuel", agent.fuel},
+              {"type", static_cast<int>(agent.kind)}});
+        }
+        all_team_starts.push_back(json::object{
+            {"team_id", team.id}, {"agents", std::move(agents)}});
+      }
+    }
+
     std::vector<ActionPlan> plans;
     for (std::size_t team_index = 0; team_index < teams.size(); ++team_index) {
       auto info = make_day_info(config, teams, team_index, day_index, roads);
       AgentTypes fixed;
       for (const auto& agent : teams[team_index].agents) fixed.push_back(agent.kind);
+      SearchLimits team_limits =
+          team_index == 0 || search_for_all_players ? limits : SearchLimits{};
+      team_limits.random_seed ^= player_seeds[team_index];
       plans.push_back(plan_day(teams[team_index].policy, config, info,
                                teams[team_index].history, fixed,
-                               team_index == 0 ? limits : SearchLimits{}));
+                               team_limits));
+    }
+    json::array all_team_actions;
+    if (replay_days != nullptr) {
+      for (std::size_t team_index = 0; team_index < teams.size(); ++team_index) {
+        all_team_actions.push_back(json::object{
+            {"team_id", teams[team_index].id},
+            {"actions", to_json(plans[team_index])}});
+      }
     }
 
     std::map<int, int> day_traffic;
@@ -1689,7 +1771,9 @@ EvaluationResult evaluate_scenario_impl(const json::value& scenario,
                  {"acquisitions", std::move(acquisitions)},
                  {"types", static_cast<int>(teams[team_index].distinct_types.size())},
                  {"daily_types", static_cast<int>(teams[team_index].daily_types.size())},
-                 {"servings", teams[team_index].total_servings}}}}});
+                 {"servings", teams[team_index].total_servings}}}},
+            {"all_team_starts", std::move(all_team_starts)},
+            {"all_team_actions", std::move(all_team_actions)}});
       }
     }
     traffic_history.push_back(std::move(day_traffic));

@@ -6,6 +6,9 @@ requires-python = ">=3.12"
 dependencies = [
   "httpx>=0.27",
   "jsonschema>=4.22",
+  "torch>=2.9.1,<2.10",
+  "torchaudio>=2.9.1,<2.10",
+  "torchvision>=0.24.1,<0.25",
 ]
 
 [project.optional-dependencies]

@@ -80,6 +80,7 @@ hexudon::SearchLimits parse_search_limits(const boost::json::object& object) {
                         std::string_view key, std::uint64_t& target) {
     if (const auto* item = search.if_contains(key)) {
       const auto value = item->to_number<std::int64_t>();
+      if (value < 0) throw std::invalid_argument("random seed must be nonnegative");
       target = static_cast<std::uint64_t>(value);
     }
   };
