@@ -388,6 +388,131 @@ def test_scoreboard_loads_named_peer_results() -> None:
 def test_dashboard_policy_list_includes_aco() -> None:
     assert "aco" in web.POLICIES
     assert "aco_ls" in web.POLICIES
+
+
+def test_local_catalog_exposes_manifest_cases_without_online_token(
+    monkeypatch, tmp_path: Path
+) -> None:
+    cases = tmp_path / "cases"
+    scenario = {
+        "schema_version": 1,
+        "tier": "brutal",
+        "config": {
+            "daySteps": [4],
+            "agents": [0],
+            "spots": [{"brand": 7, "pos": 1, "stocks": 1}],
+        },
+        "opponents": [],
+    }
+    (cases / "hard" / "brutal").mkdir(parents=True)
+    (cases / "hard" / "brutal" / "case-0000.json").write_text(
+        web.json.dumps(scenario)
+    )
+    (cases / "hard" / "manifest.json").write_text(
+        web.json.dumps(
+            {
+                "suite": "hard",
+                "cases": [
+                    {
+                        "path": "brutal/case-0000.json",
+                        "tier": "brutal",
+                        "seed": 3_000_000,
+                        "target": "distinct_types",
+                    }
+                ],
+            }
+        )
+    )
+    monkeypatch.setattr(web, "LOCAL_CASE_ROOT", cases)
+    app = web.DashboardApp(
+        tmp_path / "missing.env", tmp_path / "state", tmp_path / "reports"
+    )
+    try:
+        catalog = app.local_cases()
+        assert catalog["case_count"] == 1
+        assert catalog["groups"][0]["id"] == "hard/brutal"
+        loaded = app.local_case("hard/brutal/case-0000.json")
+        assert loaded["scenario"]["tier"] == "brutal"
+        assert loaded["optimum_score"] == {
+            "distinct_types": 1,
+            "cumulative_daily_types": 1,
+            "total_servings": 1,
+        }
+    finally:
+        app.close()
+
+
+def test_local_run_uses_trace_capable_core_and_normalizes_score(
+    monkeypatch, tmp_path: Path
+) -> None:
+    cases = tmp_path / "cases"
+    scenario = {
+        "schema_version": 1,
+        "config": {
+            "daySteps": [4],
+            "agents": [0],
+            "spots": [{"brand": 7, "pos": 1, "stocks": 1}],
+        },
+        "opponents": [],
+    }
+    (cases / "quick").mkdir(parents=True)
+    (cases / "quick" / "case-0000.json").write_text(web.json.dumps(scenario))
+    (cases / "quick" / "manifest.json").write_text(
+        web.json.dumps(
+            {"suite": "quick", "cases": [{"path": "case-0000.json", "seed": 1}]}
+        )
+    )
+    monkeypatch.setattr(web, "LOCAL_CASE_ROOT", cases)
+    monkeypatch.setattr(web, "find_binary", lambda _: tmp_path / "hexudon")
+
+    def fake_core(command, method, payload, **kwargs):
+        assert command == "visualize"
+        assert method == "local_search"
+        assert payload["hyperparameters"] == {"passes": 3}
+        return {
+            "score": {
+                "distinct_types": 1,
+                "cumulative_daily_types": 1,
+                "total_servings": 1,
+            },
+            "valid_days": 1,
+            "invalid_days": 0,
+            "replay": {"days": [{"day": 0, "teams": []}]},
+        }
+
+    monkeypatch.setattr(web, "run_core", fake_core)
+    app = web.DashboardApp(
+        tmp_path / ".env", tmp_path / "state", tmp_path / "reports"
+    )
+    try:
+        result = app.run_local_case(
+            "quick/case-0000.json", "local_search", {"passes": 3}
+        )
+        assert result["result"]["objective_percentages"] == {
+            "distinct_types": 100.0,
+            "cumulative_daily_types": 100.0,
+            "total_servings": 100.0,
+        }
+        assert result["result"]["replay"]["days"][0]["day"] == 0
+    finally:
+        app.close()
+
+
+def test_local_tab_exposes_case_controls_scores_and_frame_playback() -> None:
+    page = web.DASHBOARD_HTML
+    script = (web.STATIC_ROOT / "app.js").read_text()
+
+    assert 'id="local-nav"' in page
+    assert 'href="/local"' in page
+    assert 'api("/api/local/cases")' in script
+    assert 'post("/api/local/run"' in script
+    assert "local-score-grid" in script
+    assert "local-range" in script
+    assert "local-map-canvas" in script
+    assert "team.actions" in script
+    assert script.index("const params=collectLocalParams()") < script.index(
+        "state.local.running=true"
+    )
     assert "lns" in web.POLICIES
     assert "alns" in web.POLICIES
 

@@ -147,7 +147,7 @@ hexudon::SearchLimits parse_search_limits(const boost::json::object& object) {
 int main(int argc, char** argv) {
   try {
     if (argc != 3) {
-      std::cerr << "usage: hexudon <types|plan|solve|check|trace|eval> <policy>\n";
+      std::cerr << "usage: hexudon <types|plan|solve|check|trace|eval|visualize> <policy>\n";
       return 2;
     }
     const std::string command = argv[1];
@@ -208,6 +208,9 @@ int main(int argc, char** argv) {
       output = hexudon::to_json(
           hexudon::evaluate_scenario(input, policy,
                                      parse_search_limits(input.as_object())));
+    } else if (command == "visualize") {
+      output = hexudon::evaluate_scenario_replay(
+          input, policy, parse_search_limits(input.as_object()));
     } else if (command == "check") {
       const auto& object = input.as_object();
       const auto config = hexudon::parse_map_config(object.at("config"));

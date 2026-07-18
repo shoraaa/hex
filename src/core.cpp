@@ -1577,9 +1577,12 @@ json::value trace_action_plan(const MapConfig& config, const DayInfo& day,
   return result;
 }
 
-EvaluationResult evaluate_scenario(const json::value& scenario,
-                                   const std::string& policy,
-                                   const SearchLimits& limits) {
+namespace {
+
+EvaluationResult evaluate_scenario_impl(const json::value& scenario,
+                                        const std::string& policy,
+                                        const SearchLimits& limits,
+                                        json::array* replay_days) {
   const auto& root = scenario.as_object();
   const MapConfig config = parse_map_config(root.at("config"));
   std::vector<std::string> policies{policy};
@@ -1644,8 +1647,11 @@ EvaluationResult evaluate_scenario(const json::value& scenario,
       } else {
         ++teams[team_index].valid_days;
       }
-      auto actual_error = simulate_team_day(config, teams[team_index],
-                                            plans[team_index], roads, day_traffic);
+      SimulationTrace trace;
+      trace.capture_frames = replay_days != nullptr && team_index == 0;
+      auto actual_error = simulate_team_day(
+          config, teams[team_index], plans[team_index], roads, day_traffic,
+          trace.capture_frames ? &trace : nullptr);
       if (actual_error) {
         throw std::logic_error("fallback simulation failed: " + *actual_error);
       }
@@ -1657,6 +1663,34 @@ EvaluationResult evaluate_scenario(const json::value& scenario,
           {static_cast<int>(teams[team_index].distinct_types.size()),
            static_cast<int>(teams[team_index].daily_types.size()),
            teams[team_index].total_servings - previous_servings});
+      if (replay_days != nullptr && team_index == 0) {
+        json::object road_condition;
+        for (const auto& [position, status] : roads) {
+          road_condition[std::to_string(position)] = status;
+        }
+        json::array frames;
+        for (auto& frame : trace.frames) frames.push_back(std::move(frame));
+        json::array acquisitions;
+        for (const auto& event : trace.acquisitions) {
+          acquisitions.push_back(json::object{{"step", event.step},
+                                              {"agent", event.agent},
+                                              {"spot", event.spot_pos}});
+        }
+        replay_days->push_back(json::object{
+            {"day", day_index},
+            {"steps", config.day_steps[day_index]},
+            {"road_condition", std::move(road_condition)},
+            {"teams",
+             json::array{json::object{
+                 {"team_id", "local"},
+                 {"policy", policy},
+                 {"actions", to_json(plans[team_index])},
+                 {"frames", std::move(frames)},
+                 {"acquisitions", std::move(acquisitions)},
+                 {"types", static_cast<int>(teams[team_index].distinct_types.size())},
+                 {"daily_types", static_cast<int>(teams[team_index].daily_types.size())},
+                 {"servings", teams[team_index].total_servings}}}}});
+      }
     }
     traffic_history.push_back(std::move(day_traffic));
   }
@@ -1679,5 +1713,22 @@ EvaluationResult evaluate_scenario(const json::value& scenario,
           own.refuel_events, ending_patrol_fuel, own.daily_scores, own.errors};
 }
 
-}  // namespace hexudon
+}  // namespace
 
+EvaluationResult evaluate_scenario(const json::value& scenario,
+                                   const std::string& policy,
+                                   const SearchLimits& limits) {
+  return evaluate_scenario_impl(scenario, policy, limits, nullptr);
+}
+
+json::value evaluate_scenario_replay(const json::value& scenario,
+                                     const std::string& policy,
+                                     const SearchLimits& limits) {
+  json::array days;
+  auto result = evaluate_scenario_impl(scenario, policy, limits, &days);
+  auto output = to_json(result).as_object();
+  output["replay"] = json::object{{"days", std::move(days)}};
+  return output;
+}
+
+}  // namespace hexudon
