@@ -165,18 +165,14 @@ new local acceptance decisions use the 1,000-case normalized grade described
 above. Values below are means per case; runtime is the aggregate policy
 runtime divided by 192.
 
-| Policy | Distinct | Daily | Servings | Runtime (s) |
-|---|---:|---:|---:|---:|
-| `greedy` | 7.55 | 31.52 | 70.40 | 1.02 |
-| `utility_greedy` | 8.27 | 39.07 | 98.24 | 1.02 |
-| `fuel_aware` | 7.27 | 37.70 | 87.01 | 1.05 |
-| `stock_maximiser` | 6.21 | 27.48 | 71.85 | 1.04 |
-| `coordinated` | 8.02 | 34.03 | 77.78 | 1.13 |
-| `local_search` | 8.15 | 42.09 | 108.96 | 1.34 |
-| `lns` | 8.46 | 56.22 | 218.71 | 5.21 |
-| `alns` | 8.46 | 56.22 | 218.71 | 5.27 |
-| `aco` | 8.47 | 55.09 | 195.26 | 1.32 |
-| `aco_ls` | 8.47 | 55.04 | 196.99 | 2.82 |
+| Rank | Variant | Valid | Brutal | Steady | Easy | Overall | Runtime (s) |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 1 | `mlns+dp` | 300/300 | 73.138 / 35.398 / 35.398 | 100.000 / 87.070 / 48.175 | 100.000 / 100.000 / 61.433 | 91.046 / 74.156 / 48.335 | 9678.649 |
+| 2 | `alns+dp` | 300/300 | 72.202 / 35.277 / 35.277 | 100.000 / 85.241 / 44.960 | 100.000 / 100.000 / 56.576 | 90.734 / 73.506 / 45.604 | 1870.564 |
+| 3 | `palns+dp` | 300/300 | 71.670 / 34.890 / 34.890 | 100.000 / 86.539 / 47.557 | 100.000 / 100.000 / 55.352 | 90.557 / 73.810 / 45.933 | 1884.412 |
+| 4 | `mlns` | 300/300 | 63.715 / 30.682 / 30.682 | 100.000 / 82.816 / 43.017 | 100.000 / 100.000 / 61.374 | 87.905 / 71.166 / 45.024 | 6752.330 |
+| 5 | `palns` | 300/300 | 60.781 / 30.617 / 30.617 | 99.800 / 80.922 / 42.350 | 100.000 / 100.000 / 55.469 | 86.860 / 70.513 / 42.812 | 1813.108 |
+| 6 | `alns` | 300/300 | 60.285 / 31.338 / 31.338 | 99.657 / 83.127 / 43.475 | 100.000 / 100.000 / 57.306 | 86.647 / 71.488 / 44.040 | 1932.732 |
 
 The historical snapshot used pairwise lexicographic counts. New reports rank
 policies by their average percentage of the structural optimum and report the
