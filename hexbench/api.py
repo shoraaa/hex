@@ -22,11 +22,49 @@ from .runner import find_binary, run_core
 
 BASE_URL = "https://hexudon.hairbui76.id.vn/api"
 
+MLNS_TUNED_DEFAULTS: dict[str, int] = {
+    "min_iterations": 32,
+    "stagnation_iterations": 0,
+    "future_discount_percent": 90,
+}
+SIMPLE_LNS_TUNED_DEFAULTS: dict[str, int] = {
+    "min_iterations": 32,
+    "max_iterations": 128,
+    "stagnation_iterations": 0,
+    "future_discount_percent": 90,
+}
+LNS_DP_TUNED_DEFAULTS: dict[str, int] = {
+    "min_iterations": 4,
+    "max_iterations": 16,
+    "stagnation_iterations": 0,
+    "future_discount_percent": 90,
+}
+MLNS_ANYTIME_ITERATION_CEILING = 10_000_000
+STATEFUL_POLICIES = {"mlns", "simple_lns", "lns_dp"}
+STATEFUL_DEFAULTS = {
+    "mlns": MLNS_TUNED_DEFAULTS,
+    "simple_lns": SIMPLE_LNS_TUNED_DEFAULTS,
+    "lns_dp": LNS_DP_TUNED_DEFAULTS,
+}
+
 # These are explicit solver controls. They are validated before a practice reset
 # starts and passed to the C++ planner only for the named policy. Empty entries
 # preserve that policy's compiled defaults.
+LNS_DP_PROPOSAL_HYPERPARAMETER = {
+    "key": "use_lns_dp_proposals",
+    "label": "Use experimental LNS-DP proposals",
+    "type": "boolean",
+    "recommended": False,
+    "help": (
+        "Add request-bank LNS-DP route seeds to this solver. Aggregate quality "
+        "improved in validation, but the option has not passed per-case "
+        "no-regression promotion."
+    ),
+}
 ALNS_HYPERPARAMETERS = (
     {"key": "time_limit_ms", "label": "ALNS wall-clock limit", "unit": "ms", "type": "integer", "min": 50, "step": 50, "ui_max": 10_000, "help": "Timed mode; mutually exclusive with ALNS iterations."},
+    {"key": "continuation_time_percent", "label": "Continuation time share", "unit": "%", "type": "integer", "min": 0, "max": 100, "step": 1, "recommended": 50, "help": "Percentage of every timed non-final day reserved for remaining-match simulation; current-day ALNS receives the remainder."},
+    {"key": "exact_time_percent", "label": "Final exact-search time share", "unit": "%", "type": "integer", "min": 0, "max": 100, "step": 1, "recommended": 30, "help": "Percentage of every timed final day reserved for exact completion when a positive exact-node budget is enabled."},
     {"key": "alns_iterations", "label": "ALNS iterations on days 1–6", "unit": "iterations/day", "type": "integer", "min": 1, "step": 1, "ui_min": 32, "ui_max": 12_000, "ui_step": 32, "recommended": 1_536, "help": "Literal untimed ALNS loop count on every non-final day; exact-search nodes are additional work."},
     {"key": "final_alns_iterations", "label": "ALNS iterations on final day", "unit": "iterations", "type": "integer", "min": 1, "max": 12_000, "step": 1, "recommended": 1_024, "help": "Literal final-day ALNS loop count. Leave blank to reuse the non-final count."},
     {"key": "min_iterations", "label": "Minimum ALNS iterations", "type": "integer", "min": 1, "max": 12_000, "step": 1, "recommended": 1_536, "help": "Minimum loop count before stagnation stopping; clamped to the configured final-day count."},
@@ -38,6 +76,37 @@ ALNS_HYPERPARAMETERS = (
     {"key": "aco_ants", "label": "ALNS ACO seed ants", "unit": "ants", "type": "integer", "min": 1, "max": 128, "step": 1, "help": "Ant count for the protected ACO seed; blank uses the map-derived default."},
     {"key": "aco_iterations", "label": "ALNS ACO seed iterations", "unit": "iterations", "type": "integer", "min": 1, "max": 256, "step": 1, "help": "ACO rounds for the protected seed; blank uses the day-horizon default."},
     {"key": "aco_evaporation", "label": "ALNS ACO pheromone retention", "type": "number", "exclusive_min": 0, "exclusive_max": 1, "step": 0.01, "ui_min": 0.05, "ui_max": 0.99, "help": "Pheromone retention used by the protected ACO seed."},
+    LNS_DP_PROPOSAL_HYPERPARAMETER,
+)
+PALNS_HYPERPARAMETERS = (
+    {"key": "total_iterations", "label": "PALNS total iterations", "unit": "iterations/day", "type": "integer", "min": 1, "step": 1, "ui_min": 32, "ui_max": 12_000, "ui_step": 32, "recommended": 1_536, "help": "Shared current-day plus future-projection ALNS iteration ledger."},
+    {"key": "time_limit_ms", "label": "PALNS safety deadline", "unit": "ms", "type": "integer", "min": 50, "step": 50, "ui_max": 10_000, "help": "Optional hard deadline; PALNS stops when either this deadline or total iterations is reached."},
+    {"key": "exact_nodes", "label": "Exact-search nodes", "unit": "nodes", "type": "integer", "min": 0, "max": 10_000, "step": 1, "recommended": 512, "help": "Exact completion work kept outside the PALNS iteration ledger."},
+    {"key": "final_exact_nodes", "label": "Final exact-search nodes", "unit": "nodes", "type": "integer", "min": 0, "max": 10_000, "step": 1, "recommended": 1_024, "help": "Final-day exact node cap; blank reuses exact-search nodes."},
+    {"key": "exact_time_percent", "label": "Final exact-search time share", "unit": "%", "type": "integer", "min": 0, "max": 100, "step": 1, "recommended": 30, "help": "Timed final-day share reserved for exact completion when exact nodes are enabled."},
+    LNS_DP_PROPOSAL_HYPERPARAMETER,
+)
+MLNS_HYPERPARAMETERS = (
+    {"key": "time_limit_ms", "label": "MLNS wall-clock limit", "unit": "ms", "type": "integer", "min": 50, "step": 50, "ui_max": 60_000, "help": "Deadline for one rolling whole-match search per day."},
+    {"key": "min_iterations", "label": "Minimum MLNS iterations", "type": "integer", "min": 0, "step": 1, "ui_max": 10_000, "recommended": 32},
+    {"key": "max_iterations", "label": "Maximum MLNS iterations", "type": "integer", "min": 1, "step": 1, "ui_max": 100_000, "recommended": 96},
+    {"key": "stagnation_iterations", "label": "MLNS stagnation threshold", "type": "integer", "min": 0, "step": 1, "ui_max": 100_000, "recommended": 0, "help": "Zero lets the wall-clock deadline govern; a positive value explicitly permits early stopping."},
+    {"key": "future_discount_percent", "label": "Future-day discount", "unit": "%/horizon", "type": "integer", "min": 1, "max": 100, "step": 1, "recommended": 90, "help": "Weights today, tomorrow, and later days by 1, p, p², ... while preserving the official lexicographic objective order."},
+    LNS_DP_PROPOSAL_HYPERPARAMETER,
+)
+SIMPLE_LNS_HYPERPARAMETERS = (
+    {"key": "time_limit_ms", "label": "Simple LNS wall-clock limit", "unit": "ms", "type": "integer", "min": 50, "step": 50, "ui_max": 60_000, "help": "Deadline for repeated whole-match destroy-and-repair."},
+    {"key": "min_iterations", "label": "Minimum destroy-repair moves", "type": "integer", "min": 0, "step": 1, "ui_max": 10_000, "recommended": 32},
+    {"key": "max_iterations", "label": "Maximum destroy-repair moves", "type": "integer", "min": 1, "step": 1, "ui_max": 100_000, "recommended": 128},
+    {"key": "stagnation_iterations", "label": "Stagnation threshold", "type": "integer", "min": 0, "step": 1, "ui_max": 100_000, "recommended": 0, "help": "Zero runs the complete bounded destroy-and-repair budget."},
+    {"key": "future_discount_percent", "label": "Future-day discount", "unit": "%/horizon", "type": "integer", "min": 1, "max": 100, "step": 1, "recommended": 90, "help": "Tie-break guidance after the official final lexicographic score."},
+)
+LNS_DP_HYPERPARAMETERS = (
+    {"key": "time_limit_ms", "label": "LNS-DP wall-clock limit", "unit": "ms", "type": "integer", "min": 50, "step": 50, "ui_max": 60_000, "help": "Deadline shared by deterministic search, finalist scenarios, and two-day recourse."},
+    {"key": "min_iterations", "label": "Minimum LNS-DP moves", "type": "integer", "min": 0, "step": 1, "ui_max": 10_000, "recommended": 4},
+    {"key": "max_iterations", "label": "Maximum LNS-DP moves", "type": "integer", "min": 1, "step": 1, "ui_max": 100_000, "recommended": 16},
+    {"key": "stagnation_iterations", "label": "LNS-DP stagnation threshold", "type": "integer", "min": 0, "step": 1, "ui_max": 100_000, "recommended": 0, "help": "Zero keeps the complete bounded search and two-day phase."},
+    {"key": "future_discount_percent", "label": "Tier-1 deferral discount", "unit": "%/day", "type": "integer", "min": 1, "max": 100, "step": 1, "recommended": 90, "help": "Discount applied to uncovered-chain option value by earliest feasible deferral."},
 )
 POLICY_HYPERPARAMETERS: dict[str, tuple[dict[str, Any], ...]] = {
     "wait": (),
@@ -63,6 +132,10 @@ POLICY_HYPERPARAMETERS: dict[str, tuple[dict[str, Any], ...]] = {
     ),
     "lns": ALNS_HYPERPARAMETERS,
     "alns": ALNS_HYPERPARAMETERS,
+    "palns": PALNS_HYPERPARAMETERS,
+    "mlns": MLNS_HYPERPARAMETERS,
+    "simple_lns": SIMPLE_LNS_HYPERPARAMETERS,
+    "lns_dp": LNS_DP_HYPERPARAMETERS,
     "aco": (
         {"key": "ants", "label": "Ant count", "type": "integer", "min": 1, "step": 1, "ui_max": 128, "recommended": 20},
         {"key": "iterations", "label": "ACO iterations", "type": "integer", "min": 1, "step": 1, "ui_max": 100, "recommended": 20},
@@ -79,9 +152,9 @@ POLICY_HYPERPARAMETERS: dict[str, tuple[dict[str, Any], ...]] = {
 
 def normalize_hyperparameters(
     methods: list[str], values: Any | None,
-) -> dict[str, dict[str, int | float]]:
+) -> dict[str, dict[str, int | float | bool]]:
     if values is None:
-        return {}
+        values = {}
     if not isinstance(values, dict):
         raise ValueError("hyperparameters must be an object keyed by policy")
     allowed_methods = set(methods)
@@ -91,7 +164,7 @@ def normalize_hyperparameters(
             "hyperparameters supplied for unselected policies: "
             + ", ".join(unknown_methods)
         )
-    result: dict[str, dict[str, int | float]] = {}
+    result: dict[str, dict[str, int | float | bool]] = {}
     for method, raw in values.items():
         if method not in POLICY_HYPERPARAMETERS:
             raise ValueError(f"unknown policy: {method}")
@@ -103,9 +176,14 @@ def normalize_hyperparameters(
             raise ValueError(
                 f"unknown hyperparameters for {method}: {', '.join(unknown)}"
             )
-        normalized: dict[str, int | float] = {}
+        normalized: dict[str, int | float | bool] = {}
         for key, value in raw.items():
             field = fields[key]
+            if field["type"] == "boolean":
+                if not isinstance(value, bool):
+                    raise ValueError(f"{method}.{key} must be boolean")
+                normalized[key] = value
+                continue
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ValueError(f"{method}.{key} must be numeric")
             if not math.isfinite(float(value)):
@@ -143,7 +221,21 @@ def normalize_hyperparameters(
             )
             if effective_min > effective_max:
                 raise ValueError(f"{method}.min_iterations cannot exceed ALNS iterations")
+        if method == "palns" and "total_iterations" not in normalized:
+            normalized["total_iterations"] = 1_536
+        if method in STATEFUL_POLICIES:
+            defaults = STATEFUL_DEFAULTS[method]
+            normalized = {**defaults, **normalized}
+            effective_min = normalized["min_iterations"]
+            effective_max = normalized.get(
+                "max_iterations", MLNS_ANYTIME_ITERATION_CEILING
+            )
+            if effective_min > effective_max:
+                raise ValueError(f"{method}.min_iterations cannot exceed max_iterations")
         result[method] = normalized
+    for method in STATEFUL_POLICIES & allowed_methods:
+        if method not in result:
+            result[method] = dict(STATEFUL_DEFAULTS[method])
     return result
 
 
@@ -267,6 +359,9 @@ def fetch_game_snapshot(
         }
         if competitive_state is not None:
             snapshot["competitive_state"] = competitive_state
+            previous = competitive_state.get("prev")
+            if isinstance(previous, dict):
+                snapshot["previous_day"] = normalize_competitive_day(previous)
         return snapshot
     finally:
         client.close()
@@ -299,20 +394,26 @@ def normalize_competitive_state(
             "day": len(config.get("daySteps", [])),
         }, None
 
-    day_index = int(open_day["day"])
-    road_condition = open_day.get("road_condition", {})
+    day = normalize_competitive_day(open_day)
+    return {"status": "in_progress", "day": int(day["day"])}, day
+
+
+def normalize_competitive_day(payload: dict[str, Any]) -> dict[str, Any]:
+    """Translate one open/previous competitive day into planner input."""
+    day_index = int(payload["day"])
+    road_condition = payload.get("road_condition", {})
     agents = [
         {
             "kind": int(agent["kind"]),
             "pos": int(agent["pos"]),
             "fuel": agent.get("fuel"),
         }
-        for agent in open_day.get("agents", [])
+        for agent in payload.get("agents", [])
     ]
-    steps = open_day.get("steps")
+    steps = payload.get("steps")
     if steps is None:
-        steps = config["daySteps"][day_index]
-    day = {
+        raise ValueError("competitive day did not include steps")
+    return {
         "day": day_index,
         "steps": int(steps),
         "agents": agents,
@@ -325,7 +426,6 @@ def normalize_competitive_state(
         # per-request cutoff even when the original display schedule is old.
         "endsAt": None,
     }
-    return {"status": "in_progress", "day": day_index}, day
 
 
 def _state_path(state_dir: Path, game_id: str) -> Path:
@@ -337,12 +437,16 @@ def _load_state(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {
             "distinct_brands": [],
+            "cumulative_daily_types": 0,
+            "total_servings": 0,
             "submitted_days": {},
             "day_snapshots": {},
             "types": None,
+            "planner_state": None,
         }
     state = json.loads(path.read_text())
     state.setdefault("day_snapshots", {})
+    state.setdefault("planner_state", None)
     return state
 
 
@@ -381,6 +485,12 @@ def planning_budget(
             min(budget, day_info["endsAt"] - time.time() - deadline_margin),
         )
     return budget
+
+
+def solver_time_limit_ms(method: str, budget: float) -> int:
+    """Use MLNS's complete safe window; retain the legacy reserve elsewhere."""
+    milliseconds_per_second = 1000 if method == "mlns" else 850
+    return max(50, int(budget * milliseconds_per_second))
 
 
 def trace_action_plan(
@@ -486,7 +596,7 @@ def deploy(
     binary_path: str | None = None,
     base_url: str = BASE_URL,
     quiet: bool = False,
-    method_hyperparameters: dict[str, int | float] | None = None,
+    method_hyperparameters: dict[str, int | float | bool] | None = None,
     progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     def emit(payload: dict[str, Any]) -> dict[str, Any]:
@@ -516,12 +626,20 @@ def deploy(
             # old local journal must not suppress submissions in the replay.
             journal = {
                 "distinct_brands": [],
+                "cumulative_daily_types": 0,
+                "total_servings": 0,
                 "submitted_days": {},
                 "day_snapshots": {},
                 "types": None,
+                "planner_state": None,
             }
             emit({"game_id": resolved_id, "status": "selecting_agent_types"})
-            types = run_core("types", method, config, binary=binary)
+            type_payload = (
+                {"config": config, "hyperparameters": normalized_hyperparameters}
+                if method in {"simple_lns", "lns_dp"}
+                else config
+            )
+            types = run_core("types", method, type_payload, binary=binary)
             validate_agent_types(types, len(config["agents"]))
             if dry_run:
                 return emit({"dry_run": True, "game_id": resolved_id, "types": types})
@@ -564,6 +682,10 @@ def deploy(
             submitted = journal.get("submitted_days", {})
             history = {
                 "distinct_brands": journal.get("distinct_brands", []),
+                "cumulative_daily_types": int(
+                    journal.get("cumulative_daily_types", 0)
+                ),
+                "total_servings": int(journal.get("total_servings", 0)),
                 "submitted_actions": [
                     submitted[str(index)]
                     for index in range(day_index)
@@ -575,6 +697,7 @@ def deploy(
                 and day_info.get("endsAt") is not None
                 and day_info["endsAt"] - time.time() <= deadline_margin
             )
+            planned_state: dict[str, Any] | None = None
             if close_to_deadline:
                 emit(
                     {
@@ -591,14 +714,29 @@ def deploy(
                     is_practice=is_practice,
                     deadline_margin=deadline_margin,
                 )
-                safe_time_limit_ms = max(50, int(budget * 0.85 * 1000))
+                safe_time_limit_ms = solver_time_limit_ms(method, budget)
                 alns_iterations = normalized_hyperparameters.get("alns_iterations")
+                total_iterations = normalized_hyperparameters.get("total_iterations")
                 planner_hyperparameters = {
                     key: value
                     for key, value in normalized_hyperparameters.items()
-                    if key != "alns_iterations"
+                    if key not in {"alns_iterations", "total_iterations"}
                 }
-                if alns_iterations is not None:
+                if method == "palns":
+                    total_iterations = int(total_iterations or 1_536)
+                    requested_time_limit_ms = int(
+                        normalized_hyperparameters.get(
+                            "time_limit_ms", safe_time_limit_ms
+                        )
+                    )
+                    effective_solver_time_limit_ms = min(
+                        requested_time_limit_ms, safe_time_limit_ms
+                    )
+                    search = {
+                        "totalIterations": total_iterations,
+                        "timeLimitMs": effective_solver_time_limit_ms,
+                    }
+                elif alns_iterations is not None:
                     alns_iterations = int(alns_iterations)
                     search = {
                         "minIterations": int(
@@ -619,28 +757,43 @@ def deploy(
                             "time_limit_ms", safe_time_limit_ms
                         )
                     )
-                    solver_time_limit_ms = min(
+                    effective_solver_time_limit_ms = min(
                         requested_time_limit_ms, safe_time_limit_ms
                     )
-                    deadline_governed_search = method in {"lns", "alns"}
+                    deadline_governed_search = method in {
+                        "lns", "alns", "mlns", "simple_lns", "lns_dp"
+                    }
+                    default_stagnation = (
+                        STATEFUL_DEFAULTS[method]["stagnation_iterations"]
+                        if method in STATEFUL_POLICIES
+                        else 0 if deadline_governed_search else 96
+                    )
                     search = {
-                        "timeLimitMs": solver_time_limit_ms,
+                        "timeLimitMs": effective_solver_time_limit_ms,
                         "minIterations": int(
-                            normalized_hyperparameters.get("min_iterations", 32)
+                            normalized_hyperparameters.get(
+                                "min_iterations",
+                                STATEFUL_DEFAULTS.get(method, MLNS_TUNED_DEFAULTS)["min_iterations"],
+                            )
                         ),
                         "maxIterations": int(
                             normalized_hyperparameters.get(
                                 "max_iterations",
-                                10_000_000 if deadline_governed_search else 2048,
+                                MLNS_ANYTIME_ITERATION_CEILING
+                                if deadline_governed_search
+                                else 2048,
                             )
                         ),
                         "stagnationIterations": int(
                             normalized_hyperparameters.get(
                                 "stagnation_iterations",
-                                0 if deadline_governed_search else 96,
+                                default_stagnation,
                             )
                         ),
                     }
+                    if method == "lns_dp" and search["maxIterations"] == 16:
+                        search["minIterations"] = 0
+                        search["maxIterations"] = MLNS_ANYTIME_ITERATION_CEILING
                 progress_event = {
                     "game_id": resolved_id,
                     "day": day_index,
@@ -649,8 +802,11 @@ def deploy(
                 }
                 if alns_iterations is not None:
                     progress_event["alns_iterations"] = alns_iterations
+                elif method == "palns":
+                    progress_event["total_iterations"] = total_iterations
+                    progress_event["budget_seconds"] = effective_solver_time_limit_ms / 1000
                 else:
-                    progress_event["budget_seconds"] = solver_time_limit_ms / 1000
+                    progress_event["budget_seconds"] = effective_solver_time_limit_ms / 1000
                 emit(
                     progress_event
                 )
@@ -663,22 +819,43 @@ def deploy(
                     # with small iteration/stagnation caps that make the solver
                     # converge prematurely. Explicit limits remain available for
                     # controlled benchmarks and debugging.
-                    actions = run_core(
+                    payload = {
+                        "config": config,
+                        "day_info": day_info,
+                        "history": history,
+                        "types": types,
+                        "search": search,
+                        "hyperparameters": planner_hyperparameters,
+                    }
+                    if method in STATEFUL_POLICIES:
+                        payload["include_planner_state"] = True
+                        saved_state = journal.get("planner_state")
+                        if isinstance(saved_state, dict) and saved_state.get("method") == method:
+                            payload["planner_state"] = saved_state.get("state")
+                    planned = run_core(
                         "plan",
                         method,
-                        {
-                            "config": config,
-                            "day_info": day_info,
-                            "history": history,
-                            "types": types,
-                            "search": search,
-                            "hyperparameters": planner_hyperparameters,
-                        },
+                        payload,
                         binary=binary,
-                        timeout=budget,
+                        # The C++ solver owns ``budget`` and stops at its
+                        # internal deadline.  Give process startup, JSON
+                        # serialization, and shutdown a separate watchdog
+                        # allowance while retaining one second of the
+                        # official two-second submission margin.
+                        timeout=budget + min(1.0, deadline_margin / 2.0),
                     )
+                    if method in STATEFUL_POLICIES:
+                        if not isinstance(planned, dict) or "actions" not in planned:
+                            raise RuntimeError(
+                                f"{method} planner did not return a state envelope"
+                            )
+                        actions = planned["actions"]
+                        planned_state = planned.get("planner_state")
+                    else:
+                        actions = planned
                 except (subprocess.TimeoutExpired, RuntimeError):
                     actions = [[-config["daySteps"][day_index]] for _ in types]
+                    planned_state = None
             validate_action_shape(actions, len(types))
             check = run_core(
                 "check",
@@ -722,6 +899,18 @@ def deploy(
                 set(journal.get("distinct_brands", [])) | acquired
             )
             journal["submitted_days"][day_key] = actions
+            journal["planner_state"] = (
+                {"method": method, "state": planned_state}
+                if method in STATEFUL_POLICIES and isinstance(planned_state, dict)
+                else None
+            )
+            score = check.get("score") or {}
+            journal["cumulative_daily_types"] = int(
+                journal.get("cumulative_daily_types", 0)
+            ) + int(score.get("daily_types", 0))
+            journal["total_servings"] = int(
+                journal.get("total_servings", 0)
+            ) + int(score.get("servings", 0))
             journal["day_snapshots"][day_key] = {
                 "day_info": day_info,
                 "actions": actions,
@@ -1027,7 +1216,7 @@ def fuel_stress_benchmark(
     *,
     game_ids: list[str] | None = None,
     fuel_multipliers: tuple[float, ...] = (1.0, 0.5, 0.25),
-    hyperparameters: dict[str, dict[str, int | float]] | None = None,
+    hyperparameters: dict[str, dict[str, int | float | bool]] | None = None,
     jobs: int = 0,
     binary_path: str | None = None,
     base_url: str = BASE_URL,
@@ -1244,8 +1433,10 @@ def lns_time_benchmark(
     seed_profile: str = "production",
 ) -> dict[str, Any]:
     """Measure an LNS-family score curve as its daily budget grows."""
-    if method not in {"lns", "alns"}:
-        raise ValueError("time benchmark method must be lns or alns")
+    if method not in {"lns", "alns", "palns", "mlns", "simple_lns", "lns_dp"}:
+        raise ValueError(
+            "time benchmark method must be lns, alns, palns, mlns, simple_lns, or lns_dp"
+        )
     from .tuning import SEED_PROFILES
 
     if seed_profile not in SEED_PROFILES:
@@ -1306,9 +1497,15 @@ def lns_time_benchmark(
         payload = copy.deepcopy(cases[case_index]["scenario"])
         payload["hyperparameters"] = {
             "time_limit_ms": budget,
-            "min_iterations": 1,
-            "max_iterations": 10_000_000,
-            "stagnation_iterations": 0,
+            **(
+                {"total_iterations": 10_000_000}
+                if method == "palns"
+                else {
+                    "min_iterations": 1,
+                    "max_iterations": 10_000_000,
+                    "stagnation_iterations": 0,
+                }
+            ),
             **{
                 {
                     "acoAnts": "aco_ants",
@@ -1533,7 +1730,7 @@ def practice_benchmark(
     base_url: str = BASE_URL,
     quiet: bool = False,
     progress: Callable[[dict[str, Any]], None] | None = None,
-    hyperparameters: dict[str, dict[str, int | float]] | None = None,
+    hyperparameters: dict[str, dict[str, int | float | bool]] | None = None,
 ) -> dict[str, Any]:
     if not methods:
         raise ValueError("at least one practice method is required")
@@ -1802,7 +1999,7 @@ def practice_suite(
     binary_path: str | None = None,
     base_url: str = BASE_URL,
     quiet: bool = False,
-    hyperparameters: dict[str, dict[str, int | float]] | None = None,
+    hyperparameters: dict[str, dict[str, int | float | bool]] | None = None,
     progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Benchmark policies on every resettable practice map and rank the result."""

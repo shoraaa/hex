@@ -24,6 +24,8 @@ from .api import (
     fuel_stress_benchmark,
     load_token,
     lns_time_benchmark,
+    MLNS_ANYTIME_ITERATION_CEILING,
+    MLNS_TUNED_DEFAULTS,
     normalize_hyperparameters,
     POLICY_HYPERPARAMETERS,
     practice_benchmark,
@@ -44,6 +46,10 @@ POLICIES = (
     "local_search",
     "lns",
     "alns",
+    "palns",
+    "mlns",
+    "simple_lns",
+    "lns_dp",
     "aco",
     "aco_ls",
     "stop_bp",
@@ -58,6 +64,18 @@ PRACTICE_BENCHMARK_DEFAULT_HYPERPARAMETERS = {
     "seed_iterations": 2_048,
     "exact_nodes": 512,
     "final_exact_nodes": 1_024,
+}
+PALNS_PRACTICE_DEFAULT_HYPERPARAMETERS = {
+    "total_iterations": 1_536,
+    "exact_nodes": 512,
+    "final_exact_nodes": 1_024,
+    "exact_time_percent": 30,
+}
+MLNS_PRACTICE_DEFAULT_HYPERPARAMETERS = {
+    **MLNS_TUNED_DEFAULTS,
+    # A deadline governs Web MLNS. This is only a high safety ceiling, never
+    # a quality-tuning knob.
+    "max_iterations": MLNS_ANYTIME_ITERATION_CEILING,
 }
 
 
@@ -255,7 +273,7 @@ class DashboardApp:
         self,
         case_id: str,
         method: str,
-        hyperparameters: dict[str, int | float] | None = None,
+        hyperparameters: dict[str, int | float | bool] | None = None,
     ) -> dict[str, Any]:
         if method not in POLICIES:
             raise ValueError(f"unknown policy: {method}")
@@ -388,7 +406,7 @@ class DashboardApp:
         self,
         game_id: str,
         method: str,
-        hyperparameters: dict[str, int | float] | None = None,
+        hyperparameters: dict[str, int | float | bool] | None = None,
         *,
         execution_mode: str = "manual",
         target_day: int | None = None,
@@ -455,7 +473,7 @@ class DashboardApp:
         self,
         game_id: str,
         methods: list[str],
-        hyperparameters: dict[str, dict[str, int | float]] | None = None,
+        hyperparameters: dict[str, dict[str, int | float | bool]] | None = None,
         mode: str = "practice",
         fuel_multipliers: list[int | float] | None = None,
         time_limits_ms: list[int | float] | None = None,
@@ -470,9 +488,11 @@ class DashboardApp:
         if mode not in {"practice", "practice_suite", "fuel_stress", "lns_time"}:
             raise ValueError("unknown benchmark mode")
         if mode == "lns_time" and (
-            len(methods) != 1 or methods[0] not in {"lns", "alns"}
+            len(methods) != 1
+            or methods[0]
+            not in {"lns", "alns", "palns", "mlns", "simple_lns", "lns_dp"}
         ):
-            raise ValueError("time curves require exactly one of lns or alns")
+            raise ValueError("time curves require exactly one LNS-family policy")
         multipliers = tuple(float(value) for value in (fuel_multipliers or [1, 0.5, 0.25]))
         if not multipliers or any(
             not 0 < value <= 3 for value in multipliers
@@ -590,7 +610,7 @@ class DashboardApp:
         job_id: str,
         question: dict[str, Any],
         methods: list[str],
-        hyperparameters: dict[str, dict[str, int | float]],
+        hyperparameters: dict[str, dict[str, int | float | bool]],
     ) -> None:
         self._update(job_id, status="running", progress={"status": "starting"})
 
@@ -608,6 +628,14 @@ class DashboardApp:
                         and "alns_iterations" not in parameters
                     ):
                         parameters.update(PRACTICE_BENCHMARK_DEFAULT_HYPERPARAMETERS)
+                elif method == "palns":
+                    parameters = effective_hyperparameters.setdefault(method, {})
+                    if "total_iterations" not in parameters:
+                        parameters.update(PALNS_PRACTICE_DEFAULT_HYPERPARAMETERS)
+                elif method in {"mlns", "simple_lns", "lns_dp"}:
+                    parameters = effective_hyperparameters.setdefault(method, {})
+                    if "time_limit_ms" not in parameters and "max_iterations" not in parameters:
+                        parameters.update(MLNS_PRACTICE_DEFAULT_HYPERPARAMETERS)
             self._update(
                 job_id,
                 effective_hyperparameters=effective_hyperparameters,
@@ -656,7 +684,7 @@ class DashboardApp:
         job_id: str,
         question: dict[str, Any],
         methods: list[str],
-        hyperparameters: dict[str, dict[str, int | float]],
+        hyperparameters: dict[str, dict[str, int | float | bool]],
         fuel_multipliers: tuple[float, ...],
     ) -> None:
         self._update(
@@ -701,7 +729,7 @@ class DashboardApp:
         self,
         job_id: str,
         methods: list[str],
-        hyperparameters: dict[str, dict[str, int | float]],
+        hyperparameters: dict[str, dict[str, int | float | bool]],
     ) -> None:
         self._update(
             job_id,
@@ -1178,6 +1206,8 @@ DASHBOARD_HTML = r"""<!doctype html>
     .parameter-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
     .parameter-grid label { display:grid; gap:4px; color:var(--muted); font-size:12px; }
     .parameter-grid input { width:100%; border:1px solid #b9beb6; border-radius:8px; padding:8px 9px; font:inherit; color:var(--ink); }
+    .parameter-grid label.boolean-field { grid-template-columns:1fr auto; align-items:center; border:1px solid #b9beb6; border-radius:8px; padding:8px 9px; }
+    .parameter-grid label.boolean-field input { width:auto; }
     .parameter-help { color:var(--muted); font-size:12px; }
     .fuel-input { width:100%; border:1px solid #b9beb6; border-radius:9px; padding:9px 10px; font:inherit; margin:0 0 14px; }
     input { accent-color:var(--green); }
@@ -1270,20 +1300,25 @@ function renderHyperparameters() {
     const fields = parameterDefinitions[method] || [];
     if (!fields.length) return `<div class="parameter-card"><h3>${esc(method)}</h3><div class="parameter-help">This method has no exposed hyper-parameters.</div></div>`;
     const values = parameterValues[method] || (parameterValues[method] = {});
-    return `<div class="parameter-card"><h3>${esc(method)}</h3><div class="parameter-grid">${fields.map(field => `<label>${esc(field.label)}<input data-method="${esc(method)}" data-key="${esc(field.key)}" type="number"${parameterBounds(field)} value="${values[field.key] ?? ''}" placeholder="compiled default"></label>`).join('')}</div></div>`;
+    return `<div class="parameter-card"><h3>${esc(method)}</h3><div class="parameter-grid">${fields.map(field => field.type === 'boolean' ? `<label class="boolean-field"><span>${esc(field.label)}</span><input data-method="${esc(method)}" data-key="${esc(field.key)}" type="checkbox" ${(values[field.key] ?? field.recommended) ? 'checked' : ''}></label>` : `<label>${esc(field.label)}<input data-method="${esc(method)}" data-key="${esc(field.key)}" type="number"${parameterBounds(field)} value="${values[field.key] ?? ''}" placeholder="compiled default"></label>`).join('')}</div></div>`;
   }).join('') || '<div class="parameter-help">Select a policy to configure its optional controls.</div>';
   hyperparameters.querySelectorAll('input[data-method]').forEach(input => input.addEventListener('input', () => {
     parameterValues[input.dataset.method] ||= {};
-    if (input.value === '') delete parameterValues[input.dataset.method][input.dataset.key];
+    if (input.type === 'checkbox') parameterValues[input.dataset.method][input.dataset.key] = input.checked;
+    else if (input.value === '') delete parameterValues[input.dataset.method][input.dataset.key];
     else parameterValues[input.dataset.method][input.dataset.key] = input.value;
   }));
 }
 function selectedHyperparameters() {
   const result = {};
   hyperparameters.querySelectorAll('input[data-method]').forEach(input => {
-    if (input.value === '') return;
-    result[input.dataset.method] ||= {};
-    result[input.dataset.method][input.dataset.key] = input.step === '1' ? Number.parseInt(input.value, 10) : Number.parseFloat(input.value);
+    if (input.type === 'checkbox') {
+      result[input.dataset.method] ||= {};
+      result[input.dataset.method][input.dataset.key] = input.checked;
+    } else if (input.value !== '') {
+      result[input.dataset.method] ||= {};
+      result[input.dataset.method][input.dataset.key] = input.step === '1' ? Number.parseInt(input.value, 10) : Number.parseFloat(input.value);
+    }
   });
   return result;
 }
@@ -1380,7 +1415,7 @@ timeRun.addEventListener('click', async () => {
   if (!budgets.length || budgets.some(value => Number.isNaN(value) || value < 1 || value > 60000)) { setStatus('error','Invalid time budgets','Enter comma-separated milliseconds from 1 to 60000.'); return; }
   if (Number.isNaN(fuel) || fuel <= 0 || fuel > 3) { setStatus('error','Invalid fuel multiplier','Enter a value greater than 0 and at most 3.'); return; }
   setRunDisabled(true); results.style.display = 'none'; fuelResults.style.display = 'none'; timeResults.style.display = 'none'; setStatus('running','Starting LNS time curve','Long budgets are applied once per match day.');
-  const method = selectedPolicies().find(value => value === 'alns' || value === 'lns') || 'alns';
+  const method = selectedPolicies().find(value => ['alns','lns','palns','mlns','simple_lns','lns_dp'].includes(value)) || 'alns';
   try { const job = await jsonFetch('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'lns_time',game_id:game.value,methods:[method],time_limits_ms:budgets,time_fuel_multiplier:fuel})}); poll(job.id); }
   catch (error) { setStatus('error','Could not start time curve',error.message); setRunDisabled(false); }
 });

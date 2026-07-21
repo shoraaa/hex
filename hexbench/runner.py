@@ -41,11 +41,21 @@ def run_core(
     binary: Path,
     timeout: float = 60,
     core_threads: int | None = None,
+    environment_overrides: dict[str, str | None] | None = None,
 ) -> Any:
     environment = None
-    if core_threads is not None:
+    if core_threads is not None or environment_overrides:
         environment = dict(os.environ)
+    if core_threads is not None:
+        assert environment is not None
         environment["HEXUDON_THREADS"] = str(max(1, core_threads))
+    if environment_overrides:
+        assert environment is not None
+        for key, value in environment_overrides.items():
+            if value is None:
+                environment.pop(key, None)
+            else:
+                environment[key] = value
     completed = subprocess.run(
         [str(binary), command, policy],
         input=json.dumps(payload),
@@ -111,7 +121,8 @@ def stream_core(
                 continue
             record = json.loads(line)
             last = record
-            on_improve(record)
+            if record.get("kind") != "final":
+                on_improve(record)
             if should_stop is not None and should_stop():
                 stopped = True
                 process.kill()
@@ -171,11 +182,19 @@ def grade_suite(
     binary_path: str | None = None,
     jobs: int | None = None,
     timeout: float = 60,
+    time_limit_ms: int | None = None,
+    core_environment: dict[str, str | None] | None = None,
+    core_threads: int | None = None,
 ) -> dict[str, Any]:
     binary = find_binary(binary_path)
     manifest = json.loads(manifest_path.read_text())
     methods = list(dict.fromkeys([method, *baselines]))
     worker_count = max(1, jobs or min(os.cpu_count() or 1, 8))
+    threads_per_core = (
+        max(1, core_threads)
+        if core_threads is not None
+        else (1 if worker_count > 1 else None)
+    )
     scenarios = [
         json.loads((manifest_path.parent / case["path"]).read_text())
         for case in manifest["cases"]
@@ -206,14 +225,30 @@ def grade_suite(
     def evaluate(task: tuple[int, str]) -> tuple[int, str, dict[str, Any]]:
         case_index, name = task
         started = time.perf_counter()
-        result = run_core(
-            "eval",
-            name,
-            scenarios[case_index],
-            binary=binary,
-            timeout=timeout,
-            core_threads=1 if worker_count > 1 else None,
-        )
+        scenario = scenarios[case_index]
+        if time_limit_ms is not None:
+            scenario = dict(scenario)
+            scenario["search"] = {
+                "timeLimitMs": time_limit_ms,
+                "maxIterations": 10_000_000,
+                "stagnationIterations": 0,
+            }
+        try:
+            result = run_core(
+                "eval",
+                name,
+                scenario,
+                binary=binary,
+                timeout=timeout,
+                core_threads=threads_per_core,
+                environment_overrides=core_environment,
+            )
+        except subprocess.TimeoutExpired as error:
+            case_path = manifest["cases"][case_index]["path"]
+            raise RuntimeError(
+                f"policy '{name}' timed out on case '{case_path}' after "
+                f"{timeout:.1f} seconds; raise --timeout or reduce --jobs"
+            ) from error
         result["runtime_seconds"] = time.perf_counter() - started
         return case_index, name, result
 
@@ -307,6 +342,8 @@ def grade_suite(
         "case_count": case_count,
         "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
         "jobs": worker_count,
+        "core_threads": threads_per_core,
+        "time_limit_ms": time_limit_ms,
         "wall_seconds": wall_seconds,
         "optimum_definition": OPTIMUM_DEFINITION,
         "aggregates": aggregates,
@@ -320,7 +357,8 @@ def grade_suite(
         f"# HEXUDON benchmark: {method}",
         "",
         f"Suite: `{manifest['suite']}` ({case_count} cases)",
-        f"Workers: `{worker_count}` · wall time: `{wall_seconds:.3f}s`",
+        f"Workers: `{worker_count}` · core threads: `{threads_per_core or 'default'}` · wall time: `{wall_seconds:.3f}s`",
+        f"Per-day solver limit: `{time_limit_ms} ms`" if time_limit_ms is not None else "Per-day solver limit: policy default",
         "",
         f"Optimum: {OPTIMUM_DEFINITION}",
         "",

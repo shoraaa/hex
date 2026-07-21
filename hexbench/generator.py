@@ -92,6 +92,13 @@ SUITE_FACTORS: dict[str, tuple[Any, ...]] = {
     "spots": SPOT_DENSITIES,
 }
 SUITE_CASE_COUNTS = {"quick": 30, "full": 1_000}
+VALIDATION_PROFILES = ("hard", "medium", "easy")
+VALIDATION_CASE_COUNT = 32
+VALIDATION_PROFILE_TIERS = {
+    "hard": "brutal",
+    "medium": "steady",
+    "easy": "easy",
+}
 
 
 def _remove_ponds(
@@ -488,6 +495,90 @@ def generate_suite(name: str, output: Path) -> Path:
     }
     manifest_path = output / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    return manifest_path
+
+
+def generate_validation_suite(
+    output: Path,
+    per_profile: int = VALIDATION_CASE_COUNT,
+    profiles: tuple[str, ...] = VALIDATION_PROFILES,
+) -> Path:
+    """Generate a deterministic, stratified ALNS validation suite.
+
+    The public hard/medium/easy labels map to the existing curated
+    brutal/steady/easy recipes. It is intended for component ablations: every
+    profile has the same number of cases and no case is selected by its ALNS
+    score.
+    """
+    if per_profile < 1:
+        raise ValueError("per_profile must be positive")
+    unknown = set(profiles) - set(VALIDATION_PROFILES)
+    if unknown:
+        raise ValueError(f"unknown validation profile: {sorted(unknown)}")
+    output.mkdir(parents=True, exist_ok=True)
+    combined_cases: list[dict[str, Any]] = []
+    for profile in profiles:
+        tier = VALIDATION_PROFILE_TIERS[profile]
+        recipe = HARD_RECIPES[tier]
+        profile_dir = output / profile
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        cases: list[dict[str, Any]] = []
+        for index in range(per_profile):
+            scenario = _generate_hard_scenario(recipe.base_seed + index, tier)
+            scenario["validation"] = {
+                "profile": profile,
+                "source_tier": tier,
+                "index": index,
+                "suite": "alns-validation",
+            }
+            filename = f"case-{index:04d}.json"
+            (profile_dir / filename).write_text(
+                json.dumps(scenario, indent=2) + "\n"
+            )
+            entry = {
+                "path": filename,
+                "seed": scenario["seed"],
+                "profile": profile,
+                "source_tier": tier,
+                "target": recipe.target,
+                "design": scenario["design"],
+                "validation": scenario["validation"],
+            }
+            cases.append(entry)
+            combined_cases.append({**entry, "path": f"{profile}/{filename}"})
+        (profile_dir / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "suite": f"alns-validation-{profile}",
+                    "profile": profile,
+                    "source_tier": tier,
+                    "target": recipe.target,
+                    "case_count": per_profile,
+                    "cases": cases,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+    manifest_path = output / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "suite": "alns-validation",
+                "profiles": list(profiles),
+                "source_tiers": {
+                    profile: VALIDATION_PROFILE_TIERS[profile]
+                    for profile in profiles
+                },
+                "cases_per_profile": per_profile,
+                "cases": combined_cases,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
     return manifest_path
 
 

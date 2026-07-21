@@ -5,18 +5,16 @@ guarded client for the live server. The C++20 core owns simulation, scoring,
 and policies; Python owns generation, reporting, and HTTP orchestration. Both
 local grading and live deployment invoke the same compiled policy code.
 
-## Build and test
+## Build
 
 ```sh
-uv sync --extra test
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-ctest --test-dir build --output-on-failure
-uv run pytest -q
+cmake --build build --parallel
 ```
 
 The build uses the system Boost.JSON library plus the already-vendored `fmt`
-and `cxxopts` headers. No token is needed for local generation or grading.
+and `cxxopts` headers. It produces `build/hexudon`; no regression suite is run
+as part of the build. No token is needed for local generation or grading.
 
 ## Generate and grade locally
 
@@ -134,6 +132,18 @@ steps. Every suite case simulates 16 teams (the candidate plus 15 scripted
 opponents), so road state is derived from multi-team traffic on every match.
 Every emitted `config` uses the official map configuration shape;
 benchmark-only design metadata is kept outside it.
+
+For ALNS component ablations, generate an equal-size profile-stratified suite:
+
+```sh
+uv run --no-sync hexbench generate-validation \
+  --out cases/alns-validation --per-profile 32
+```
+
+This writes `hard`, `medium`, and `easy` manifests with 32 deterministic cases
+each, mapped to the existing curated recipes as `brutal`, `steady`, and `easy`.
+Cases are selected by seed position, never by the current ALNS score, so the
+suite does not inherit the component behavior it is meant to test.
 
 Local grading is based on average normalized performance, not a requirement
 to beat every case. For each case, the structural optimum is all brands, all
@@ -453,9 +463,10 @@ positions: the final day is optimized against its revealed traffic, and earlier
 days retain their full ALNS budget so continuation state is not replaced by a
 daily-only exact solution. An exact candidate replaces the incumbent only when
 it strictly improves the three official objectives; ties do not exchange one
-unscored continuation state for another. Timed searches reserve the final 30%
-of a budget of at least five seconds for exact search on the final day and
-always retain the best valid incumbent.
+unscored continuation state for another. Timed final-day searches reserve the
+configured exact-search percentage only when a positive exact-node budget is
+configured; otherwise ALNS uses the complete deadline. Every phase
+always retains the best valid incumbent.
 The promoted exact phase uses admissible reachability, per-patrol serving,
 stock-allocation, and no-refuel fuel bounds. They only prune branches whose
 best possible lexicographic score cannot beat the incumbent, so they improve
@@ -463,11 +474,147 @@ search throughput without weakening eventual optimality.
 
 Production ALNS is online: planning reads the current day's revealed traffic,
 positions, fuel, and accepted history, plus the complete schedule supplied in
-the initial config. It does not predict future traffic or opponent actions.
+the initial config. It never reads future traffic or opponent actions. Its
+continuation look-ahead simulates future days with a symmetric self-traffic
+surrogate, shares the reserved wall-clock window across candidate roots and
+future days, and stops at the live solver deadline so the selected plan can be
+streamed before submission closes.
 Every day begins with a protected ACO+LS incumbent under the same fixed agent
-types; ALNS returns only a lexicographically better current-day score and uses
-the incumbent on an official tie. Ending positions are free decision variables
-rather than equality constraints. Short timed budgets use a reduced ACO seed.
+types. The main ALNS loop retains only a lexicographically better current-day
+incumbent; continuation look-ahead may choose an equal-realized-distinct plan
+when its simulated remaining-match rank is strictly better. Ending positions
+are free decision variables rather than equality constraints. Timed seed
+construction receives a proportional slice of the current-day ALNS budget.
+
+`palns` is the projection-guided ALNS variant. It preserves the realized
+current-day official triple as the primary objective and uses a simulated final
+match triple only to break exact ties. Every unique best-tier continuation
+state is projected immediately; current-day and nested future-day ALNS loops
+draw from one `total_iterations` ledger. Predicted ending patrol fuel breaks
+ties between equal projected official triples, while projection-worse states
+remain eligible for ordinary ALNS acceptance so the noisy forecast does not
+turn plateau exploration into greedy hill climbing. Non-final days therefore
+have no separate continuation-time share. A timed final day is split only when
+exact completion is enabled. Evaluation JSON includes `palns_diagnostics`,
+including outer/projection iteration counts and the percentage of projection
+requests that safely fell back because the remaining iteration or time budget
+could not complete every future day.
+
+`mlns` is the simpler rolling whole-match alternative. One candidate contains
+route skeletons for every remaining day. The current day is replayed with the
+road conditions supplied by the server; later days are replayed recursively
+with the existing symmetric-opponent traffic assumption. A mutation ruins and
+repairs a geometrically selected pivot or contiguous multi-day block, then
+re-decodes downstream skeletons from the resulting positions, fuel, brand
+history, and predicted roads. Untimed full-match runs initialize a bounded beam
+of distinct partial-match states, retaining equal-scoring daily plans when they
+end in different positions, fuel, or traffic. ACO, escort, local-search, and
+bounded fixed-type ALNS plans are proposal generators for that beam; only the
+weighted complete-match objective selects the winner. Neighborhood iterations evaluate
+both a fully re-decoded suffix and a still-legal retained-action suffix, and can
+mutate contiguous multi-day blocks. Short timed requests keep the lightweight
+single-day/retained-suffix path so initialization cannot consume the deadline.
+There are no projection caches, adaptive MCTS operators, or multi-restarts.
+Beam states, independent proposal generators, proposal simulations, and the two
+suffix-decoding alternatives run in parallel. Nested worker accounting divides
+`HEXUDON_THREADS` across those levels, preventing outer beam workers from each
+spawning a full inner pool. The Web server still serializes practice jobs to
+protect reset state, but each active C++ MLNS process can use multiple cores.
+
+MLNS compares the exact lexicographic vector of discounted marginal distinct
+brands, daily types, and servings. The default horizon weights are `1`, `0.5`,
+`0.5²`, and so on; `future_discount_percent` changes the ratio. This permits a
+better weighted match plan to collect less on the current day. The unexecuted
+suffix is serialized in the local controller journal and re-rooted against the
+next day's actual traffic and agent state. Alongside spot-index route skeletons,
+the state stores exact suffix actions and their predicted starting signature;
+an action plan is replayed only when the revealed agents and traffic match that
+signature. The state is never sent to the competition server; stale state whose
+map, types, source day, or committed action does not match accepted history is
+discarded automatically.
+
+`simple_lns` is a separate rolling SISR policy with a classical route genome.
+Each patrol stores only its ordered udon spots. Each refuel vehicle stores
+semantic `{target patrol, escort tiles}` tasks; the decoder chooses the earliest
+feasible interception cell on that patrol's predicted path and sends the
+refueler there by shortest path. Unknown future roads are held at today's
+revealed status, and the saved suffix is repaired when the next day is revealed.
+The search adapts string/split-string removal, Shaw-biased recreate orderings,
+blink insertion, and simulated annealing from the Apache-2.0
+`open-source-sisr-routing` implementation by Martin Pajersky, Vaclav Sobotka,
+and Hana Rudova. SISR-specific constants are fixed; the public controls are the
+ordinary deadline/iteration/seed controls and `future_discount_percent`.
+The untimed default performs 128 destroy-and-repair moves with stagnation
+stopping disabled; the final official lexicographic match score ranks solutions,
+while the 90% future discount only breaks official-score ties.
+Patrol strings are repaired first. Later neighborhoods also remove contiguous
+strings from the current day's refuel task routes and repair task allocation and
+order across refuel vehicles; rendezvous cells remain decoder-derived rather
+than stored coordinates.
+
+MLNS remains experimental. The full deterministic 1,000-case design completed
+with `1,000/1,000` valid cases and zero invalid days when exercising cold/warm
+construction without additional search iterations. A 12-case hard-profile
+screen at `1 s/day` produced four lexicographic wins, four ties, and four losses
+against ALNS. MLNS collected 90 total distinct brands versus ALNS's 86, while
+ALNS retained the secondary cumulative-daily advantage (`211` versus `201`).
+This is encouraging but is not the complete 96-case promotion gate, so MLNS
+remains opt-in. A subsequent 32-trial Bayesian search at `1 s/day` completed
+all 96 hard/medium/easy validation cases for every candidate with zero invalid
+days. It selected `min_iterations=32`, `stagnation_iterations=16`, and
+`future_discount_percent=90`. Against the previous `32/0/50` default, the
+normalized macro score changed from `88.7708 / 71.2049 / 45.3228` to
+`88.8546 / 71.0422 / 45.3994`; the primary distinct-coverage gain therefore
+wins lexicographically. Total/max iterations were not tuned and remain a high
+safety ceiling under the Web deadline.
+
+Optimize MLNS on the complete deterministic 96-case hard/medium/easy suite
+with the resumable Tree-structured Parzen (Bayesian) search:
+
+```sh
+uv run --no-sync hexbench mlns-tune \
+  --cases cases/alns-validation/manifest.json \
+  --trials 32 \
+  --time-limit-ms 1000 \
+  --report reports/mlns-validation
+```
+
+Every trial sees all 96 cases under the same per-day wall-clock budget. The
+optimizer searches minimum iterations, stagnation stopping, and the future-day
+discount; the total/max iteration ceiling is intentionally fixed outside the
+search so the Web UI can remain deadline-governed. Trials are ranked by the
+official lexicographic normalized distinct/daily/servings vector; validity is
+a hard gate and runtime only breaks an exact quality tie. `state.json` is
+checkpointed after every case and the same command resumes it. Use `--no-resume`
+to start over. The final directory contains `report.json`, `report.md`, and a
+Web-UI-ready `best-search.json` that omits total iterations.
+
+Tune the fixed projection depth and restart count, then report the public total
+iteration curve on the 96-case brutal/steady/easy validation suite with:
+
+```sh
+uv run --no-sync hexbench palns-tune \
+  --cases cases/alns-validation/manifest.json \
+  --report reports/palns-validation
+```
+
+The production anytime allocation is scale-free and uniform across CLI and Web
+Competition runs:
+
+- On every non-final day, current-day ALNS and continuation simulation each
+  receive 50% by default. Both phases are deadline-governed;
+  there is no hidden iteration or stagnation cap below the explicit controls.
+- Continuation time is divided fairly across the incumbent and distinct elite
+  roots, then across every remaining simulated day.
+- On the final day, ALNS uses 100% unless exact search is enabled with a
+  positive node budget. With exact search, ALNS uses 70% and exact completion
+  uses the remaining 30%.
+- Explicit iteration and exact-node limits remain safety ceilings for controlled
+  benchmarks. The Web UI supplies a high iteration ceiling and zero stagnation,
+  making its requested wall-clock value authoritative.
+- `continuation_time_percent` and `exact_time_percent` are manual tuning
+  controls. Changing them preserves the same percentage rule for every
+  `daySeconds` value rather than introducing duration-specific branches.
 
 Maps with more than 15 spots reuse the base rendezvous cache instead of adding
 transit nodes and rebuilding the quartic meeting table. Agent types are also
@@ -521,9 +668,24 @@ performed well. The seeded generator keeps this adaptive policy reproducible.
 | `local_search` | Start from coordinated and test valid whole-plan/route substitutions using the official objectives. |
 | `lns` | Promoted ALNS with stable rendezvous choices, shared preprocessing, MCTS operator selection, and admissible exact-search resource bounds. |
 | `alns` | Explicit alias for the promoted ALNS; its destroy/repair/travel operators are selected by a deterministic UCB tree that backpropagates validated rollout quality. |
+| `simple_lns` | Rolling whole-match SISR over spot-only patrol routes and shortest-path refuel interception tasks; its state is repaired against each newly revealed road map. |
+| `lns_dp` | Independent request-bank LNS with full-recharge fuel DP, global rendezvous scheduling, traffic-filtered terminal value, scenario finalist grading, and two-day adaptive recourse. |
 | `aco` | Pure ant-colony search over complete patrol routes and synchronized mobile-refueling rendezvous. |
 | `aco_ls` | ACO whose every ant is refined by one-pass route-substitution local search before ranking and selection. |
 | `stop_bp` (`bp`) | Branch-and-price over fuel-relaxed patrol routes: a set-partition master LP solved with an in-house revised simplex, label-setting pricing with dominance, and lambda-branching. Warm-started from a short ALNS run, which is also returned when the instance exceeds the spot/brand cap or the deadline expires. |
+
+LNS-DP can also supply additive route proposals to `alns`, `palns`, and `mlns`.
+Enable **Use experimental LNS-DP proposals** in the Web UI, pass the
+`use_lns_dp_proposals: true` hyperparameter, or set
+`HEXUDON_ENABLE_LNS_DP_PROPOSALS=1`. This remains experimental: it improves
+aggregate validation quality but has not passed the per-case no-regression
+promotion gate. The proposal contains a stock-expanded patrol
+visit order, a simulator-valid action seed, and residual-fuel annotations.
+ALNS/PALNS rank the direct seed with their existing official/projection
+objectives and can re-decode the visit order through the established rendezvous
+graph; MLNS evaluates it as another whole-match root. The existing ALNS
+rendezvous decoder, PALNS projection logic, and MLNS continuation beam remain
+authoritative.
 
 For example:
 
