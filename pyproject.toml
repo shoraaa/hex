@@ -9,6 +9,7 @@ dependencies = [
   "torch>=2.9.1,<2.10",
   "torchaudio>=2.9.1,<2.10",
   "torchvision>=0.24.1,<0.25",
+  "tqdm>=4.69.0",
 ]
 
 [project.scripts]

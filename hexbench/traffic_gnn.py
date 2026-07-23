@@ -5,16 +5,19 @@ import hashlib
 import math
 import random
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from tqdm import tqdm
+
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from .generator import generate_scenario
+from .generator import HARD_TIERS, _generate_hard_scenario
 from .models import neighbors
 from .runner import find_binary, run_core
 
@@ -238,11 +241,19 @@ def graph_samples_from_replay(
     return samples
 
 
-def make_alns16_scenario(seed: int, alns_iterations: int) -> dict[str, Any]:
-    """Generate a small online instance with exactly 16 ALNS players."""
+def make_traffic_scenario(
+    seed: int, alns_iterations: int, tier: str = "easy", *, policy: str = "lns"
+) -> dict[str, Any]:
+    """Generate a graded-tier online instance with exactly 16 search-policy players.
 
-    profiles = ("easy", "medium", "hard")
-    scenario = generate_scenario(seed, profiles[seed % len(profiles)], "small", "single")
+    ``tier`` selects one of the hard-suite recipes (``brutal``/``steady``/
+    ``easy``) so the traffic dataset spans discriminating maps instead of the
+    too-easy random profiles. ``policy`` is the planner used by every player
+    (``lns`` by default; ``alns`` runs the heavier adaptive search). The
+    16-player traffic simulation is layered on top of the constructed scenario.
+    """
+
+    scenario = _generate_hard_scenario(seed, tier)
     config = scenario["config"]
     cells = config["map"]["cells"]
     if not any(value == 1 for row in cells for value in row):
@@ -256,9 +267,9 @@ def make_alns16_scenario(seed: int, alns_iterations: int) -> dict[str, Any]:
             if position not in reserved and cells[position // width][position % width] != 3
         )
         cells[replacement // width][replacement % width] = 1
-    scenario["traffic_mode"] = "alns16"
+    scenario["traffic_mode"] = f"{policy}16"
     config["players"] = 16
-    scenario["opponents"] = ["alns"] * 15
+    scenario["opponents"] = [policy] * 15
     seed_random = random.Random(seed ^ 0x414C4E533136)
     player_seeds: list[int] = []
     while len(player_seeds) < 16:
@@ -286,15 +297,19 @@ def simulate_online_samples(
     binary: Path | None = None,
     timeout: float = 180.0,
     core_threads: int = 1,
+    policy: str = "lns",
 ) -> tuple[list[TrafficGraphSample], list[dict[str, Any]]]:
     binary = binary or find_binary()
     samples: list[TrafficGraphSample] = []
     instance_summaries: list[dict[str, Any]] = []
     for seed in seeds:
-        scenario = make_alns16_scenario(seed, alns_iterations)
+        # Balance the three graded tiers across consecutive seeds so the
+        # dataset gets an even mix of brutal/steady/easy maps.
+        tier = HARD_TIERS[seed % len(HARD_TIERS)]
+        scenario = make_traffic_scenario(seed, alns_iterations, tier, policy=policy)
         replay = run_core(
             "visualize",
-            "alns",
+            policy,
             scenario,
             binary=binary,
             timeout=timeout,
@@ -309,6 +324,7 @@ def simulate_online_samples(
         instance_summaries.append(
             {
                 "seed": seed,
+                "tier": tier,
                 "profile": scenario["profile"],
                 "days": len(scenario["config"]["daySteps"]),
                 "samples": len(generated),
@@ -389,6 +405,7 @@ def _save_instance_shard(
     split: str,
     seed: int,
     alns_iterations: int,
+    policy: str,
     samples: list[TrafficGraphSample],
     summary: dict[str, Any],
 ) -> None:
@@ -399,6 +416,7 @@ def _save_instance_shard(
         "split": split,
         "seed": seed,
         "alns_iterations": alns_iterations,
+        "policy": policy,
         "summary": summary,
         "samples": [_sample_payload(sample) for sample in samples],
     }
@@ -408,7 +426,7 @@ def _save_instance_shard(
 
 
 def _load_instance_shard(
-    path: Path, *, split: str, seed: int, alns_iterations: int
+    path: Path, *, split: str, seed: int, alns_iterations: int, policy: str
 ) -> tuple[list[TrafficGraphSample], dict[str, Any]]:
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if (
@@ -419,6 +437,7 @@ def _load_instance_shard(
         or payload.get("split") != split
         or int(payload.get("seed", -1)) != seed
         or int(payload.get("alns_iterations", -1)) != alns_iterations
+        or str(payload.get("policy")) != policy
     ):
         raise ValueError(f"incompatible traffic shard: {path}")
     samples = [_sample_from_payload(item) for item in payload.get("samples", [])]
@@ -439,6 +458,7 @@ def generate_traffic_dataset(
     core_threads: int = 1,
     jobs: int = 1,
     overwrite: bool = False,
+    policy: str = "lns",
 ) -> dict[str, Any]:
     """Run expensive simulations once and persist reusable CPU tensors."""
 
@@ -450,12 +470,13 @@ def generate_traffic_dataset(
     manifest_path = output_dir / "manifest.json"
     if not overwrite and dataset_path.exists() and manifest_path.exists():
         existing = json.loads(manifest_path.read_text())
-        expected = (train_cases, validation_cases, seed, alns_iterations)
+        expected = (train_cases, validation_cases, seed, alns_iterations, policy)
         observed = (
             len(existing.get("train_instances", [])),
             len(existing.get("validation_instances", [])),
             int(existing.get("seed", -1)),
             int(existing.get("alns_iterations", -1)),
+            str(existing.get("policy")),
         )
         if observed == expected and existing.get("dataset_sha256") == _sha256(dataset_path):
             return existing
@@ -478,61 +499,136 @@ def generate_traffic_dataset(
     ]
 
     def shard_path(split: str, instance_seed: int) -> Path:
-        return shard_dir / f"{split}-{instance_seed}.pt"
+        return shard_dir / f"{split}-{instance_seed}-{policy}.pt"
 
-    def generate_one(split: str, instance_seed: int) -> Path:
+    started_at: dict[tuple[str, int], float] = {}
+
+    def generate_one(split: str, instance_seed: int) -> tuple[Path, dict[str, Any]]:
+        # Record when the worker actually begins; the outer elapsed metric
+        # would otherwise include ThreadPoolExecutor queue wait, which grows
+        # linearly as later futures sit behind earlier ones.
+        started_at[(split, instance_seed)] = monotonic()
         path = shard_path(split, instance_seed)
         if path.exists() and not overwrite:
-            _load_instance_shard(
+            _, cached_summary = _load_instance_shard(
                 path,
                 split=split,
                 seed=instance_seed,
                 alns_iterations=alns_iterations,
+                policy=policy,
             )
-            return path
+            return path, cached_summary
         samples, summaries = simulate_online_samples(
             [instance_seed],
             alns_iterations=alns_iterations,
             binary=binary,
             timeout=simulation_timeout,
             core_threads=core_threads,
+            policy=policy,
         )
         _save_instance_shard(
             path,
             split=split,
             seed=instance_seed,
             alns_iterations=alns_iterations,
+            policy=policy,
             samples=samples,
             summary=summaries[0],
         )
-        return path
+        return path, summaries[0]
 
-    completed = 0
-    with ThreadPoolExecutor(max_workers=jobs) as executor:
-        futures = {
-            executor.submit(generate_one, split, instance_seed): (split, instance_seed)
-            for split, instance_seed in requested
-        }
-        for future in as_completed(futures):
-            future.result()
-            completed += 1
-            if completed == len(requested) or completed % max(1, len(requested) // 100) == 0:
-                print(
-                    f"traffic generation: {completed}/{len(requested)} instances",
-                    file=sys.stderr,
-                    flush=True,
-                )
+    class_totals = [0, 0, 0]
+    total_samples = 0
+    last_status: str = ""
+    failed: list[dict[str, Any]] = []
+    succeeded: list[tuple[str, int]] = []
+    monotonic = time.monotonic
+    progress = tqdm(
+        total=len(requested),
+        desc="traffic generation",
+        unit="inst",
+        dynamic_ncols=True,
+        file=sys.stderr,
+    )
+    interrupted = False
+    try:
+        with ThreadPoolExecutor(max_workers=jobs) as executor:
+            futures: dict[Any, tuple[str, int]] = {}
+            for split, instance_seed in requested:
+                future = executor.submit(generate_one, split, instance_seed)
+                futures[future] = (split, instance_seed)
+            try:
+                for future in as_completed(futures):
+                    split, instance_seed = futures[future]
+                    # Prefer the worker-recorded start time so the reported
+                    # elapsed reflects actual work, not pool queue wait.
+                    anchor = started_at.get((split, instance_seed))
+                    elapsed = monotonic() - anchor if anchor else 0.0
+                    try:
+                        _, summary = future.result()
+                    except Exception as exc:
+                        failed.append(
+                            {
+                                "split": split,
+                                "seed": instance_seed,
+                                "elapsed_seconds": round(elapsed, 3),
+                                "error": f"{type(exc).__name__}: {exc}",
+                            }
+                        )
+                        progress.write(
+                            f"FAILED {split} seed={instance_seed} "
+                            f"({elapsed:.1f}s): {type(exc).__name__}: {exc}"
+                        )
+                        progress.update(1)
+                        continue
+                    class_counts = summary.get("class_counts", [0, 0, 0])
+                    for index, value in enumerate(class_counts):
+                        class_totals[index] += int(value)
+                    total_samples += int(summary.get("samples", 0))
+                    succeeded.append((split, instance_seed))
+                    last_status = (
+                        f"{split[0]}{instance_seed} {elapsed:.1f}s "
+                        f"d={summary.get('days', '?')} "
+                        f"s={summary.get('samples', 0)} "
+                        f"roads={summary.get('roads', '?')} "
+                        f"S/B/J={class_counts[0]}/{class_counts[1]}/{class_counts[2]}"
+                    )
+                    postfix = (
+                        f"last[{last_status}] tot={total_samples} "
+                        f"S/B/J={class_totals[0]}/{class_totals[1]}/{class_totals[2]}"
+                    )
+                    if failed:
+                        postfix += f" failed={len(failed)}"
+                    progress.set_postfix_str(postfix, refresh=True)
+                    progress.update(1)
+            except KeyboardInterrupt:
+                # Ctrl-C: cancel pending submissions so the pool exits without
+                # waiting for every in-flight subprocess. Already-succeeded
+                # shards are still merged below.
+                interrupted = True
+                progress.write("interrupted; cancelling pending instances")
+                for pending in futures:
+                    pending.cancel()
+    finally:
+        progress.close()
+
+    if not succeeded:
+        raise RuntimeError(
+            "no traffic instances succeeded"
+            + (f"; {len(failed)} failed" if failed else "")
+        )
 
     train_samples: list[TrafficGraphSample] = []
     validation_samples: list[TrafficGraphSample] = []
     train_instances: list[dict[str, Any]] = []
     validation_instances: list[dict[str, Any]] = []
-    for split, instance_seed in requested:
+    for split, instance_seed in succeeded:
         samples, summary = _load_instance_shard(
             shard_path(split, instance_seed),
             split=split,
             seed=instance_seed,
             alns_iterations=alns_iterations,
+            policy=policy,
         )
         if split == "train":
             train_samples.extend(samples)
@@ -542,14 +638,18 @@ def generate_traffic_dataset(
             validation_instances.append(summary)
 
     metadata = {
-        "kind": "offline-alns16-traffic-dataset",
+        "kind": f"offline-{policy}16-traffic-dataset",
         "target": "simulator road status for day t from state/history through t-1",
         "players": 16,
-        "policy": "alns",
+        "policy": policy,
         "alns_iterations": alns_iterations,
         "seed": seed,
         "train_instances": train_instances,
         "validation_instances": validation_instances,
+        "requested_instances": len(requested),
+        "succeeded_instances": len(succeeded),
+        "failed_instances": failed,
+        "interrupted": interrupted,
     }
     payload = {
         "schema_version": DATASET_SCHEMA_VERSION,
@@ -688,13 +788,23 @@ def _metrics(
     samples: list[TrafficGraphSample],
     device: torch.device,
     batch_size: int,
+    *,
+    desc: str = "eval",
 ) -> dict[str, Any]:
     model.eval()
     loss_sum = 0.0
     count = 0
     confusion = torch.zeros((3, 3), dtype=torch.long)
+    total_batches = (len(samples) + batch_size - 1) // batch_size
     with torch.no_grad():
-        for raw_sample in _sample_batches(samples, batch_size):
+        for raw_sample in tqdm(
+            _sample_batches(samples, batch_size),
+            total=total_batches,
+            desc=desc,
+            unit="batch",
+            leave=False,
+            file=sys.stderr,
+        ):
             sample = raw_sample.to(device)
             logits = model(sample.features, sample.edge_index, sample.edge_direction)
             road_logits = logits[sample.road_mask]
@@ -736,6 +846,7 @@ def train_traffic_gnn(
     minimum_epochs: int,
     device_name: str,
     report_dir: Path,
+    warmup_epochs: int = 0,
 ) -> dict[str, Any]:
     if (
         epochs < 1
@@ -746,6 +857,8 @@ def train_traffic_gnn(
         or patience < 0
         or minimum_epochs < 1
         or minimum_epochs > epochs
+        or warmup_epochs < 0
+        or warmup_epochs >= epochs
     ):
         raise ValueError("invalid traffic training hyperparameters")
     random.seed(seed)
@@ -761,17 +874,46 @@ def train_traffic_gnn(
 
     model = TrafficGNN(len(FEATURE_NAMES), hidden_size=hidden_size, layers=layers).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(1, epochs - warmup_epochs)
+    )
+    if warmup_epochs > 0:
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=1e-2,
+            end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
+        scheduler: torch.optim.lr_scheduler.LRScheduler = (
+            torch.optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[warmup, cosine],
+                milestones=[warmup_epochs],
+            )
+        )
+    else:
+        scheduler = cosine
     report_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = report_dir / "model.pt"
     history: list[dict[str, Any]] = []
     best_validation_loss = math.inf
     best_epoch = 0
     stale_epochs = 0
-    for epoch in range(1, epochs + 1):
+    epoch_bar = tqdm(
+        range(1, epochs + 1), desc="epochs", unit="epoch", file=sys.stderr
+    )
+    for epoch in epoch_bar:
         model.train()
         random.shuffle(train_samples)
-        for raw_sample in _sample_batches(train_samples, batch_size):
+        train_total = (len(train_samples) + batch_size - 1) // batch_size
+        for raw_sample in tqdm(
+            _sample_batches(train_samples, batch_size),
+            total=train_total,
+            desc=f"ep{epoch} train",
+            unit="batch",
+            leave=False,
+            file=sys.stderr,
+        ):
             sample = raw_sample.to(device)
             optimizer.zero_grad(set_to_none=True)
             logits = model(sample.features, sample.edge_index, sample.edge_direction)
@@ -780,8 +922,12 @@ def train_traffic_gnn(
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
         scheduler.step()
-        train_metrics = _metrics(model, train_samples, device, batch_size)
-        validation_metrics = _metrics(model, validation_samples, device, batch_size)
+        train_metrics = _metrics(
+            model, train_samples, device, batch_size, desc=f"ep{epoch} train-eval"
+        )
+        validation_metrics = _metrics(
+            model, validation_samples, device, batch_size, desc=f"ep{epoch} val-eval"
+        )
         history.append(
             {
                 "epoch": epoch,
@@ -808,12 +954,22 @@ def train_traffic_gnn(
             )
         else:
             stale_epochs += 1
+        epoch_bar.set_postfix(
+            train_loss=f"{train_metrics['loss']:.4f}",
+            val_loss=f"{validation_metrics['loss']:.4f}",
+            val_acc=f"{validation_metrics['accuracy']:.3f}",
+            val_f1=f"{validation_metrics['macro_f1']:.3f}",
+            best=best_epoch,
+            stale=stale_epochs,
+            refresh=True,
+        )
         if patience > 0 and epoch >= minimum_epochs and stale_epochs >= patience:
             break
+    epoch_bar.close()
 
     best_record = history[best_epoch - 1]
     report = {
-        "kind": "offline-alns16-traffic-gnn",
+        "kind": f"offline-{dataset_metadata.get('policy', 'alns')}16-traffic-gnn",
         "target": "simulator road status for day t from state/history through t-1",
         "loss": "unweighted road-node cross entropy",
         "training_seed": seed,
@@ -826,6 +982,8 @@ def train_traffic_gnn(
         "maximum_epochs": epochs,
         "minimum_epochs": minimum_epochs,
         "patience": patience,
+        "warmup_epochs": warmup_epochs,
+        "scheduler": "linear-warmup+cosine" if warmup_epochs > 0 else "cosine",
         "best_epoch": best_epoch,
         "best_train": best_record["train"],
         "best_validation": best_record["validation"],
@@ -834,3 +992,100 @@ def train_traffic_gnn(
     }
     (report_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     return report
+
+
+def load_traffic_model(checkpoint_path: Path) -> TrafficGNN:
+    """Reconstruct a trained GNN from a saved checkpoint.
+
+    The checkpoint stores the schema (``feature_names``/``classes``) alongside
+    the architecture hyperparameters so a prediction caller does not need to
+    remember the training configuration.
+    """
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
+        raise ValueError("traffic checkpoint is missing a state_dict")
+    feature_names = tuple(checkpoint.get("feature_names") or ())
+    if feature_names and feature_names != FEATURE_NAMES:
+        raise ValueError("traffic checkpoint feature schema does not match the model")
+    classes = tuple(checkpoint.get("classes") or ())
+    if classes and classes != TRAFFIC_CLASSES:
+        raise ValueError("traffic checkpoint class schema does not match the model")
+    hidden_size = int(checkpoint.get("hidden_size") or 64)
+    layers = int(checkpoint.get("layers") or 3)
+    model = TrafficGNN(len(FEATURE_NAMES), hidden_size=hidden_size, layers=layers)
+    model.load_state_dict(checkpoint["state_dict"])
+    model.eval()
+    return model
+
+
+def predict_traffic(
+    scenario: dict[str, Any], replay: dict[str, Any], checkpoint_path: Path
+) -> dict[str, Any]:
+    """Run a trained traffic GNN over an authoritative replay.
+
+    For every predicted day (``day >= 1``) each road cell reports the model's
+    guessed status, the simulator ground truth, the predicted probability, and
+    whether the guess matched. Day zero is fixed to smooth and is skipped.
+    """
+
+    samples = graph_samples_from_replay(scenario, replay)
+    if not samples:
+        return {
+            "classes": list(TRAFFIC_CLASSES),
+            "days": [],
+            "road_count": 0,
+            "matched": 0,
+            "accuracy": 0.0,
+            "confusion": [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        }
+    model = load_traffic_model(checkpoint_path)
+    days_out: list[dict[str, Any]] = []
+    total_roads = 0
+    matched = 0
+    confusion = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
+    with torch.no_grad():
+        for sample in samples:
+            logits = model(sample.features, sample.edge_index, sample.edge_direction)
+            probabilities = torch.softmax(logits, dim=1)
+            predictions = probabilities.argmax(dim=1)
+            road_positions = sample.road_mask.nonzero(as_tuple=True)[0].tolist()
+            cells: list[dict[str, Any]] = []
+            day_matched = 0
+            for pos in road_positions:
+                predicted = int(predictions[pos].item())
+                actual = int(sample.labels[pos].item())
+                confusion[actual][predicted] += 1
+                total_roads += 1
+                correct = predicted == actual
+                if correct:
+                    matched += 1
+                    day_matched += 1
+                cells.append(
+                    {
+                        "pos": pos,
+                        "predicted": predicted,
+                        "actual": actual,
+                        "probability": round(
+                            float(probabilities[pos, predicted].item()), 4
+                        ),
+                        "correct": correct,
+                    }
+                )
+            days_out.append(
+                {
+                    "day": int(sample.day),
+                    "road_count": len(cells),
+                    "matched": day_matched,
+                    "accuracy": (day_matched / len(cells)) if cells else 0.0,
+                    "cells": cells,
+                }
+            )
+    return {
+        "classes": list(TRAFFIC_CLASSES),
+        "days": days_out,
+        "road_count": total_roads,
+        "matched": matched,
+        "accuracy": (matched / total_roads) if total_roads else 0.0,
+        "confusion": confusion,
+    }
