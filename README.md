@@ -318,14 +318,17 @@ minutes per map. The web dashboard exposes the same curve controls.
 
 ## Traffic GNN prototype
 
-Generate the reusable dataset once. Every simulated player uses ALNS with a
-distinct deterministic seed:
+Generate the reusable dataset once. Maps are drawn from the graded hard suite
+and balanced evenly across the `brutal`, `steady`, and `easy` tiers, so the
+model sees road-condition labels from discriminating scenarios rather than the
+saturated random profiles. Every simulated player uses LNS (pass `--policy alns`
+for the heavier adaptive search) with a distinct deterministic seed:
 
 ```sh
 uv run hexbench traffic-generate \
-  --train-cases 100 \
-  --validation-cases 20 \
-  --alns-iterations 32 \
+  --train-cases 800 \
+  --validation-cases 200 \
+  --alns-iterations 16 \
   --jobs 8 \
   --out datasets/traffic-gnn
 ```

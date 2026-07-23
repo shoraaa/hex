@@ -527,6 +527,154 @@ def test_local_tab_exposes_case_controls_scores_and_frame_playback() -> None:
     assert "alns" in web.POLICIES
 
 
+def test_local_tab_exposes_traffic_model_prediction_overlay() -> None:
+    script = (web.STATIC_ROOT / "app.js").read_text()
+
+    assert "trafficModel" in script
+    assert 'id="local-model"' in script
+    assert "traffic_model_id" in script
+    assert 'api("/api/traffic/models")' in script
+    assert "data-local-view" in script
+    assert "actualTraffics" in script
+    assert "localTrafficBarMarkup" in script
+    assert "state.local.view=button.dataset.localView" in script
+    assert "state.local.prediction=state.local.result?.result?.traffic||null" in script
+
+
+def test_traffic_models_discovers_trained_checkpoints(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import torch
+
+    from hexbench.traffic_gnn import FEATURE_NAMES, TRAFFIC_CLASSES, TrafficGNN
+
+    monkeypatch.setattr(web, "ROOT", tmp_path)
+    model_dir = tmp_path / "reports" / "traffic-fixture"
+    model_dir.mkdir(parents=True)
+    checkpoint = model_dir / "model.pt"
+    torch.save(
+        {
+            "state_dict": TrafficGNN(
+                len(FEATURE_NAMES), hidden_size=8, layers=1
+            ).state_dict(),
+            "feature_names": FEATURE_NAMES,
+            "hidden_size": 8,
+            "layers": 1,
+            "classes": TRAFFIC_CLASSES,
+        },
+        checkpoint,
+    )
+    (model_dir / "report.json").write_text(
+        web.json.dumps(
+            {
+                "kind": "offline-lns16-traffic-gnn",
+                "checkpoint": str(checkpoint),
+                "best_epoch": 5,
+                "best_validation": {"accuracy": 0.89, "macro_f1": 0.7},
+                "dataset": {"policy": "lns", "dataset": "fixture.pt"},
+                "train_samples": 10,
+                "validation_samples": 2,
+            }
+        )
+    )
+    app = web.DashboardApp(
+        tmp_path / ".env", tmp_path / "state", tmp_path / "reports"
+    )
+    try:
+        models = app.traffic_models()
+        assert len(models) == 1
+        assert models[0]["id"] == "traffic-fixture"
+        assert models[0]["validation_accuracy"] == 0.89
+        assert models[0]["policy"] == "lns"
+    finally:
+        app.close()
+
+
+def test_local_run_attaches_traffic_prediction_when_model_selected(
+    monkeypatch, tmp_path: Path
+) -> None:
+    cases = tmp_path / "cases"
+    scenario = {
+        "schema_version": 1,
+        "config": {
+            "daySteps": [4, 4],
+            "agents": [0],
+            "spots": [{"brand": 7, "pos": 1, "stocks": 1}],
+        },
+        "opponents": [],
+    }
+    (cases / "quick").mkdir(parents=True)
+    (cases / "quick" / "case-0000.json").write_text(web.json.dumps(scenario))
+    (cases / "quick" / "manifest.json").write_text(
+        web.json.dumps({"suite": "quick", "cases": [{"path": "case-0000.json", "seed": 1}]})
+    )
+    monkeypatch.setattr(web, "LOCAL_CASE_ROOT", cases)
+    monkeypatch.setattr(web, "find_binary", lambda _: tmp_path / "hexudon")
+
+    def fake_core(command, method, payload, **kwargs):
+        assert command == "visualize"
+        return {
+            "score": {
+                "distinct_types": 1,
+                "cumulative_daily_types": 2,
+                "total_servings": 2,
+            },
+            "valid_days": 2,
+            "invalid_days": 0,
+            "replay": {
+                "days": [
+                    {"day": 0, "road_condition": {}, "teams": []},
+                    {"day": 1, "road_condition": {"0": 1}, "teams": []},
+                ]
+            },
+        }
+
+    monkeypatch.setattr(web, "run_core", fake_core)
+    app = web.DashboardApp(
+        tmp_path / ".env", tmp_path / "state", tmp_path / "reports"
+    )
+    captured: dict[str, object] = {}
+
+    def fake_predict(scenario_arg, result_arg, model_id):
+        captured["model_id"] = model_id
+        return {
+            "classes": ["smooth", "busy", "jammed"],
+            "days": [
+                {
+                    "day": 1,
+                    "road_count": 1,
+                    "matched": 0,
+                    "accuracy": 0.0,
+                    "cells": [
+                        {
+                            "pos": 0,
+                            "predicted": 0,
+                            "actual": 1,
+                            "probability": 0.5,
+                            "correct": False,
+                        }
+                    ],
+                }
+            ],
+            "road_count": 1,
+            "matched": 0,
+            "accuracy": 0.0,
+            "confusion": [[0, 0, 0], [1, 0, 0], [0, 0, 0]],
+        }
+
+    monkeypatch.setattr(app, "_traffic_prediction", fake_predict)
+    try:
+        result = app.run_local_case(
+            "quick/case-0000.json", "local_search", {}, "traffic-fixture"
+        )
+        assert captured["model_id"] == "traffic-fixture"
+        traffic = result["result"]["traffic"]
+        assert traffic["road_count"] == 1
+        assert traffic["days"][0]["cells"][0]["actual"] == 1
+    finally:
+        app.close()
+
+
 def test_game_ui_proxies_replay_answers_and_safe_practice_reset(
     monkeypatch, tmp_path: Path
 ) -> None:

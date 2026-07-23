@@ -98,6 +98,9 @@ class DashboardApp:
         # Practice resets are stateful. One worker prevents two jobs from
         # resetting the same team game underneath each other.
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hexbench-web")
+        # Loaded traffic GNNs keyed by model id. Each value is refreshed when
+        # the underlying checkpoint file changes on disk.
+        self._traffic_models_cache: dict[str, dict[str, Any]] = {}
 
     def close(self) -> None:
         self._competition.close()
@@ -256,6 +259,7 @@ class DashboardApp:
         case_id: str,
         method: str,
         hyperparameters: dict[str, int | float] | None = None,
+        traffic_model_id: str | None = None,
     ) -> dict[str, Any]:
         if method not in POLICIES:
             raise ValueError(f"unknown policy: {method}")
@@ -273,6 +277,10 @@ class DashboardApp:
         result["runtime_seconds"] = time.perf_counter() - started
         optimum = structural_optimum(scenario)
         result.update(normalized_performance(result, optimum))
+        if traffic_model_id:
+            result["traffic"] = self._traffic_prediction(
+                scenario, result, traffic_model_id
+            )
         return {
             "case_id": case_id,
             "method": method,
@@ -280,6 +288,85 @@ class DashboardApp:
             "scenario": scenario,
             "result": result,
         }
+
+    def traffic_models(self) -> list[dict[str, Any]]:
+        """Discover trained traffic GNN checkpoints under the reports tree."""
+
+        models: list[dict[str, Any]] = []
+        roots = {ROOT / "reports", self.report_dir}
+        seen: set[Path] = set()
+        for root in roots:
+            if not root or not root.exists():
+                continue
+            for report_path in sorted(root.glob("*/report.json")):
+                checkpoint_dir = report_path.parent.resolve()
+                if checkpoint_dir in seen:
+                    continue
+                seen.add(checkpoint_dir)
+                try:
+                    report = json.loads(report_path.read_text())
+                except (OSError, ValueError):
+                    continue
+                if not isinstance(report, dict) or "traffic-gnn" not in str(
+                    report.get("kind", "")
+                ):
+                    continue
+                checkpoint = Path(report.get("checkpoint") or checkpoint_dir / "model.pt")
+                if not checkpoint.is_file():
+                    continue
+                validation = report.get("best_validation") or {}
+                dataset = report.get("dataset") or {}
+                models.append(
+                    {
+                        "id": checkpoint_dir.name,
+                        "name": checkpoint_dir.name,
+                        "checkpoint": str(checkpoint),
+                        "policy": dataset.get("policy"),
+                        "dataset": dataset.get("dataset"),
+                        "best_epoch": report.get("best_epoch"),
+                        "train_samples": report.get("train_samples"),
+                        "validation_samples": report.get("validation_samples"),
+                        "validation_accuracy": validation.get("accuracy"),
+                        "validation_macro_f1": validation.get("macro_f1"),
+                        "modified_at": datetime.fromtimestamp(
+                            checkpoint.stat().st_mtime, UTC
+                        ).isoformat(),
+                    }
+                )
+        models.sort(key=lambda row: row["modified_at"], reverse=True)
+        return models
+
+    def _load_traffic_model(self, model_id: str) -> dict[str, Any]:
+        cache = self._traffic_models_cache.get(model_id)
+        meta = next(
+            (model for model in self.traffic_models() if model["id"] == model_id), None
+        )
+        if meta is None:
+            raise ValueError(f"unknown traffic model: {model_id}")
+        checkpoint = Path(meta["checkpoint"])
+        mtime = checkpoint.stat().st_mtime
+        if cache and cache.get("mtime") == mtime:
+            return cache
+        from .traffic_gnn import load_traffic_model
+
+        model = load_traffic_model(checkpoint)
+        entry = {"model": model, "meta": meta, "mtime": mtime}
+        self._traffic_models_cache[model_id] = entry
+        return entry
+
+    def _traffic_prediction(
+        self,
+        scenario: dict[str, Any],
+        result: dict[str, Any],
+        model_id: str,
+    ) -> dict[str, Any]:
+        from .traffic_gnn import predict_traffic
+
+        try:
+            checkpoint = Path(self._load_traffic_model(model_id)["meta"]["checkpoint"])
+            return predict_traffic(scenario, result, checkpoint)
+        except Exception as error:  # Keep the solver result usable on model failure.
+            return {"error": str(error)}
 
     def snapshot(self, game_id: str) -> dict[str, Any]:
         return fetch_game_snapshot(load_token(self.env_path), game_id, self.base_url)
@@ -880,6 +967,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except (OSError, ValueError, json.JSONDecodeError) as error:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
             return
+        if path == "/api/traffic/models":
+            self._json(HTTPStatus.OK, {"models": self.app.traffic_models()})
+            return
         if path == "/api/games":
             try:
                 mode = parse_qs(parsed.query).get("mode", ["practice"])[0]
@@ -984,13 +1074,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 case_id = payload.get("case_id")
                 method = payload.get("method", "alns")
                 hyperparameters = payload.get("hyperparameters")
+                traffic_model_id = payload.get("traffic_model_id")
                 if not isinstance(case_id, str) or not isinstance(method, str):
                     raise ValueError("case_id and method are required")
                 if hyperparameters is not None and not isinstance(hyperparameters, dict):
                     raise ValueError("hyperparameters must be an object")
+                if traffic_model_id is not None and not isinstance(
+                    traffic_model_id, str
+                ):
+                    raise ValueError("traffic_model_id must be a string")
                 self._json(
                     HTTPStatus.OK,
-                    self.app.run_local_case(case_id, method, hyperparameters),
+                    self.app.run_local_case(
+                        case_id, method, hyperparameters, traffic_model_id or None
+                    ),
                 )
                 return
             if path.startswith("/api/games/") and path.endswith("/reset"):

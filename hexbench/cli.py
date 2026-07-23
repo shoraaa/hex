@@ -204,19 +204,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     traffic_data = subparsers.add_parser(
         "traffic-generate",
-        help="generate a reusable traffic dataset with 16 diversely seeded ALNS players",
+        help="generate a reusable traffic dataset (balanced brutal/steady/easy tiers, 16 ALNS players)",
     )
-    traffic_data.add_argument("--train-cases", type=int, default=100)
-    traffic_data.add_argument("--validation-cases", type=int, default=20)
+    traffic_data.add_argument("--train-cases", type=int, default=800)
+    traffic_data.add_argument("--validation-cases", type=int, default=200)
     traffic_data.add_argument("--seed", type=int, default=20260718)
-    traffic_data.add_argument("--alns-iterations", type=int, default=32)
+    traffic_data.add_argument("--alns-iterations", type=int, default=16)
     traffic_data.add_argument(
         "--out", type=Path, default=Path("datasets/traffic-gnn")
     )
     traffic_data.add_argument("--binary")
-    traffic_data.add_argument("--simulation-timeout", type=float, default=180.0)
-    traffic_data.add_argument("--core-threads", type=int, default=1)
+    traffic_data.add_argument("--simulation-timeout", type=float, default=500.0)
+    traffic_data.add_argument("--core-threads", type=int, default=2)
     traffic_data.add_argument("--jobs", type=int, default=8)
+    traffic_data.add_argument(
+        "--policy",
+        choices=("lns", "alns"),
+        default="lns",
+        help="planner used by every simulated player (default: lns)",
+    )
     traffic_data.add_argument("--overwrite", action="store_true")
 
     traffic = subparsers.add_parser(
@@ -228,14 +234,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("datasets/traffic-gnn/dataset.pt"),
     )
-    traffic.add_argument("--epochs", type=int, default=200)
+    traffic.add_argument("--epochs", type=int, default=20)
     traffic.add_argument("--seed", type=int, default=20260718)
     traffic.add_argument("--hidden-size", type=int, default=128)
     traffic.add_argument("--layers", type=int, default=4)
     traffic.add_argument("--learning-rate", type=float, default=1e-3)
-    traffic.add_argument("--batch-size", type=int, default=64)
+    traffic.add_argument("--batch-size", type=int, default=32)
     traffic.add_argument("--patience", type=int, default=30)
-    traffic.add_argument("--minimum-epochs", type=int, default=50)
+    traffic.add_argument("--minimum-epochs", type=int, default=5)
+    traffic.add_argument("--warmup-epochs", type=int, default=5)
     traffic.add_argument("--device", default="auto")
     traffic.add_argument("--report", type=Path, default=Path("reports/traffic-gnn"))
 
@@ -449,6 +456,7 @@ def main(argv: list[str] | None = None) -> None:
             core_threads=args.core_threads,
             jobs=args.jobs,
             overwrite=args.overwrite,
+            policy=args.policy,
         )
         print(
             json.dumps(
@@ -473,6 +481,7 @@ def main(argv: list[str] | None = None) -> None:
             batch_size=args.batch_size,
             patience=args.patience,
             minimum_epochs=args.minimum_epochs,
+            warmup_epochs=args.warmup_epochs,
             device_name=args.device,
             report_dir=args.report,
         )

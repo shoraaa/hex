@@ -3,15 +3,19 @@ from __future__ import annotations
 import torch
 from torch.nn import functional as F
 
+import pytest
+
 import hexbench.traffic_gnn as traffic_gnn
 from hexbench.cli import build_parser
 from hexbench.traffic_gnn import (
     FEATURE_NAMES,
+    TRAFFIC_CLASSES,
     TrafficGNN,
     generate_traffic_dataset,
     graph_samples_from_replay,
     load_traffic_dataset,
-    make_alns16_scenario,
+    make_traffic_scenario,
+    predict_traffic,
     train_traffic_gnn,
 )
 
@@ -84,14 +88,22 @@ def test_minimal_gnn_cross_entropy_backward() -> None:
     assert any(parameter.grad is not None for parameter in model.parameters())
 
 
-def test_online_scenario_uses_sixteen_alns_players() -> None:
-    scenario = make_alns16_scenario(11, alns_iterations=3)
+def test_online_scenario_uses_sixteen_default_policy_players() -> None:
+    scenario = make_traffic_scenario(11, alns_iterations=3, tier="easy")
 
     assert scenario["config"]["players"] == 16
-    assert scenario["opponents"] == ["alns"] * 15
+    assert scenario["opponents"] == ["lns"] * 15
     assert scenario["searchForAllPlayers"] is True
     assert len(set(scenario["playerSeeds"])) == 16
     assert scenario["search"]["maxIterations"] == 3
+    assert scenario["tier"] == "easy"
+
+
+def test_online_scenario_can_force_alns_policy() -> None:
+    scenario = make_traffic_scenario(11, alns_iterations=3, tier="easy", policy="alns")
+
+    assert scenario["opponents"] == ["alns"] * 15
+    assert scenario["traffic_mode"] == "alns16"
 
 
 def test_offline_dataset_roundtrip_and_training_without_simulation(
@@ -136,7 +148,7 @@ def test_offline_dataset_roundtrip_and_training_without_simulation(
         device_name="cpu",
         report_dir=tmp_path / "report",
     )
-    assert report["kind"] == "offline-alns16-traffic-gnn"
+    assert report["kind"] == "offline-lns16-traffic-gnn"
     assert report["train_samples"] == 2
     assert report["best_epoch"] == 1
 
@@ -152,6 +164,60 @@ def test_cli_exposes_offline_generation_and_training() -> None:
     assert generate.command == "traffic-generate"
     assert generate.train_cases == 2
     assert generate.alns_iterations == 3
+    assert generate.policy == "lns"
     assert train.command == "traffic-train"
     assert str(train.dataset) == "saved.pt"
     assert train.epochs == 3
+
+
+def test_predict_traffic_reports_per_day_model_guesses(tmp_path) -> None:
+    scenario, replay = _replay_fixture()
+    checkpoint_path = tmp_path / "model.pt"
+    model = TrafficGNN(len(FEATURE_NAMES), hidden_size=8, layers=1)
+    torch.save(
+        {
+            "state_dict": model.state_dict(),
+            "feature_names": FEATURE_NAMES,
+            "hidden_size": 8,
+            "layers": 1,
+            "classes": TRAFFIC_CLASSES,
+            "dataset_sha256": "test",
+            "best_epoch": 1,
+        },
+        checkpoint_path,
+    )
+
+    result = predict_traffic(scenario, replay, checkpoint_path)
+
+    assert result["classes"] == ["smooth", "busy", "jammed"]
+    # Day zero is fixed to smooth and is skipped; days 1 and 2 are predicted.
+    assert [day["day"] for day in result["days"]] == [1, 2]
+    first = result["days"][0]
+    # The 2x2 fixture has road cells at positions 0 and 3 only.
+    assert first["road_count"] == 2
+    assert {cell["pos"] for cell in first["cells"]} == {0, 3}
+    assert all(cell["predicted"] in {0, 1, 2} for cell in first["cells"])
+    assert all(0.0 <= cell["probability"] <= 1.0 for cell in first["cells"])
+    # Ground-truth labels for day 1 are {"0": 1, "3": 0}.
+    pos0 = next(cell for cell in first["cells"] if cell["pos"] == 0)
+    assert pos0["actual"] == 1
+    assert result["confusion"][1][pos0["predicted"]] >= 1
+    assert result["road_count"] == 4
+    assert result["matched"] + result["confusion"][1][0] + result["confusion"][1][2] >= 1
+
+
+def test_predict_traffic_rejects_incompatible_checkpoint_schema(tmp_path) -> None:
+    scenario, replay = _replay_fixture()
+    checkpoint_path = tmp_path / "bad.pt"
+    torch.save(
+        {
+            "state_dict": TrafficGNN(len(FEATURE_NAMES), hidden_size=8, layers=1).state_dict(),
+            "feature_names": tuple("different") + FEATURE_NAMES,
+            "hidden_size": 8,
+            "layers": 1,
+            "classes": TRAFFIC_CLASSES,
+        },
+        checkpoint_path,
+    )
+    with pytest.raises(ValueError, match="feature schema"):
+        predict_traffic(scenario, replay, checkpoint_path)
