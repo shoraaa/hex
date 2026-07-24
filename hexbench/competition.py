@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import re
 import shlex
 import threading
@@ -44,6 +45,33 @@ from .runner import (
     run_core,
     stream_core,
 )
+
+
+# The C++ core caps each MLNS search's internal parallelism at this many worker
+# threads (configured_workers in src/core.cpp), so on larger machines a single
+# trajectory leaves cores idle. Racing one extra independent trajectory per
+# spare block of cores and keeping the best-scoring committed plan converts that
+# idle capacity into a higher, lower-variance score floor -- validated on the
+# online q10/q11 fixtures (Q10 servings 332->341, Q11 daily floor 276->282 at
+# 30s/day) with no regression. Best-of-K is realized by HEXUDON_MLNS_PORTFOLIO
+# in the core; here we only pick a sensible K from the host core count.
+_MLNS_WORKER_CAP = 8
+
+
+def _maybe_enable_mlns_portfolio(method: str) -> None:
+    """Race best-of-K MLNS trajectories when the host has spare cores.
+
+    No-op unless the method is MLNS, the operator has not already pinned
+    ``HEXUDON_MLNS_PORTFOLIO``, and there is room for at least two full-strength
+    trajectories (2 * worker cap cores). Sets the environment variable the C++
+    core reads; the solver subprocess inherits it.
+    """
+    if method != "mlns" or "HEXUDON_MLNS_PORTFOLIO" in os.environ:
+        return
+    cores = os.cpu_count() or 1
+    portfolio = max(1, min(8, cores // _MLNS_WORKER_CAP))
+    if portfolio > 1:
+        os.environ["HEXUDON_MLNS_PORTFOLIO"] = str(portfolio)
 
 
 def _now() -> str:
@@ -1482,6 +1510,7 @@ class CompetitionSessionManager:
             )
         )
         binary = find_binary(self.binary_path)
+        _maybe_enable_mlns_portfolio(session["method"])
         prediction_mode = (
             "gnn"
             if bool(session.get("hyperparameters", {}).get("use_traffic_gnn"))

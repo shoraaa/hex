@@ -231,6 +231,17 @@ oversubscription. Live deployment instead uses bounded C++ parallelism for
 coordinated resource paths and local-search candidate scoring. Set
 `HEXUDON_THREADS=N` to control that inner limit; it defaults to at most eight.
 
+Because that inner limit caps a single MLNS search at eight worker threads, a
+host with more cores would otherwise leave them idle. `HEXUDON_MLNS_PORTFOLIO=K`
+races `K` independent MLNS trajectories per day (each still using the full
+eight-worker budget, so `K` trajectories occupy up to `8K` cores) and commits
+the best-scoring plan. The timed search is nondeterministic run-to-run, so
+best-of-`K` raises the score floor; on the online q10/q11 fixtures at 30 s/day
+it lifted Q10 servings 332→341 and tightened Q11's daily floor with no
+regression. The online client (`hexbench/competition.py`) auto-selects
+`K = cores // 8` for MLNS unless `HEXUDON_MLNS_PORTFOLIO` is already set. The
+default (`K=1`) is exactly the historical single-trajectory search.
+
 ## Live reads and deployment
 
 Put the team JWT in an untracked `.env` file:

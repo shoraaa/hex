@@ -1513,6 +1513,93 @@ AgentTypes select_agent_types(const std::string& policy,
   return select_agent_types_online(policy, config, limits);
 }
 
+// Number of independent MLNS trajectories to race per day (best-of-K portfolio).
+// Default 1 is exactly the historical single-trajectory search. Override with
+// HEXUDON_MLNS_PORTFOLIO.
+int mlns_portfolio_count() {
+  static const int value = [] {
+    const char* raw = std::getenv("HEXUDON_MLNS_PORTFOLIO");
+    if (raw == nullptr) return 1;
+    int parsed = 1;
+    try {
+      parsed = std::stoi(raw);
+    } catch (const std::exception&) {
+      throw std::invalid_argument("HEXUDON_MLNS_PORTFOLIO must be an integer");
+    }
+    if (parsed < 1 || parsed > 8) {
+      throw std::invalid_argument("HEXUDON_MLNS_PORTFOLIO must be in [1,8]");
+    }
+    return parsed;
+  }();
+  return value;
+}
+
+// Run `count` MLNS trajectories in parallel and keep the one whose committed
+// current-day plan has the best official (distinct, daily, servings) score.
+// The timed search is nondeterministic run-to-run (wall-clock cutoffs) with a
+// wide spread; because `configured_workers` caps each trajectory's intra-search
+// parallelism at 8, machines with more cores have spare capacity that a
+// best-of-K portfolio converts into a higher, lower-variance floor -- it simply
+// selects the luckiest trajectory (e.g. one that routed the single refuel car
+// efficiently enough to keep patrols collecting) without altering the search.
+// Only trajectory 0 receives the streaming sink, so anytime `solve` output
+// stays single-threaded; the chosen plan is still emitted as the final line.
+PlannerResult build_mlns_portfolio(const MapConfig& config, const DayInfo& day,
+                                   const PolicyHistory& history,
+                                   const AgentTypes& types,
+                                   const SearchLimits& limits,
+                                   const json::value* planner_state,
+                                   const ImprovementSink* on_improve,
+                                   int count) {
+  // Run each trajectory on its own raw thread so it keeps the full per-search
+  // worker budget (configured_workers is capped at 8 regardless of machine
+  // size). K trajectories therefore occupy up to 8K cores -- the point is to
+  // spend the cores a single capped search leaves idle on >8-core hardware, not
+  // to split one search's budget. Each trajectory is thus as strong as a
+  // standalone run, and best-of-K can only raise the floor.
+  const std::size_t k = static_cast<std::size_t>(count);
+  std::vector<PlannerResult> plans(k);
+  std::vector<std::optional<Score>> scores(k);
+  std::vector<std::exception_ptr> errors(k);
+  std::vector<std::thread> threads;
+  threads.reserve(k);
+  for (std::size_t index = 0; index < k; ++index) {
+    threads.emplace_back([&, index] {
+      try {
+        SearchLimits local = limits;
+        local.random_seed =
+            limits.random_seed ^
+            (static_cast<std::uint64_t>(index) * 0x9E3779B97F4A7C15ULL);
+        // Only trajectory 0 streams incumbents; the rest run silently so the
+        // anytime `solve` sink is never called from more than one thread.
+        const ImprovementSink* sink = index == 0 ? on_improve : nullptr;
+        plans[index] = build_mlns_plan(config, day, history, types, local,
+                                       planner_state, sink);
+        scores[index] =
+            score_action_plan(config, day, history, plans[index].actions);
+      } catch (...) {
+        errors[index] = std::current_exception();
+      }
+    });
+  }
+  for (auto& thread : threads) thread.join();
+  for (auto& error : errors) {
+    if (error) std::rethrow_exception(error);
+  }
+  auto key = [&](std::size_t index) {
+    const auto& score = scores[index];
+    return score ? std::tuple{score->distinct_types,
+                              score->cumulative_daily_types,
+                              score->total_servings}
+                 : std::tuple{-1, -1, -1};
+  };
+  std::size_t best = 0;
+  for (std::size_t index = 1; index < k; ++index) {
+    if (key(index) > key(best)) best = index;
+  }
+  return std::move(plans[best]);
+}
+
 ActionPlan plan_day_online(const std::string& policy, const MapConfig& config,
                            const DayInfo& day,
                            const PolicyHistory& history,
@@ -1570,6 +1657,12 @@ ActionPlan plan_day_online(const std::string& policy, const MapConfig& config,
         .actions;
   }
   if (policy == "mlns") {
+    const int portfolio = mlns_portfolio_count();
+    if (portfolio > 1) {
+      return build_mlns_portfolio(config, day, history, fixed_types, limits,
+                                  nullptr, on_improve, portfolio)
+          .actions;
+    }
     return build_mlns_plan(config, day, history, fixed_types, limits, nullptr,
                            on_improve)
         .actions;
@@ -1646,6 +1739,11 @@ PlannerResult plan_day_with_state(
     throw std::invalid_argument("day index outside config");
   }
   if (policy == "mlns") {
+    const int portfolio = mlns_portfolio_count();
+    if (portfolio > 1) {
+      return build_mlns_portfolio(config, day, history, fixed_types, limits,
+                                  planner_state, on_improve, portfolio);
+    }
     return build_mlns_plan(config, day, history, fixed_types, limits,
                            planner_state, on_improve);
   }
