@@ -6,7 +6,8 @@ dist/
 __pycache__/
 cases/
 datasets/
-reports/
+reports/*
+!reports/traffic-1k-test/
 .hexbench-state*/
 .claude/
 
