@@ -16,6 +16,69 @@ OBJECTIVES = (
     "cumulative_daily_types",
     "total_servings",
 )
+
+
+def _traffic_gnn_enabled(payload: dict[str, Any]) -> bool:
+    for source in (
+        payload,
+        payload.get("search") if isinstance(payload.get("search"), dict) else {},
+        payload.get("hyperparameters")
+        if isinstance(payload.get("hyperparameters"), dict)
+        else {},
+    ):
+        if source.get("use_traffic_gnn") or source.get("useTrafficGnn"):
+            return True
+    return os.environ.get("HEXUDON_USE_TRAFFIC_GNN", "") not in {"", "0"}
+
+
+def _traffic_gnn_checkpoint(payload: dict[str, Any]) -> Path:
+    explicit = payload.get("traffic_model_path") or os.environ.get(
+        "HEXUDON_TRAFFIC_GNN_CHECKPOINT"
+    )
+    candidates = [Path(explicit)] if explicit else []
+    candidates.append(ROOT / "reports" / "traffic-1k-test" / "model.pt")
+    candidates.extend(
+        sorted(
+            (ROOT / "reports").glob("traffic-gnn*/model.pt"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    raise FileNotFoundError(
+        "GNN prediction requested but no traffic checkpoint was found; "
+        "expected reports/traffic-1k-test/model.pt; set "
+        "HEXUDON_TRAFFIC_GNN_CHECKPOINT or train traffic-train first"
+    )
+
+
+def _prepare_traffic_gnn_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if not _traffic_gnn_enabled(payload) or "predictedTraffic" in payload:
+        return payload
+    from .traffic_gnn import predict_future_traffic
+
+    scenario = dict(payload)
+    if isinstance(payload.get("day_info"), dict):
+        scenario["day_info"] = payload["day_info"]
+        known_day = int(payload["day_info"].get("day", 0))
+        known_traffic = {
+            int(item["pos"]): int(item["status"])
+            for item in payload["day_info"].get("traffics", [])
+        }
+    else:
+        known_day = None
+        known_traffic = None
+    predictions = predict_future_traffic(
+        scenario,
+        _traffic_gnn_checkpoint(payload),
+        known_day=known_day,
+        known_traffic=known_traffic,
+    )
+    prepared = dict(payload)
+    prepared["predictedTraffic"] = predictions
+    return prepared
 OPTIMUM_DEFINITION = (
     "Per-case structural upper bound: every brand is collected, every brand "
     "is collected on every day, and every spot serves up to one bowl per "
@@ -43,6 +106,8 @@ def run_core(
     core_threads: int | None = None,
     environment_overrides: dict[str, str | None] | None = None,
 ) -> Any:
+    if isinstance(payload, dict) and policy == "mlns":
+        payload = _prepare_traffic_gnn_payload(payload)
     environment = None
     if core_threads is not None or environment_overrides:
         environment = dict(os.environ)
@@ -87,6 +152,7 @@ def stream_core(
     The ``timeout`` is a backstop watchdog: it should exceed the solver deadline
     plus a margin. Returns the final (best) record, or ``None`` if nothing streamed.
     """
+    payload = _prepare_traffic_gnn_payload(payload) if policy == "mlns" else payload
     environment = None
     if core_threads is not None:
         environment = dict(os.environ)
@@ -185,6 +251,7 @@ def grade_suite(
     time_limit_ms: int | None = None,
     core_environment: dict[str, str | None] | None = None,
     core_threads: int | None = None,
+    policy_hyperparameters: dict[str, dict[str, int | float | bool]] | None = None,
 ) -> dict[str, Any]:
     binary = find_binary(binary_path)
     manifest = json.loads(manifest_path.read_text())
@@ -233,6 +300,9 @@ def grade_suite(
                 "maxIterations": 10_000_000,
                 "stagnationIterations": 0,
             }
+        if policy_hyperparameters and name in policy_hyperparameters:
+            scenario = dict(scenario)
+            scenario["hyperparameters"] = dict(policy_hyperparameters[name])
         try:
             result = run_core(
                 "eval",

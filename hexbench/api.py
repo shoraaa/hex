@@ -61,6 +61,17 @@ LNS_DP_PROPOSAL_HYPERPARAMETER = {
         "no-regression promotion."
     ),
 }
+TRAFFIC_GNN_HYPERPARAMETER = {
+    "key": "use_traffic_gnn",
+    "label": "Use GNN traffic prediction",
+    "type": "boolean",
+    "recommended": False,
+    "help": (
+        "Forecast future road status with the trained traffic GNN instead of "
+        "the symmetric self-traffic suffix surrogate. Today's revealed roads "
+        "remain authoritative."
+    ),
+}
 ALNS_HYPERPARAMETERS = (
     {"key": "time_limit_ms", "label": "ALNS wall-clock limit", "unit": "ms", "type": "integer", "min": 50, "step": 50, "ui_max": 10_000, "help": "Timed mode; mutually exclusive with ALNS iterations."},
     {"key": "continuation_time_percent", "label": "Continuation time share", "unit": "%", "type": "integer", "min": 0, "max": 100, "step": 1, "recommended": 50, "help": "Percentage of every timed non-final day reserved for remaining-match simulation; current-day ALNS receives the remainder."},
@@ -93,6 +104,7 @@ MLNS_HYPERPARAMETERS = (
     {"key": "stagnation_iterations", "label": "MLNS stagnation threshold", "type": "integer", "min": 0, "step": 1, "ui_max": 100_000, "recommended": 0, "help": "Zero lets the wall-clock deadline govern; a positive value explicitly permits early stopping."},
     {"key": "future_discount_percent", "label": "Future-day discount", "unit": "%/horizon", "type": "integer", "min": 1, "max": 100, "step": 1, "recommended": 90, "help": "Weights today, tomorrow, and later days by 1, p, p², ... while preserving the official lexicographic objective order."},
     LNS_DP_PROPOSAL_HYPERPARAMETER,
+    TRAFFIC_GNN_HYPERPARAMETER,
 )
 SIMPLE_LNS_HYPERPARAMETERS = (
     {"key": "time_limit_ms", "label": "Simple LNS wall-clock limit", "unit": "ms", "type": "integer", "min": 50, "step": 50, "ui_max": 60_000, "help": "Deadline for repeated whole-match destroy-and-repair."},

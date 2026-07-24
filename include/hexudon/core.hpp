@@ -104,6 +104,27 @@ struct PalnsDiagnostics {
   int projection_deadline_fallbacks{};
 };
 
+// Wall-clock and incumbent-attribution counters for the production MLNS
+// pipeline. Components are intentionally coarse, non-overlapping top-level
+// phases: nested decoder/evaluation work is charged to the phase that asked
+// for it. Gain vectors are phase-boundary deltas, not independent ablations.
+struct MlnsComponentDiagnostics {
+  std::string component;
+  int calls{};
+  std::int64_t elapsed_microseconds{};
+  int incumbent_updates{};
+  int final_selections{};
+  std::array<std::int64_t, 3> current_score_gain{};
+  std::array<std::int64_t, 3> projected_score_gain{};
+  std::int64_t ending_patrol_fuel_gain{};
+};
+
+struct MlnsDiagnostics {
+  int planner_calls{};
+  std::int64_t elapsed_microseconds{};
+  std::vector<MlnsComponentDiagnostics> components;
+};
+
 // Anytime callback invoked whenever the solver advances its incumbent. The
 // final callback is the plan returned at the wall-clock deadline, including a
 // continuation-aware replacement selected by remaining-match look-ahead. The
@@ -123,6 +144,7 @@ struct EvaluationResult {
   std::vector<Score> daily_scores;
   std::vector<std::string> errors;
   PalnsDiagnostics palns_diagnostics;
+  MlnsDiagnostics mlns_diagnostics;
 };
 
 struct SearchLimits {
@@ -169,6 +191,11 @@ struct SearchLimits {
   // MLNS discounts each additional prediction horizon geometrically by this
   // integer percentage. 90 means 1, 0.9, 0.9^2, ... .
   int future_discount_percent{90};
+  // Replace MLNS's symmetric self-traffic suffix forecast with maps supplied
+  // by the optional traffic-GNN predictor. The current revealed day remains
+  // authoritative; entries are used only for future suffix days.
+  bool use_traffic_gnn{false};
+  std::vector<std::map<int, int>> predicted_traffic;
 };
 
 struct PlannerResult {

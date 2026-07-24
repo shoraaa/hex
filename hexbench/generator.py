@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import random
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from itertools import combinations
 from pathlib import Path
@@ -99,6 +100,14 @@ VALIDATION_PROFILE_TIERS = {
     "medium": "steady",
     "easy": "easy",
 }
+HARD_TRAFFIC_PLAYERS = 8
+HARD_TRAFFIC_POLICY = "lns"
+HARD_TRAFFIC_MODE = "fixed-lns8"
+HARD_LIVE_TRAFFIC_MODE = "lns8-live"
+HARD_TRAFFIC_SEED_SALT = 0x4C4E5338
+HARD_TRAFFIC_CACHE_VERSION = 1
+HARD_TRAFFIC_LNS_ITERATIONS = 32
+HARD_TRAFFIC_MODEL = "seven-clones"
 
 
 def _remove_ponds(
@@ -502,6 +511,9 @@ def generate_validation_suite(
     output: Path,
     per_profile: int = VALIDATION_CASE_COUNT,
     profiles: tuple[str, ...] = VALIDATION_PROFILES,
+    binary_path: str | None = None,
+    traffic_timeout: float = 600.0,
+    traffic_jobs: int = 4,
 ) -> Path:
     """Generate a deterministic, stratified ALNS validation suite.
 
@@ -512,9 +524,14 @@ def generate_validation_suite(
     """
     if per_profile < 1:
         raise ValueError("per_profile must be positive")
+    if traffic_jobs < 1:
+        raise ValueError("traffic_jobs must be positive")
     unknown = set(profiles) - set(VALIDATION_PROFILES)
     if unknown:
         raise ValueError(f"unknown validation profile: {sorted(unknown)}")
+    from .runner import find_binary
+
+    binary = find_binary(binary_path)
     output.mkdir(parents=True, exist_ok=True)
     combined_cases: list[dict[str, Any]] = []
     for profile in profiles:
@@ -523,18 +540,44 @@ def generate_validation_suite(
         profile_dir = output / profile
         profile_dir.mkdir(parents=True, exist_ok=True)
         cases: list[dict[str, Any]] = []
+        scenarios: list[dict[str, Any] | None] = []
         for index in range(per_profile):
-            scenario = _generate_hard_scenario(recipe.base_seed + index, tier)
+            seed = recipe.base_seed + index
+            filename = f"case-{index:04d}.json"
+            case_path = profile_dir / filename
+            scenarios.append(_load_matching_frozen_scenario(case_path, seed, tier))
+
+        missing = [
+            index for index, scenario in enumerate(scenarios) if scenario is None
+        ]
+
+        def freeze_index(index: int) -> tuple[int, dict[str, Any]]:
+            seed = recipe.base_seed + index
+            return index, freeze_hard_opponent_traffic(
+                _generate_hard_scenario(seed, tier),
+                binary=binary,
+                timeout=traffic_timeout,
+            )
+
+        if missing:
+            with ThreadPoolExecutor(
+                max_workers=min(traffic_jobs, len(missing))
+            ) as executor:
+                for index, scenario in executor.map(freeze_index, missing):
+                    scenarios[index] = scenario
+
+        for index, loaded_scenario in enumerate(scenarios):
+            assert loaded_scenario is not None
+            scenario = loaded_scenario
+            filename = f"case-{index:04d}.json"
+            case_path = profile_dir / filename
             scenario["validation"] = {
                 "profile": profile,
                 "source_tier": tier,
                 "index": index,
                 "suite": "alns-validation",
             }
-            filename = f"case-{index:04d}.json"
-            (profile_dir / filename).write_text(
-                json.dumps(scenario, indent=2) + "\n"
-            )
+            case_path.write_text(json.dumps(scenario, indent=2) + "\n")
             entry = {
                 "path": filename,
                 "seed": scenario["seed"],
@@ -554,6 +597,9 @@ def generate_validation_suite(
                     "profile": profile,
                     "source_tier": tier,
                     "target": recipe.target,
+                    "players": HARD_TRAFFIC_PLAYERS,
+                    "traffic_mode": HARD_TRAFFIC_MODE,
+                    "opponent_policy": HARD_TRAFFIC_POLICY,
                     "case_count": per_profile,
                     "cases": cases,
                 },
@@ -572,6 +618,9 @@ def generate_validation_suite(
                     profile: VALIDATION_PROFILE_TIERS[profile]
                     for profile in profiles
                 },
+                "players": HARD_TRAFFIC_PLAYERS,
+                "traffic_mode": HARD_TRAFFIC_MODE,
+                "opponent_policy": HARD_TRAFFIC_POLICY,
                 "cases_per_profile": per_profile,
                 "cases": combined_cases,
             },
@@ -793,6 +842,13 @@ def _generate_hard_scenario(seed: int, tier: str) -> dict[str, Any]:
         for _ in range(days)
     ]
     fuel = max(1, min(3 * day_steps[0], rng.randint(*recipe.fuel)))
+    player_seed_rng = random.Random(seed ^ HARD_TRAFFIC_SEED_SALT)
+    player_seeds: list[int] = []
+    while len(player_seeds) < HARD_TRAFFIC_PLAYERS:
+        candidate = player_seed_rng.getrandbits(63)
+        if candidate not in player_seeds:
+            player_seeds.append(candidate)
+
     config = {
         "startsAt": 1_700_000_000,
         "daySeconds": [60 for _ in range(days)],
@@ -801,7 +857,7 @@ def _generate_hard_scenario(seed: int, tier: str) -> dict[str, Any]:
         "spots": spots,
         "agents": agent_positions,
         "fuelLimits": fuel,
-        "players": 1,
+        "players": HARD_TRAFFIC_PLAYERS,
         "busyThreshold": 1,
         "jammedThreshold": 2,
     }
@@ -813,7 +869,7 @@ def _generate_hard_scenario(seed: int, tier: str) -> dict[str, Any]:
         "target": recipe.target,
         "profile": "hard",
         "size": f"{height}x{width}",
-        "traffic_mode": "single",
+        "traffic_mode": HARD_LIVE_TRAFFIC_MODE,
         "design": {
             "tier": tier,
             "target": recipe.target,
@@ -825,8 +881,99 @@ def _generate_hard_scenario(seed: int, tier: str) -> dict[str, Any]:
             "day_steps": day_steps,
         },
         "config": config,
-        "opponents": [],
+        "opponents": [HARD_TRAFFIC_POLICY] * (HARD_TRAFFIC_PLAYERS - 1),
+        "playerSeeds": player_seeds,
     }
+
+
+def freeze_hard_opponent_traffic(
+    scenario: dict[str, Any],
+    *,
+    binary: Path,
+    timeout: float = 600.0,
+) -> dict[str, Any]:
+    """Replace seven live LNS opponents with their cached road occupancy."""
+    from .runner import run_core
+
+    if scenario["config"]["players"] != HARD_TRAFFIC_PLAYERS:
+        raise ValueError("hard traffic precomputation requires eight players")
+    if scenario.get("opponents") != [HARD_TRAFFIC_POLICY] * (
+        HARD_TRAFFIC_PLAYERS - 1
+    ):
+        raise ValueError("hard traffic precomputation requires seven LNS opponents")
+    live_scenario = dict(scenario)
+    live_scenario["config"] = {**scenario["config"], "players": 1}
+    live_scenario["opponents"] = []
+    live_scenario["playerSeeds"] = list(scenario["playerSeeds"][:1])
+    live_scenario["search"] = {
+        "minIterations": HARD_TRAFFIC_LNS_ITERATIONS,
+        "maxIterations": HARD_TRAFFIC_LNS_ITERATIONS,
+        "stagnationIterations": HARD_TRAFFIC_LNS_ITERATIONS,
+        "seedIterations": min(16, HARD_TRAFFIC_LNS_ITERATIONS),
+        "exactNodes": 0,
+    }
+    replay = run_core(
+        "visualize",
+        HARD_TRAFFIC_POLICY,
+        live_scenario,
+        binary=binary,
+        timeout=timeout,
+    )
+    if replay["invalid_days"] != 0:
+        raise RuntimeError("LNS traffic precomputation produced an invalid day")
+    replay_days = replay.get("replay", {}).get("days", [])
+    expected_days = len(scenario["config"]["daySteps"])
+    if len(replay_days) != expected_days:
+        raise RuntimeError("LNS traffic precomputation returned incomplete replay")
+
+    frozen = dict(scenario)
+    frozen["traffic_mode"] = HARD_TRAFFIC_MODE
+    frozen["opponents"] = []
+    frozen["playerSeeds"] = list(scenario["playerSeeds"][:1])
+    frozen["fixedOpponentPlayers"] = HARD_TRAFFIC_PLAYERS - 1
+    frozen["fixedOpponentPolicy"] = HARD_TRAFFIC_POLICY
+    frozen["fixedOpponentIterations"] = HARD_TRAFFIC_LNS_ITERATIONS
+    frozen["fixedOpponentModel"] = HARD_TRAFFIC_MODEL
+    frozen["fixedOpponentTrafficVersion"] = HARD_TRAFFIC_CACHE_VERSION
+    frozen["fixedOpponentTraffic"] = [
+        [
+            {
+                "pos": int(entry["pos"]),
+                "volume": int(entry["volume"])
+                * (HARD_TRAFFIC_PLAYERS - 1),
+            }
+            for entry in day.get("own_traffic", [])
+        ]
+        for day in replay_days
+    ]
+    return frozen
+
+
+def _load_matching_frozen_scenario(
+    path: Path, seed: int, tier: str
+) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        scenario = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if (
+        scenario.get("seed") != seed
+        or scenario.get("tier") != tier
+        or scenario.get("traffic_mode") != HARD_TRAFFIC_MODE
+        or scenario.get("fixedOpponentPlayers") != HARD_TRAFFIC_PLAYERS - 1
+        or scenario.get("fixedOpponentPolicy") != HARD_TRAFFIC_POLICY
+        or scenario.get("fixedOpponentIterations")
+        != HARD_TRAFFIC_LNS_ITERATIONS
+        or scenario.get("fixedOpponentModel") != HARD_TRAFFIC_MODEL
+        or scenario.get("fixedOpponentTrafficVersion")
+        != HARD_TRAFFIC_CACHE_VERSION
+        or len(scenario.get("fixedOpponentTraffic", []))
+        != len(scenario.get("config", {}).get("daySteps", []))
+    ):
+        return None
+    return scenario
 
 
 def _objective_percentages(
@@ -886,7 +1033,9 @@ def _write_tier(
         "suite": f"hard-{tier}",
         "tier": tier,
         "target": HARD_RECIPES[tier].target,
-        "players": 1,
+        "players": HARD_TRAFFIC_PLAYERS,
+        "traffic_mode": HARD_TRAFFIC_MODE,
+        "opponent_policy": HARD_TRAFFIC_POLICY,
         "cases": manifest_cases,
     }
     (tier_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -901,6 +1050,7 @@ def generate_hard_suite(
     verify: bool = True,
     verify_policy: str = "alns",
     max_attempts: int = 80,
+    traffic_timeout: float = 600.0,
 ) -> Path:
     """Construct the graded hard suite under `output`.
 
@@ -914,11 +1064,9 @@ def generate_hard_suite(
         if tier not in HARD_RECIPES:
             raise ValueError(f"unknown hard tier: {tier}")
     output.mkdir(parents=True, exist_ok=True)
-    binary = None
-    if verify:
-        from .runner import find_binary
+    from .runner import find_binary
 
-        binary = find_binary(binary_path)
+    binary = find_binary(binary_path)
 
     combined_cases: list[dict[str, Any]] = []
     for tier in tiers:
@@ -927,11 +1075,14 @@ def generate_hard_suite(
         seed = recipe.base_seed
         attempts = 0
         while len(accepted) < per_tier and attempts < max_attempts:
-            scenario = _generate_hard_scenario(seed, tier)
+            scenario = freeze_hard_opponent_traffic(
+                _generate_hard_scenario(seed, tier),
+                binary=binary,
+                timeout=traffic_timeout,
+            )
             seed += 1
             attempts += 1
             if verify:
-                assert binary is not None
                 percentages, result = _objective_percentages(
                     scenario, binary, verify_policy
                 )
@@ -970,7 +1121,9 @@ def generate_hard_suite(
         "tiers": list(tiers),
         "targets": {tier: HARD_RECIPES[tier].target for tier in tiers},
         "verified_with": verify_policy if verify else None,
-        "players": 1,
+        "players": HARD_TRAFFIC_PLAYERS,
+        "traffic_mode": HARD_TRAFFIC_MODE,
+        "opponent_policy": HARD_TRAFFIC_POLICY,
         "cases": combined_cases,
     }
     manifest_path = output / "manifest.json"

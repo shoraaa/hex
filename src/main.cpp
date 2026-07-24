@@ -135,6 +135,7 @@ hexudon::SearchLimits parse_search_limits(const boost::json::object& object,
     assign_bool(search, "useLegacySeed", limits.use_legacy_seed);
     assign_bool(search, "useLocalSearchSeed", limits.use_local_search_seed);
     assign_bool(search, "useLnsDpProposals", limits.use_lns_dp_proposals);
+    assign_bool(search, "useTrafficGnn", limits.use_traffic_gnn);
     assign_seed(search, "randomSeed", limits.random_seed);
   }
   if (const auto* value = object.if_contains("hyperparameters")) {
@@ -178,6 +179,7 @@ hexudon::SearchLimits parse_search_limits(const boost::json::object& object,
                 limits.use_local_search_seed);
     assign_bool(hyperparameters, "use_lns_dp_proposals",
                 limits.use_lns_dp_proposals);
+    assign_bool(hyperparameters, "use_traffic_gnn", limits.use_traffic_gnn);
     assign_seed(hyperparameters, "random_seed", limits.random_seed);
     assign(hyperparameters, "max_targets", limits.max_targets);
     assign(hyperparameters, "fuel_reserve", limits.fuel_reserve);
@@ -185,6 +187,28 @@ hexudon::SearchLimits parse_search_limits(const boost::json::object& object,
     assign(hyperparameters, "ants", limits.aco_ants);
     assign(hyperparameters, "iterations", limits.aco_iterations);
     assign_double(hyperparameters, "evaporation", limits.aco_evaporation);
+  }
+  if (const auto* value = object.if_contains("predictedTraffic")) {
+    for (const auto& item : value->as_array()) {
+      const auto& entry = item.as_object();
+      const int day = static_cast<int>(entry.at("day").to_number<std::int64_t>());
+      if (day < 0) throw std::invalid_argument("predicted traffic day must be nonnegative");
+      if (limits.predicted_traffic.size() <= static_cast<std::size_t>(day)) {
+        limits.predicted_traffic.resize(static_cast<std::size_t>(day) + 1);
+      }
+      auto& roads = limits.predicted_traffic[static_cast<std::size_t>(day)];
+      const auto& traffic = entry.at("traffics").as_array();
+      for (const auto& road : traffic) {
+        const auto& point = road.as_object();
+        const int pos = static_cast<int>(point.at("pos").to_number<std::int64_t>());
+        const int status = static_cast<int>(point.at("status").to_number<std::int64_t>());
+        if (pos < 0 || status < 0 || status > 2) {
+          throw std::invalid_argument("invalid predicted traffic point");
+        }
+        roads[pos] = status;
+      }
+    }
+    if (!limits.predicted_traffic.empty()) limits.use_traffic_gnn = true;
   }
   if (explicit_time_limit && !explicit_max_iterations) {
     limits.max_iterations = 10'000'000;

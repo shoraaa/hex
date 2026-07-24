@@ -459,6 +459,33 @@ json::value to_json(const EvaluationResult& result) {
          diagnostics.projection_deadline_fallbacks},
         {"projection_fallback_percentage", fallback_percentage}};
   }
+  if (result.mlns_diagnostics.planner_calls > 0) {
+    const auto& diagnostics = result.mlns_diagnostics;
+    json::array components;
+    for (const auto& component : diagnostics.components) {
+      json::array current_gain;
+      json::array projected_gain;
+      for (auto value : component.current_score_gain) {
+        current_gain.push_back(value);
+      }
+      for (auto value : component.projected_score_gain) {
+        projected_gain.push_back(value);
+      }
+      components.push_back(json::object{
+          {"component", component.component},
+          {"calls", component.calls},
+          {"elapsed_microseconds", component.elapsed_microseconds},
+          {"incumbent_updates", component.incumbent_updates},
+          {"final_selections", component.final_selections},
+          {"current_score_gain", std::move(current_gain)},
+          {"projected_score_gain", std::move(projected_gain)},
+          {"ending_patrol_fuel_gain", component.ending_patrol_fuel_gain}});
+    }
+    output["mlns_profile"] = json::object{
+        {"planner_calls", diagnostics.planner_calls},
+        {"elapsed_microseconds", diagnostics.elapsed_microseconds},
+        {"components", std::move(components)}};
+  }
   return output;
 }
 
@@ -1728,7 +1755,37 @@ EvaluationResult evaluate_scenario_impl(const json::value& scenario,
       policies.emplace_back(item.as_string());
     }
   }
-  if (static_cast<int>(policies.size()) != config.players) {
+  std::vector<std::map<int, int>> fixed_opponent_traffic;
+  int fixed_opponent_players = 0;
+  if (const auto* fixed = root.if_contains("fixedOpponentTraffic")) {
+    if (const auto* count = root.if_contains("fixedOpponentPlayers")) {
+      fixed_opponent_players = count->to_number<int>();
+    }
+    if (fixed_opponent_players <= 0 ||
+        static_cast<int>(policies.size()) + fixed_opponent_players !=
+            config.players) {
+      throw std::invalid_argument(
+          "fixed opponent count does not match players");
+    }
+    for (const auto& encoded_day : fixed->as_array()) {
+      std::map<int, int> traffic;
+      for (const auto& encoded_entry : encoded_day.as_array()) {
+        const auto& entry = encoded_entry.as_object();
+        const int pos = entry.at("pos").to_number<int>();
+        const int volume = entry.at("volume").to_number<int>();
+        if (pos < 0 || pos >= config.width * config.height ||
+            config.cells[pos] != Terrain::Road || volume < 0) {
+          throw std::invalid_argument("invalid fixed opponent traffic");
+        }
+        if (volume > 0) traffic[pos] += volume;
+      }
+      fixed_opponent_traffic.push_back(std::move(traffic));
+    }
+    if (fixed_opponent_traffic.size() != config.day_steps.size()) {
+      throw std::invalid_argument(
+          "fixed opponent traffic does not match days");
+    }
+  } else if (static_cast<int>(policies.size()) != config.players) {
     throw std::invalid_argument("scenario opponents do not match players");
   }
   const bool search_for_all_players =
@@ -1767,7 +1824,7 @@ EvaluationResult evaluate_scenario_impl(const json::value& scenario,
   for (int day_index = 0; day_index < static_cast<int>(config.day_steps.size());
        ++day_index) {
     const auto roads =
-        road_status_for_day(config, traffic_history, static_cast<int>(teams.size()));
+        road_status_for_day(config, traffic_history, config.players);
     for (auto& team : teams) {
       team.stock.clear();
       team.daily_types.clear();
@@ -1819,7 +1876,12 @@ EvaluationResult evaluate_scenario_impl(const json::value& scenario,
       }
     }
 
-    std::map<int, int> day_traffic;
+    std::map<int, int> opponent_day_traffic;
+    if (!fixed_opponent_traffic.empty()) {
+      opponent_day_traffic = fixed_opponent_traffic[day_index];
+    }
+    std::map<int, int> own_day_traffic;
+    std::map<int, int> day_traffic = opponent_day_traffic;
     for (std::size_t team_index = 0; team_index < teams.size(); ++team_index) {
       const int previous_servings = teams[team_index].total_servings;
       auto trial = teams[team_index];
@@ -1837,12 +1899,18 @@ EvaluationResult evaluate_scenario_impl(const json::value& scenario,
       }
       SimulationTrace trace;
       trace.capture_frames = replay_days != nullptr && team_index == 0;
+      std::map<int, int> team_day_traffic;
       auto actual_error = simulate_team_day(
-          config, teams[team_index], plans[team_index], roads, day_traffic,
+          config, teams[team_index], plans[team_index], roads, team_day_traffic,
           trace.capture_frames ? &trace : nullptr);
       if (actual_error) {
         throw std::logic_error("fallback simulation failed: " + *actual_error);
       }
+      for (const auto& [pos, volume] : team_day_traffic) {
+        day_traffic[pos] += volume;
+        if (team_index > 0) opponent_day_traffic[pos] += volume;
+      }
+      if (team_index == 0) own_day_traffic = team_day_traffic;
       teams[team_index].history.submitted_actions.push_back(plans[team_index]);
       teams[team_index].history.distinct_brands = teams[team_index].distinct_types;
       teams[team_index].cumulative_daily_types +=
@@ -1885,6 +1953,26 @@ EvaluationResult evaluate_scenario_impl(const json::value& scenario,
             {"all_team_actions", std::move(all_team_actions)}});
       }
     }
+    if (replay_days != nullptr) {
+      json::array encoded_opponent_traffic;
+      for (const auto& [pos, volume] : opponent_day_traffic) {
+        if (volume > 0) {
+          encoded_opponent_traffic.push_back(
+              json::object{{"pos", pos}, {"volume", volume}});
+        }
+      }
+      replay_days->back().as_object()["opponent_traffic"] =
+          std::move(encoded_opponent_traffic);
+      json::array encoded_own_traffic;
+      for (const auto& [pos, volume] : own_day_traffic) {
+        if (volume > 0) {
+          encoded_own_traffic.push_back(
+              json::object{{"pos", pos}, {"volume", volume}});
+        }
+      }
+      replay_days->back().as_object()["own_traffic"] =
+          std::move(encoded_own_traffic);
+    }
     traffic_history.push_back(std::move(day_traffic));
   }
 
@@ -1904,7 +1992,7 @@ EvaluationResult evaluate_scenario_impl(const json::value& scenario,
            own.cumulative_daily_types, own.total_servings},
           own.valid_days, own.invalid_days, patrol_agents, refuel_agents,
           own.refuel_events, ending_patrol_fuel, own.daily_scores, own.errors,
-          current_palns_diagnostics()};
+          current_palns_diagnostics(), current_mlns_diagnostics()};
 }
 
 }  // namespace
@@ -1913,6 +2001,7 @@ EvaluationResult evaluate_scenario(const json::value& scenario,
                                    const std::string& policy,
                                    const SearchLimits& limits) {
   reset_palns_diagnostics();
+  reset_mlns_diagnostics();
   return evaluate_scenario_impl(scenario, policy, limits, nullptr);
 }
 
@@ -1920,6 +2009,7 @@ json::value evaluate_scenario_replay(const json::value& scenario,
                                      const std::string& policy,
                                      const SearchLimits& limits) {
   reset_palns_diagnostics();
+  reset_mlns_diagnostics();
   json::array days;
   auto result = evaluate_scenario_impl(scenario, policy, limits, &days);
   auto output = to_json(result).as_object();

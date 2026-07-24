@@ -19,6 +19,7 @@
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <tuple>
 #include <type_traits>
@@ -29,6 +30,8 @@
 namespace hexudon {
 namespace {
 thread_local PalnsDiagnostics palns_diagnostics;
+thread_local MlnsDiagnostics mlns_diagnostics;
+thread_local std::vector<std::map<int, int>> mlns_predicted_traffic;
 using PalnsReturnedRank =
     std::tuple<std::tuple<int, int, int>, int>;
 thread_local std::map<ActionPlan, PalnsReturnedRank>
@@ -43,6 +46,15 @@ bool lns_dp_proposals_enabled(const SearchLimits& limits) {
   const char* enabled = std::getenv("HEXUDON_ENABLE_LNS_DP_PROPOSALS");
   return enabled != nullptr && enabled[0] != '\0' && enabled[0] != '0';
 }
+
+bool stop_bp_proposals_enabled() {
+  const char* disabled = std::getenv("HEXUDON_DISABLE_STOP_BP_PROPOSALS");
+  if (disabled != nullptr && disabled[0] != '\0' && disabled[0] != '0') {
+    return false;
+  }
+  const char* enabled = std::getenv("HEXUDON_ENABLE_STOP_BP_PROPOSALS");
+  return enabled != nullptr && enabled[0] != '\0' && enabled[0] != '0';
+}
 }
 
 void reset_palns_diagnostics() {
@@ -51,6 +63,10 @@ void reset_palns_diagnostics() {
 }
 
 PalnsDiagnostics current_palns_diagnostics() { return palns_diagnostics; }
+
+void reset_mlns_diagnostics() { mlns_diagnostics = {}; }
+
+MlnsDiagnostics current_mlns_diagnostics() { return mlns_diagnostics; }
 
 AlnsAnytimeBudget alns_anytime_budget(int total_ms, bool final_day,
                                       bool allow_continuation,
@@ -3633,6 +3649,22 @@ using MlnsWide = boost::multiprecision::uint128_t;
 
 struct MlnsRank {
   std::array<MlnsWide, 3> weighted{};
+  // Daily types and servings realized on the committed current day. Only the
+  // current day is submitted; every spot restocks each morning and later days
+  // are re-planned from the revealed state. The whole-match suffix forecast is
+  // a weak decoder that systematically under-counts an aggressive current-day
+  // plan's future coverage/servings, so ranking banks these realized values
+  // before trusting the forecast (see mlns_rank_better). Distinct types stay a
+  // discounted whole-match quantity because reaching every brand over the match
+  // genuinely needs multi-day look-ahead.
+  int current_daily{};
+  int current_servings{};
+  // Total patrol fuel carried out of the committed current day. Among plans that
+  // realize the identical current-day official triple, a larger reserve enters
+  // the next day fuller, so it needs fewer/later refuel rendezvous and wastes
+  // fewer collection steps on detours. It is a non-forecast continuation signal
+  // used only to break exact commit ties (see mlns_commit_better).
+  int current_ending_fuel{};
   std::tuple<int, int, int> projected{};
   int ending_fuel{};
   std::size_t hash{};
@@ -3669,6 +3701,93 @@ struct MlnsGenome {
   std::vector<std::optional<MlnsReplaySignature>> replay_signatures;
 };
 
+struct MlnsProfileSnapshot {
+  std::tuple<int, int, int> current{};
+  std::tuple<int, int, int> projected{};
+  int ending_fuel{};
+  std::size_t hash{};
+  ActionPlan committed_plan;
+};
+
+std::map<int, int> mlns_forecast_traffic(
+    const MapConfig& config,
+    const std::vector<std::map<int, int>>& traffic_history,
+    int day_index) {
+  if (day_index >= 0 &&
+      static_cast<std::size_t>(day_index) < mlns_predicted_traffic.size()) {
+    return mlns_predicted_traffic[static_cast<std::size_t>(day_index)];
+  }
+  return road_status_for_day(config, traffic_history, 1);
+}
+
+MlnsProfileSnapshot mlns_profile_snapshot(const MlnsSolution& solution) {
+  const auto current = solution.days.empty()
+                           ? std::tuple{0, 0, 0}
+                           : alns_official_value(
+                                 solution.days.front().evaluation.value);
+  return {current, solution.rank.projected, solution.rank.ending_fuel,
+          solution.rank.hash,
+          solution.days.empty() ? ActionPlan{} : solution.days.front().plan};
+}
+
+MlnsComponentDiagnostics& mlns_profile_component(std::string_view name) {
+  auto found = std::find_if(
+      mlns_diagnostics.components.begin(), mlns_diagnostics.components.end(),
+      [&](const MlnsComponentDiagnostics& component) {
+        return component.component == name;
+      });
+  if (found != mlns_diagnostics.components.end()) return *found;
+  mlns_diagnostics.components.push_back(
+      MlnsComponentDiagnostics{std::string(name)});
+  return mlns_diagnostics.components.back();
+}
+
+std::int64_t mlns_elapsed_microseconds(
+    std::chrono::steady_clock::time_point started) {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::steady_clock::now() - started)
+      .count();
+}
+
+bool mlns_profile_changed(const MlnsProfileSnapshot& before,
+                          const MlnsProfileSnapshot& after) {
+  return before.current != after.current ||
+         before.projected != after.projected ||
+         before.ending_fuel != after.ending_fuel || before.hash != after.hash ||
+         before.committed_plan != after.committed_plan;
+}
+
+bool mlns_profile_committed_plan_changed(const MlnsProfileSnapshot& before,
+                                         const MlnsProfileSnapshot& after) {
+  return before.committed_plan != after.committed_plan;
+}
+
+void mlns_profile_phase(std::string_view name,
+                        std::chrono::steady_clock::time_point started,
+                        const std::optional<MlnsProfileSnapshot>& before,
+                        const MlnsSolution& after) {
+  auto& component = mlns_profile_component(name);
+  ++component.calls;
+  component.elapsed_microseconds += mlns_elapsed_microseconds(started);
+  if (!before) return;
+  const auto current = mlns_profile_snapshot(after);
+  if (!mlns_profile_changed(*before, current)) return;
+  ++component.incumbent_updates;
+  const auto add_tuple_delta = [](std::array<std::int64_t, 3>& destination,
+                                  const std::tuple<int, int, int>& left,
+                                  const std::tuple<int, int, int>& right) {
+    destination[0] += std::get<0>(left) - std::get<0>(right);
+    destination[1] += std::get<1>(left) - std::get<1>(right);
+    destination[2] += std::get<2>(left) - std::get<2>(right);
+  };
+  add_tuple_delta(component.current_score_gain, current.current,
+                  before->current);
+  add_tuple_delta(component.projected_score_gain, current.projected,
+                  before->projected);
+  component.ending_patrol_fuel_gain +=
+      current.ending_fuel - before->ending_fuel;
+}
+
 MlnsWide mlns_power(int base, int exponent) {
   MlnsWide result = 1;
   for (int index = 0; index < exponent; ++index) {
@@ -3699,8 +3818,43 @@ std::string mlns_wide_string(MlnsWide value) {
   return result;
 }
 
+// MLNS commits only the current day and re-plans every later day from the
+// revealed state, but it ranks whole-match candidates. Its suffix decoder is a
+// cheap forecast that systematically under-counts an aggressive current-day
+// plan's future daily coverage and servings (on Q06 it predicted 87/127 for a
+// plan that actually realizes 91/223). Ranking therefore trusts the forecast
+// only where multi-day planning is essential and irreversible — reaching every
+// distinct brand over the match — and otherwise banks the current day's
+// realized, submitted values before consulting the forecast.
 bool mlns_rank_better(const MlnsRank& left, const MlnsRank& right) {
-  if (left.weighted != right.weighted) return left.weighted > right.weighted;
+  // 1. Predicted final distinct types (top official objective). Distinct is
+  //    permanent and match-wide, so it keeps full look-ahead: giving up a
+  //    current-day brand to reach more brands overall stays available.
+  if (std::get<0>(left.projected) != std::get<0>(right.projected)) {
+    return std::get<0>(left.projected) > std::get<0>(right.projected);
+  }
+  // 2. Among equal predicted final distinct, prefer collecting brands earlier
+  //    (weighted[0] discounts later days), which is robust to later-day traffic
+  //    and fuel uncertainty.
+  if (left.weighted[0] != right.weighted[0]) {
+    return left.weighted[0] > right.weighted[0];
+  }
+  // 3-4. Bank the committed day's realized daily types, then servings. These
+  //    reset every morning and are re-planned next day, so the reliable
+  //    submitted value outranks the weak whole-match forecast below.
+  if (left.current_daily != right.current_daily) {
+    return left.current_daily > right.current_daily;
+  }
+  if (left.current_servings != right.current_servings) {
+    return left.current_servings > right.current_servings;
+  }
+  // 5-6. Discounted whole-match daily / servings forecasts break remaining ties.
+  if (left.weighted[1] != right.weighted[1]) {
+    return left.weighted[1] > right.weighted[1];
+  }
+  if (left.weighted[2] != right.weighted[2]) {
+    return left.weighted[2] > right.weighted[2];
+  }
   if (left.projected != right.projected) {
     return left.projected > right.projected;
   }
@@ -3712,13 +3866,121 @@ bool mlns_rank_better(const MlnsRank& left, const MlnsRank& right) {
 
 bool mlns_rank_equal(const MlnsRank& left, const MlnsRank& right) {
   return left.weighted == right.weighted &&
+         left.current_daily == right.current_daily &&
+         left.current_servings == right.current_servings &&
          left.projected == right.projected &&
          left.ending_fuel == right.ending_fuel && left.hash == right.hash;
 }
 
 bool mlns_reward_better(const MlnsRank& left, const MlnsRank& right) {
-  if (left.weighted != right.weighted) return left.weighted > right.weighted;
+  if (std::get<0>(left.projected) != std::get<0>(right.projected)) {
+    return std::get<0>(left.projected) > std::get<0>(right.projected);
+  }
+  if (left.weighted[0] != right.weighted[0]) {
+    return left.weighted[0] > right.weighted[0];
+  }
+  if (left.current_daily != right.current_daily) {
+    return left.current_daily > right.current_daily;
+  }
+  if (left.current_servings != right.current_servings) {
+    return left.current_servings > right.current_servings;
+  }
+  if (left.weighted[1] != right.weighted[1]) {
+    return left.weighted[1] > right.weighted[1];
+  }
+  if (left.weighted[2] != right.weighted[2]) {
+    return left.weighted[2] > right.weighted[2];
+  }
   return left.projected > right.projected;
+}
+
+// Servings tolerance (in realized current-day servings) within which the plan
+// that is COMMITTED for the current day is chosen by the whole-match
+// continuation forecast rather than by raw realized current-day servings.
+//
+// mlns_rank_better banks the realized current-day servings before the forecast
+// (weighted[1]/weighted[2]) because that forecast systematically under-counts an
+// aggressive plan's future. That protects the submitted day but makes the
+// committed choice greedy: on coupled days it maximizes today at the cost of
+// stranding agents/fuel for tomorrow (Q06 committed day2=36 -> re-planned
+// day3=24, versus day2=35 -> day3=28, a net whole-match loss). weighted[2]
+// already contains the realized current day at full weight plus the discounted
+// suffix, so inside a small current-day gap it directly answers "does the better
+// continuation outweigh the current-day deficit?". Outside the band the realized
+// advantage is protected from the biased forecast. Tuned on the
+// brutal/steady/easy + online suite; override with HEXUDON_MLNS_COMMIT_TOLERANCE.
+constexpr int kMlnsCommitToleranceDefault = 0;
+int mlns_commit_tolerance() {
+  static const int value = [] {
+    const char* raw = std::getenv("HEXUDON_MLNS_COMMIT_TOLERANCE");
+    if (raw == nullptr) return kMlnsCommitToleranceDefault;
+    return std::max(0, std::atoi(raw));
+  }();
+  return value;
+}
+
+// Tie-break used among commit candidates whose current-day official triple is
+// within tolerance. "fuel" prefers the plan that carries more patrol fuel out
+// of the committed day before consulting the biased whole-match forecast;
+// "forecast" keeps the forecast-first order. Default set by the suite sweep;
+// override with HEXUDON_MLNS_COMMIT_MODE.
+constexpr bool kMlnsCommitPrefersFuelDefault = false;
+bool mlns_commit_prefers_fuel() {
+  static const bool value = [] {
+    const char* raw = std::getenv("HEXUDON_MLNS_COMMIT_MODE");
+    if (raw == nullptr) return kMlnsCommitPrefersFuelDefault;
+    if (std::string_view(raw) == "fuel") return true;
+    if (std::string_view(raw) == "forecast") return false;
+    throw std::invalid_argument(
+        "HEXUDON_MLNS_COMMIT_MODE must be forecast or fuel");
+  }();
+  return value;
+}
+
+// Pairwise preference for the plan to commit this day. Only ever used to update
+// the returned incumbent `best` (never inside a std::sort), so the bounded
+// current-day tolerance need not be transitive. Distinct/daily coverage remains
+// fully protected: the primary objectives are compared before servings.
+bool mlns_commit_better(const MlnsRank& left, const MlnsRank& right) {
+  if (std::get<0>(left.projected) != std::get<0>(right.projected)) {
+    return std::get<0>(left.projected) > std::get<0>(right.projected);
+  }
+  if (left.weighted[0] != right.weighted[0]) {
+    return left.weighted[0] > right.weighted[0];
+  }
+  if (left.current_daily != right.current_daily) {
+    return left.current_daily > right.current_daily;
+  }
+  const int tolerance = mlns_commit_tolerance();
+  const long long gap = static_cast<long long>(left.current_servings) -
+                        static_cast<long long>(right.current_servings);
+  if (gap > tolerance) return true;
+  if (gap < -tolerance) return false;
+  // Current-day servings are within tolerance. Optionally prefer the larger
+  // carried-out fuel reserve (a non-forecast continuation signal) before the
+  // biased whole-match forecast.
+  if (mlns_commit_prefers_fuel() &&
+      left.current_ending_fuel != right.current_ending_fuel) {
+    return left.current_ending_fuel > right.current_ending_fuel;
+  }
+  // Otherwise let the discounted whole-match forecast (which includes today at
+  // full weight) pick the better continuation.
+  if (left.weighted[1] != right.weighted[1]) {
+    return left.weighted[1] > right.weighted[1];
+  }
+  if (left.weighted[2] != right.weighted[2]) {
+    return left.weighted[2] > right.weighted[2];
+  }
+  if (left.current_servings != right.current_servings) {
+    return left.current_servings > right.current_servings;
+  }
+  if (left.projected != right.projected) {
+    return left.projected > right.projected;
+  }
+  if (left.ending_fuel != right.ending_fuel) {
+    return left.ending_fuel > right.ending_fuel;
+  }
+  return left.hash < right.hash;
 }
 
 std::string mlns_config_fingerprint(const MapConfig& config) {
@@ -3971,6 +4233,14 @@ MlnsRank mlns_build_rank(const MapConfig& config,
     }
   }
   if (!days.empty()) {
+    result.current_daily = days.front().reward[1];
+    result.current_servings = days.front().reward[2];
+    for (std::size_t agent = 0; agent < types.size(); ++agent) {
+      if (types[agent] == AgentKind::Patrol) {
+        result.current_ending_fuel +=
+            days.front().evaluation.ending_fuel[agent];
+      }
+    }
     const auto& tail = days.back();
     result.projected = {
         static_cast<int>(tail.history_after.distinct_brands.size()),
@@ -4046,7 +4316,7 @@ std::optional<MlnsSolution> mlns_evaluate(
       // Future opponent actions are unavailable. Treat our candidate traffic
       // as representative of every team, matching the existing symmetric
       // online surrogate while keeping today's server traffic authoritative.
-      info.traffics = road_status_for_day(config, traffic_history, 1);
+      info.traffics = mlns_forecast_traffic(config, traffic_history, info.day);
     }
 
     ActionPlan plan;
@@ -4255,7 +4525,7 @@ std::optional<MlnsSolution> mlns_beam_seed(
               {types[agent], previous.evaluation.ending_positions[agent],
                previous.evaluation.ending_fuel[agent]});
         }
-        info.traffics = road_status_for_day(config, traffic_history, 1);
+        info.traffics = mlns_forecast_traffic(config, traffic_history, info.day);
       }
 
       std::vector<ActionPlan> plans;
@@ -4452,11 +4722,30 @@ PlannerResult build_mlns_plan(
     const SearchLimits& limits, const json::value* planner_state,
     const ImprovementSink* on_improve) {
   const auto started = std::chrono::steady_clock::now();
+  ++mlns_diagnostics.planner_calls;
+  mlns_predicted_traffic = limits.use_traffic_gnn
+                               ? limits.predicted_traffic
+                               : std::vector<std::map<int, int>>{};
   const bool timed = limits.time_limit_ms >= 0;
   // A small explicit iteration cap is a reproducible search mode, not an
   // anytime request. Keep its richer whole-match neighborhoods while still
   // enforcing the wall deadline as a safety backstop.
   const bool anytime_search = timed && limits.max_iterations > 256;
+  enum class NeighborhoodMode { Current, Refined, Disabled };
+  const auto neighborhood_mode = [] {
+    const char* value = std::getenv("HEXUDON_MLNS_NEIGHBORHOOD_MODE");
+    if (value == nullptr || std::string_view(value) == "current") {
+      return NeighborhoodMode::Current;
+    }
+    if (std::string_view(value) == "refined") {
+      return NeighborhoodMode::Refined;
+    }
+    if (std::string_view(value) == "disabled") {
+      return NeighborhoodMode::Disabled;
+    }
+    throw std::invalid_argument(
+        "HEXUDON_MLNS_NEIGHBORHOOD_MODE must be current, refined, or disabled");
+  }();
   const auto deadline =
       started + std::chrono::milliseconds(std::max(0, limits.time_limit_ms));
   auto expired = [&] {
@@ -4468,6 +4757,7 @@ PlannerResult build_mlns_plan(
       config.day_steps.size() - static_cast<std::size_t>(day.day);
   std::vector<LnsSkeleton> empty(remaining_days);
   for (auto& skeleton : empty) skeleton.routes.resize(types.size());
+  const auto cold_started = std::chrono::steady_clock::now();
   auto cold = mlns_evaluate(config, day, history, types, std::move(empty),
                             limits.future_discount_percent, nullptr, 0,
                             /*coordinated_seed=*/true);
@@ -4475,6 +4765,17 @@ PlannerResult build_mlns_plan(
     throw std::logic_error("MLNS failed to construct a valid cold seed");
   }
   MlnsSolution best = *cold;
+  mlns_profile_phase("cold_seed", cold_started, std::nullopt, best);
+  std::string winning_component = "cold_seed";
+  auto record_phase = [&](std::string_view name,
+                          const MlnsProfileSnapshot& before,
+                          std::chrono::steady_clock::time_point phase_started) {
+    const auto after = mlns_profile_snapshot(best);
+    mlns_profile_phase(name, phase_started, before, best);
+    if (mlns_profile_committed_plan_changed(before, after)) {
+      winning_component = name;
+    }
+  };
   // A timed Web search still needs a credible multi-day root.  Disabling the
   // strong suffix completely made the production path start from an ACO-only
   // continuation even when tens of seconds were available; the New Question
@@ -4518,7 +4819,7 @@ PlannerResult build_mlns_plan(
           std::tuple{std::get<0>(best_current), std::get<1>(best_current)};
       if (candidate_coverage > best_coverage ||
           (candidate_coverage == best_coverage &&
-           mlns_rank_better(candidate->rank, best.rank))) {
+           mlns_commit_better(candidate->rank, best.rank))) {
         best = std::move(*candidate);
       }
     }
@@ -4529,6 +4830,8 @@ PlannerResult build_mlns_plan(
   if (use_dp_proposals && anytime_search &&
       remaining_days > 2 &&
       limits.time_limit_ms >= 1000 && !expired()) {
+    const auto profile_before = mlns_profile_snapshot(best);
+    const auto profile_started = std::chrono::steady_clock::now();
     const auto floor_deadline =
         started + std::chrono::milliseconds(
                       std::max(1, limits.time_limit_ms * 60 / 100));
@@ -4538,15 +4841,24 @@ PlannerResult build_mlns_plan(
     current_limits.min_iterations = 0;
     current_limits.max_iterations = std::max(1, limits.max_iterations);
     current_limits.stagnation_iterations = 0;
-    current_limits.alns_restarts = 2;
+    current_limits.alns_restarts = 3;
     // This is the protected baseline chain. Its budget must remain comparable
     // to ordinary ALNS; DP proposals are evaluated separately by MLNS below.
     current_limits.use_lns_dp_proposals = false;
+    // Do not spend the floor's slice on its own continuation look-ahead: MLNS
+    // already searches the whole match around this seed, so an internal
+    // continuation phase is redundant and (via alns_anytime_budget's 50/50
+    // split) halves the floor's current-day search. On coverage-saturated maps
+    // that lost servings the whole-match machinery cannot recover, because the
+    // floor is the only component that optimizes the committed day's servings.
+    // Running it current-day-only lifts its effective budget from ~25% to ~50%
+    // of the request, matching standalone ALNS's current-day effort.
     auto current_seed = build_alns_plan(
         config, day, history, types, current_limits,
-        kProductionAlnsFeatures, /*allow_continuation=*/true);
+        kProductionAlnsFeatures, /*allow_continuation=*/false);
     consider_root_seed(current_seed,
         /*strong_suffix=*/false, floor_deadline);
+    record_phase("protected_alns_floor", profile_before, profile_started);
   }
   // Near the end of the match there is no value in spending the complete
   // deadline rediscovering mature single-day routing moves through the generic
@@ -4556,6 +4868,8 @@ PlannerResult build_mlns_plan(
   // remainder stays available for coupled state search.
   if (!expired() && timed && remaining_days <= 2 &&
       limits.time_limit_ms >= 1000) {
+    const auto profile_before = mlns_profile_snapshot(best);
+    const auto profile_started = std::chrono::steady_clock::now();
     SearchLimits route_limits = limits;
     const int route_percent = remaining_days == 1 ? 90 : 50;
     route_limits.time_limit_ms =
@@ -4570,18 +4884,66 @@ PlannerResult build_mlns_plan(
         config, day, history, types, route_limits, kProductionAlnsFeatures,
         /*allow_continuation=*/remaining_days > 1);
     consider_root_seed(route_seed, /*strong_suffix=*/remaining_days > 1);
+    record_phase("route_alns_seed", profile_before, profile_started);
   }
   // Tight-fuel maps need an explicit mobile-refuel construction. Evaluate it
   // as another complete match root rather than embedding refuel-specific
   // surrogate rewards in the MLNS objective.
   if (!expired() && config.players == 1) {
+    const auto profile_before = mlns_profile_snapshot(best);
+    const auto profile_started = std::chrono::steady_clock::now();
     consider_root_seed(build_escort_plan(config, day, history, types));
+    record_phase("escort_seed", profile_before, profile_started);
+  }
+  // STOP branch-and-price is valid on the paper-compatible regime where each
+  // unit-stock spot is its own brand cluster. Use it only as a bounded root
+  // proposal: MLNS remains responsible for replaying the complete suffix and
+  // may reject a locally stronger route when its continuation is worse.
+  if (stop_bp_proposals_enabled() && !expired() &&
+      (!timed || limits.time_limit_ms >= 1000)) {
+    std::set<int> stop_brands;
+    for (const auto& spot : config.spots) stop_brands.insert(spot.brand);
+    const bool stop_compatible =
+        !config.spots.empty() && config.spots.size() <= 20 &&
+        stop_brands.size() == config.spots.size() &&
+        std::all_of(config.spots.begin(), config.spots.end(),
+                    [](const Spot& spot) { return spot.stocks == 1; });
+    if (stop_compatible) {
+      const auto profile_before = mlns_profile_snapshot(best);
+      const auto profile_started = std::chrono::steady_clock::now();
+      SearchLimits bp_limits = limits;
+      if (timed) {
+        const int remaining_ms = std::max(
+            0, static_cast<int>(std::chrono::duration_cast<
+                                    std::chrono::milliseconds>(
+                                    deadline -
+                                    std::chrono::steady_clock::now())
+                                    .count()));
+        bp_limits.time_limit_ms =
+            std::min(remaining_ms,
+                     std::max(100, limits.time_limit_ms / 10));
+      }
+      bp_limits.exact_nodes =
+          limits.exact_nodes > 0 ? limits.exact_nodes : 50;
+      if ((!timed || bp_limits.time_limit_ms >= 100) &&
+          !best.days.empty()) {
+        if (auto proposal = build_stop_bp_proposal(
+                config, day, history, types, best.days.front().plan,
+                bp_limits, /*allow_official_tie=*/true)) {
+          consider_root_seed(*proposal,
+                             /*strong_suffix=*/remaining_days <= 2);
+        }
+      }
+      record_phase("stop_bp_seed", profile_before, profile_started);
+    }
   }
   // Add one DP request-bank route as another whole-match root. MLNS still
   // replays it through its suffix decoder, so it cannot bypass continuation
   // state validation.
   if (use_dp_proposals && !expired() &&
       (!timed || limits.time_limit_ms >= 1000)) {
+    const auto profile_before = mlns_profile_snapshot(best);
+    const auto profile_started = std::chrono::steady_clock::now();
     SearchLimits dp_limits = limits;
     if (anytime_search) {
       const int remaining_ms = std::max(
@@ -4605,6 +4967,7 @@ PlannerResult build_mlns_plan(
       if (expired()) break;
       consider_root_seed(proposal.plan, /*strong_suffix=*/remaining_days <= 2);
     }
+    record_phase("dp_seed", profile_before, profile_started);
   }
   // One ACO+LS construction gives the rolling match search a competitive root
   // and initializes its suffix without nesting another optimizer inside every
@@ -4612,6 +4975,8 @@ PlannerResult build_mlns_plan(
   // all-pairs preprocessing would consume the entire response window.
   if (!expired() && limits.use_aco_seed &&
       (!timed || limits.time_limit_ms >= 1000)) {
+    const auto profile_before = mlns_profile_snapshot(best);
+    const auto profile_started = std::chrono::steady_clock::now();
     SearchLimits seed_limits;
     seed_limits.aco_evaporation = limits.aco_evaporation;
     if (anytime_search) {
@@ -4656,15 +5021,15 @@ PlannerResult build_mlns_plan(
                           /*allow_continuation=*/false),
           /*strong_suffix=*/true);
     }
+    record_phase("aco_seed", profile_before, profile_started);
   }
   // Untimed evaluation keeps its proven ALNS-backed beam.  Timed Web search
   // uses inexpensive constructive proposals over a long horizon, then enables
   // the stronger ALNS-backed expansion for the tightly coupled final days.
   if (!expired() && ((!timed && strong_suffix_iterations > 0) ||
                      (timed && limits.time_limit_ms >= 5000))) {
-    // Across a long timed horizon use the inexpensive constructive proposals
-    // only.  The beam still carries alternative positions/fuel/traffic through
-    // every remaining day, while avoiding a nested ALNS run at every node.
+    const auto profile_before = mlns_profile_snapshot(best);
+    const auto profile_started = std::chrono::steady_clock::now();
     const int beam_alns_iterations =
         anytime_search && remaining_days > 3
             ? 0
@@ -4674,12 +5039,15 @@ PlannerResult build_mlns_plan(
             beam_alns_iterations,
             /*use_elite_pool=*/anytime_search,
             anytime_search ? evaluation_deadline : std::nullopt);
-        beam_seed && mlns_rank_better(beam_seed->rank, best.rank) &&
+        beam_seed && mlns_commit_better(beam_seed->rank, best.rank) &&
         (!anytime_search || mlns_reward_better(beam_seed->rank, best.rank))) {
       best = std::move(*beam_seed);
     }
+    record_phase("beam_seed", profile_before, profile_started);
   }
   if (!expired()) {
+    const auto profile_before = mlns_profile_snapshot(best);
+    const auto profile_started = std::chrono::steady_clock::now();
     if (auto warm_skeletons =
             mlns_parse_state(config, day, history, types, planner_state)) {
       if (auto warm = mlns_evaluate(
@@ -4700,11 +5068,12 @@ PlannerResult build_mlns_plan(
         const bool trusted_warm =
             config.players == 1 || warm_coverage >= fresh_coverage;
         if (trusted_warm &&
-            mlns_rank_better(warm->rank, best.rank)) {
+            mlns_commit_better(warm->rank, best.rank)) {
           best = std::move(*warm);
         }
       }
     }
+    record_phase("warm_start", profile_before, profile_started);
   }
   MlnsSolution current = best;
   auto emit = [&] {
@@ -4748,8 +5117,25 @@ PlannerResult build_mlns_plan(
   int stagnation = 0;
   const int maximum = std::max(0, limits.max_iterations);
   const int minimum = std::min(limits.min_iterations, maximum);
+  const auto neighborhood_before = mlns_profile_snapshot(best);
+  const auto neighborhood_started = std::chrono::steady_clock::now();
+  // The production profiler found that the generic neighborhood consumed over
+  // one third of MLNS wall time while changing only one incumbent in ten. The
+  // refined mode keeps a short exploitation tail for the useful coupled moves
+  // but no longer lets it consume every millisecond left by stronger seeds.
+  const auto refined_neighborhood_deadline =
+      timed ? std::min(deadline,
+                       neighborhood_started + std::chrono::milliseconds(
+                           std::max(250, limits.time_limit_ms * 15 / 100)))
+            : std::chrono::steady_clock::time_point::max();
+  auto neighborhood_expired = [&] {
+    if (neighborhood_mode == NeighborhoodMode::Disabled) return true;
+    if (expired()) return true;
+    return neighborhood_mode == NeighborhoodMode::Refined && timed &&
+           std::chrono::steady_clock::now() >= refined_neighborhood_deadline;
+  };
   for (int iteration = 0; iteration < maximum; ++iteration) {
-    if (expired()) break;
+    if (neighborhood_expired()) break;
     std::size_t pivot = 0;
     if (iteration > 0) {
       std::uint64_t draw = pivot_total == 0 ? 0 : random() % pivot_total;
@@ -4764,7 +5150,9 @@ PlannerResult build_mlns_plan(
       // predecessor, where a changed ending position can still repair that
       // deficit.  A path that already serves all stock keeps the ordinary
       // discounted distribution.
-      if (anytime_search && random() % 100U < 50U) {
+      const unsigned deficiency_focus =
+          neighborhood_mode == NeighborhoodMode::Refined ? 80U : 50U;
+      if (anytime_search && random() % 100U < deficiency_focus) {
         auto deficient = std::find_if(
             current.days.begin(), current.days.end(),
             [&](const MlnsDaySolution& item) {
@@ -4790,7 +5178,10 @@ PlannerResult build_mlns_plan(
     // state-coupled across day boundaries, so a single-day mutation cannot
     // discover many useful whole-match transitions.
     const std::size_t available_span = current.days.size() - pivot;
-    const unsigned coupled_percent = anytime_search ? 20U : 35U;
+    const unsigned coupled_percent =
+        neighborhood_mode == NeighborhoodMode::Refined
+            ? 30U
+            : (anytime_search ? 20U : 35U);
     const std::size_t span =
         available_span <= 1 || random() % 100U >= coupled_percent
             ? 1U
@@ -4855,7 +5246,9 @@ PlannerResult build_mlns_plan(
       // suffix against the newly produced positions, fuel, and traffic; using
       // the old ActionPlans here turns a whole-match neighbor back into a
       // single-day search with stale future routes.
-      const bool rebuild_suffix = span > 1 || iteration % 16 == 0;
+      const bool rebuild_suffix =
+          span > 1 || (neighborhood_mode == NeighborhoodMode::Current &&
+                       iteration % 16 == 0);
       candidate = mlns_evaluate(
           config, day, history, types, std::move(replay_skeletons),
           limits.future_discount_percent, &current, pivot, false, nullptr,
@@ -4886,12 +5279,25 @@ PlannerResult build_mlns_plan(
         trusted_transition &&
         (mlns_rank_better(candidate->rank, current.rank) ||
          mlns_rank_equal(candidate->rank, current.rank));
-    bool accepted = improves_current;
+    // In refined mode, forecast/fuel-only replacements are not reliable enough
+    // to justify changing the live trajectory when the mutation touches today.
+    // A future-only pivot preserves today's plan exactly, however, so it may
+    // still improve the serialized continuation without risking the submitted
+    // action. Requiring a current-day gain for pivot > 0 rejects every such
+    // candidate by construction and silently turns MLNS into daily-only LNS.
+    const bool refined_transition_gain =
+        pivot > 0 ? mlns_rank_better(candidate->rank, current.rank)
+                  : candidate_current > incumbent_current;
+    bool accepted =
+        neighborhood_mode == NeighborhoodMode::Refined
+            ? trusted_transition && refined_transition_gain
+            : improves_current;
     const long double current_scalar =
         mlns_rank_scalar(config, current.rank, weights);
     const long double candidate_scalar =
         mlns_rank_scalar(config, candidate->rank, weights);
-    if (!accepted && candidate_scalar < current_scalar) {
+    if (neighborhood_mode == NeighborhoodMode::Current && !accepted &&
+        candidate_scalar < current_scalar) {
       const long double loss = current_scalar - candidate_scalar;
       if (observed_losses.size() < 12U) observed_losses.push_back(loss);
       long double probability = 0.05L;
@@ -4928,8 +5334,13 @@ PlannerResult build_mlns_plan(
                               candidate_coverage >= best_coverage;
     const bool preserves_protected_current =
         candidate_coverage >= best_coverage;
+    const bool refined_best_gain =
+        pivot > 0 ? mlns_rank_better(candidate->rank, best.rank)
+                  : candidate_current > best_current;
     if (trusted_best && preserves_protected_current &&
-        mlns_rank_better(candidate->rank, best.rank)) {
+        mlns_commit_better(candidate->rank, best.rank) &&
+        (neighborhood_mode != NeighborhoodMode::Refined ||
+         refined_best_gain)) {
       best = *candidate;
       stagnation = 0;
       emit();
@@ -4937,13 +5348,24 @@ PlannerResult build_mlns_plan(
       ++stagnation;
     }
     if (accepted) current = std::move(*candidate);
+    if (neighborhood_mode == NeighborhoodMode::Refined && stagnation >= 64 &&
+        iteration + 1 >= std::min(32, minimum)) {
+      break;
+    }
     if (iteration + 1 >= minimum && limits.stagnation_iterations > 0 &&
         stagnation >= limits.stagnation_iterations) {
       break;
     }
   }
-  return {best.days.front().plan,
-          mlns_serialize_state(config, day, types, best)};
+  record_phase("neighborhood_search", neighborhood_before,
+               neighborhood_started);
+  const auto state_started = std::chrono::steady_clock::now();
+  auto serialized_state = mlns_serialize_state(config, day, types, best);
+  mlns_profile_phase("state_serialization", state_started,
+                     mlns_profile_snapshot(best), best);
+  ++mlns_profile_component(winning_component).final_selections;
+  mlns_diagnostics.elapsed_microseconds += mlns_elapsed_microseconds(started);
+  return {best.days.front().plan, std::move(serialized_state)};
 }
 
 LnsSkeleton build_rollout_skeleton(const MapConfig& config,

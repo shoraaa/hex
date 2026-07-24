@@ -121,7 +121,6 @@ DpRank rank_decoded(const MapConfig &config, const DayInfo &day,
                     const RoadFilter &filter, int discount_percent,
                     const std::map<int, int> &previous_dwell);
 int remaining_days(const MapConfig &config, int day);
-std::vector<int> endpoint_positions(const DpDecode &decoded);
 bool same_route_shape(const DpSolution &left, const DpSolution &right);
 
 auto rank_quality(const DpRank &rank) {
@@ -892,17 +891,23 @@ void destroy_dp(const DpSearchContext &context, DpSolution &solution, int mode,
                                AgentKind::Patrol));
 }
 
-DpSolution repair_dp(const DpSearchContext &context, DpSolution solution,
-                     int mode, int iteration_cap = -1) {
+DpSolution repair_dp(
+    const DpSearchContext &context, DpSolution solution, int mode,
+    int iteration_cap = -1,
+    const std::optional<std::chrono::steady_clock::time_point> &deadline =
+        std::nullopt) {
   canonicalize_bank(solution, context.config,
                     std::count(context.types.begin(), context.types.end(),
                                AgentKind::Patrol));
+  const auto expired = [&] {
+    return deadline && std::chrono::steady_clock::now() >= *deadline;
+  };
   int moves = 0;
   const int effective_cap =
       iteration_cap < 0
           ? std::min<int>(32, static_cast<int>(solution.bank.size()))
           : iteration_cap;
-  while (!solution.bank.empty() && moves < effective_cap) {
+  while (!solution.bank.empty() && moves < effective_cap && !expired()) {
     struct Option {
       DpRequest request;
       std::size_t agent{};
@@ -920,13 +925,19 @@ DpSolution repair_dp(const DpSearchContext &context, DpSolution solution,
     };
     std::vector<Option> options;
     for (const auto &request : solution.bank) {
+      if (expired())
+        break;
       std::vector<Option> placements;
       for (std::size_t agent = 0; agent < context.types.size(); ++agent) {
+        if (expired())
+          break;
         if (context.types[agent] != AgentKind::Patrol ||
             same_spot_in_route(solution.routes[agent], request.spot))
           continue;
         for (std::size_t position = 0;
              position <= solution.routes[agent].requests.size(); ++position) {
+          if (expired())
+            break;
           const int delta = insertion_delta(context.config, context.day,
                                             solution.routes[agent], agent,
                                             position, request.spot);
@@ -956,7 +967,7 @@ DpSolution repair_dp(const DpSearchContext &context, DpSolution solution,
                          : best.regret2;
       options.push_back(best);
     }
-    if (options.empty())
+    if (expired() || options.empty())
       break;
     std::sort(options.begin(), options.end(),
               [&](const Option &left, const Option &right) {
@@ -975,6 +986,8 @@ DpSolution repair_dp(const DpSearchContext &context, DpSolution solution,
     const std::size_t exact_limit = std::min<std::size_t>(options.size(), 8);
     for (std::size_t index = 0;
          index < options.size() && candidates.size() < exact_limit; ++index) {
+      if (expired())
+        break;
       const auto &option = options[index];
       auto inserted = insert_and_decode(context, solution, option.request,
                                         option.agent, option.position);
@@ -1032,25 +1045,51 @@ int weighted_choice(const std::vector<double> &weights,
   return static_cast<int>(weights.size() - 1);
 }
 
-bool diverse_item(const SearchItem &candidate,
-                  const std::vector<SearchItem> &elite) {
-  const auto candidate_ends = endpoint_positions(candidate.decoded);
-  for (const auto &item : elite) {
-    if (same_route_shape(candidate.solution, item.solution))
-      return false;
-    if (!candidate_ends.empty() &&
-        candidate_ends == endpoint_positions(item.decoded) &&
-        candidate.rank.banked_match == item.rank.banked_match) {
-      return false;
-    }
+std::set<int> collected_brands(const MapConfig &config,
+                               const SearchItem &item) {
+  std::set<int> result;
+  if (!item.decoded.evaluation)
+    return result;
+  for (const auto &acquisition : item.decoded.evaluation->trace.acquisitions) {
+    if (const Spot *spot = spot_at(config, acquisition.spot_pos))
+      result.insert(spot->brand);
   }
-  return true;
+  return result;
 }
 
-void insert_elite(SearchItem item, std::vector<SearchItem> &elite,
+bool same_elite_state(const MapConfig &config, const SearchItem &left,
+                      const SearchItem &right) {
+  if (same_route_shape(left.solution, right.solution))
+    return true;
+  if (!left.decoded.evaluation || !right.decoded.evaluation)
+    return false;
+  const auto &left_evaluation = *left.decoded.evaluation;
+  const auto &right_evaluation = *right.decoded.evaluation;
+  return left_evaluation.ending_positions == right_evaluation.ending_positions &&
+         left_evaluation.ending_fuel == right_evaluation.ending_fuel &&
+         left_evaluation.road_traffic == right_evaluation.road_traffic &&
+         collected_brands(config, left) == collected_brands(config, right) &&
+         left.rank.daily == right.rank.daily &&
+         left.rank.servings == right.rank.servings;
+}
+
+void insert_elite(const MapConfig &config, SearchItem item,
+                  std::vector<SearchItem> &elite,
                   std::size_t limit = 12) {
-  if (!diverse_item(item, elite))
+  auto duplicate = std::find_if(
+      elite.begin(), elite.end(),
+      [&](const SearchItem &existing) {
+        return same_elite_state(config, item, existing);
+      });
+  if (duplicate != elite.end()) {
+    if (better_rank(item.rank, duplicate->rank))
+      *duplicate = std::move(item);
+    std::sort(elite.begin(), elite.end(),
+              [](const SearchItem &left, const SearchItem &right) {
+                return better_rank(left.rank, right.rank);
+              });
     return;
+  }
   elite.push_back(std::move(item));
   std::sort(elite.begin(), elite.end(),
             [](const SearchItem &left, const SearchItem &right) {
@@ -1126,7 +1165,7 @@ SearchOutcome search_current_day(
   outcome.best = seeds.front();
   SearchItem current = seeds.front();
   for (auto &seed : seeds)
-    insert_elite(seed, outcome.elite);
+    insert_elite(context.config, seed, outcome.elite);
 
   auto emit = [&](const SearchItem &item) {
     if (!on_improve || !item.decoded.evaluation)
@@ -1178,8 +1217,8 @@ SearchOutcome search_current_day(
                            static_cast<std::uint64_t>(maximum - minimum + 1));
       destroy_dp(context, candidate_solution, destroy, remove, current.decoded);
     }
-    candidate_solution =
-        repair_dp(context, std::move(candidate_solution), repair);
+    candidate_solution = repair_dp(context, std::move(candidate_solution),
+                                   repair, -1, deadline);
     DpDecode decoded =
         normalize_and_decode(context.config, context.day, context.history,
                              context.types, candidate_solution);
@@ -1222,7 +1261,7 @@ SearchOutcome search_current_day(
         repair_weights[repair] += 2.0;
       }
     }
-    insert_elite(candidate, outcome.elite);
+    insert_elite(context.config, candidate, outcome.elite);
     if (accepted)
       current = std::move(candidate);
     if ((iteration + 1) % 32 == 0) {
@@ -1300,7 +1339,8 @@ RecourseValue solve_recourse(
                  std::max(1, static_cast<int>(visits.size() / 5)),
                  best.decoded);
     }
-    candidate = repair_dp(context, std::move(candidate), iteration % 4, 4);
+    candidate = repair_dp(context, std::move(candidate), iteration % 4, 4,
+                          deadline);
     auto evaluated =
         normalize_and_decode(config, future, history, types, candidate);
     if (!evaluated.valid)
@@ -1559,13 +1599,6 @@ DpRank rank_decoded(const MapConfig &config, const DayInfo &day,
   rank.hygiene = -repeated;
   rank.hash = solution_hash(DpSolution{});
   return rank;
-}
-
-std::vector<int> endpoint_positions(const DpDecode &decoded) {
-  std::vector<int> result;
-  if (!decoded.evaluation)
-    return result;
-  return decoded.evaluation->ending_positions;
 }
 
 bool same_route_shape(const DpSolution &left, const DpSolution &right) {
@@ -2518,8 +2551,8 @@ PlannerResult build_lns_dp_plan(const MapConfig &config, const DayInfo &day,
                    std::max(1, static_cast<int>(visits.size() / 5)),
                    current.decoded);
       }
-      candidate_solution =
-          repair_dp(context, std::move(candidate_solution), iteration % 4, 4);
+      candidate_solution = repair_dp(context, std::move(candidate_solution),
+                                     iteration % 4, 4, total_deadline);
       DpDecode decoded =
           normalize_and_decode(config, day, history, types, candidate_solution);
       if (!decoded.valid)

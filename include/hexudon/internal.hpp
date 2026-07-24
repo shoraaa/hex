@@ -327,11 +327,18 @@ PlannerResult build_lns_dp_plan(
 
 void reset_palns_diagnostics();
 PalnsDiagnostics current_palns_diagnostics();
+void reset_mlns_diagnostics();
+MlnsDiagnostics current_mlns_diagnostics();
 
 ActionPlan build_stop_bp_plan(const MapConfig& config, const DayInfo& day,
                               const PolicyHistory& history,
                               const AgentTypes& types,
                               const SearchLimits& limits);
+std::optional<ActionPlan> build_stop_bp_proposal(
+    const MapConfig& config, const DayInfo& day,
+    const PolicyHistory& history, const AgentTypes& types,
+    const ActionPlan& incumbent, const SearchLimits& limits,
+    bool allow_official_tie = false);
 
 // Parallel helpers (templates, so defined inline here).
 template <class Function>

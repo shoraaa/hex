@@ -60,6 +60,14 @@ that grades every tier at once; each case records its verified percentages under
 `verification`. Pass `--tiers brutal,steady` to build a subset or `--no-verify`
 for a fast constructive-only draft.
 
+Every brutal/steady/easy case runs one deterministic 32-iteration `lns`
+trajectory offline and caches seven copies of its road occupancy. During
+grading, only the candidate is simulated; its occupancy is added to the cached
+seven-player field and divided by eight to derive the next day's traffic with
+the official rolling rule. This intentionally approximates eight-player play:
+the seven opponents share one trajectory and do not react when the candidate
+changes the traffic field.
+
 To tune ALNS locally, evaluate a deterministic grid of explicit ALNS iteration
 budgets on the same manifest:
 
@@ -143,7 +151,8 @@ uv run --no-sync hexbench generate-validation \
 This writes `hard`, `medium`, and `easy` manifests with 32 deterministic cases
 each, mapped to the existing curated recipes as `brutal`, `steady`, and `easy`.
 Cases are selected by seed position, never by the current ALNS score, so the
-suite does not inherit the component behavior it is meant to test.
+suite does not inherit the component behavior it is meant to test. These cases
+use the same cached seven-LNS background traffic as the curated hard suite.
 
 Local grading is based on average normalized performance, not a requirement
 to beat every case. For each case, the structural optimum is all brands, all
@@ -368,6 +377,22 @@ nodes only. The report directory receives `report.json` with per-epoch metrics
 and `model.pt` with the best-validation checkpoint, dataset digest, and feature schema.
 Use `--device cpu` for a CPU-only run or leave `auto` to use an available GPU.
 
+MLNS can consume this model instead of its symmetric self-traffic suffix
+surrogate. Enable **Use GNN traffic prediction** in the Web planner, or pass
+`use_traffic_gnn: true` in the MLNS hyperparameters. Only unrevealed suffix
+days use model output; the current day's server road status and official
+evaluation remain authoritative. The bundled
+`reports/traffic-1k-test/model.pt` checkpoint is used by default. Set
+`HEXUDON_TRAFFIC_GNN_CHECKPOINT` to pick an explicit checkpoint instead.
+Compare the option on the 96-case and saved-online gates with:
+
+```sh
+uv run --no-sync --with tqdm python scripts/benchmark_mlns_gnn.py \
+  --time-limit-ms 1000 \
+  --checkpoint reports/traffic-1k-test/model.pt \
+  --report reports/mlns-gnn-1s
+```
+
 PyTorch is intentionally resolved from the normal Python package index rather than
 being pinned to an AMD ROCm wheel. On Linux this provides the standard CUDA-enabled
 PyTorch build; on other platforms uv selects the compatible published wheel. If an
@@ -587,6 +612,34 @@ a hard gate and runtime only breaks an exact quality tie. `state.json` is
 checkpointed after every case and the same command resumes it. Use `--no-resume`
 to start over. The final directory contains `report.json`, `report.md`, and a
 Web-UI-ready `best-search.json` that omits total iterations.
+
+Profile the production MLNS pipeline with LNS-DP proposals enabled on 16
+brutal, 16 steady, and 16 easy cases plus all seven saved online-practice
+cases (Q01-Q06 and New Question):
+
+```sh
+uv run --no-sync hexbench mlns-profile \
+  --time-limit-ms 30000 \
+  --jobs 1 \
+  --core-threads 16 \
+  --report reports/mlns-profile-30s-real
+```
+
+`report.md` and `report.json` break total MLNS wall time into non-overlapping
+top-level components. For every component they record calls, incumbent-changing
+calls, final-plan selections, authoritative current-day score gain, predicted
+final-match score gain, and ending-fuel tie-break gain. Gain is attributed at
+the production phase boundary and is therefore observational; use it to select
+suspects, then confirm removals with an explicit ablation. The online fixtures
+are saved locally, so profiling does not require a live token. Use
+`--max-cases 1` for a four-case smoke run. Progress is flushed to stderr after
+every completed case, with a heartbeat, elapsed time, and ETA every 10 seconds
+while workers are busy. Change that cadence with `--log-interval SECONDS`, or
+use `--quiet-progress` for a machine-silent run. The per-case process watchdog
+automatically scales with the number of days and the per-day budget, so a
+multi-day 30-second deployment simulation is not killed by the 120-second
+minimum. Every completed case is atomically saved to `progress.json`; rerunning
+the same command resumes it. Use `--no-resume` to discard compatible progress.
 
 Tune the fixed projection depth and restart count, then report the public total
 iteration curve on the 96-case brutal/steady/easy validation suite with:

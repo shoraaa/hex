@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "suite": "mlns-profile-brutal-16",
+  "source_tier": "brutal",
+  "cases": [
+    {
+      "path": "../../alns-validation/hard/case-0000.json",
+      "name": "brutal-0000"
+    },
+    {
+      "path": "../../alns-validation/hard/case-0001.json",
+      "name": "brutal-0001"
+    },
+    {
+      "path": "../../alns-validation/hard/case-0002.json",
+      "name": "brutal-0002"
+    },
+    {
+      "path": "../../alns-validation/hard/case-0003.json",
+      "name": "brutal-0003"
+    },
+    {
+      "path": "../../alns-validation/hard/case-0004.json",
+      "name": "brutal-0004"
+    },
+    {
+      "path": "../../alns-validation/hard/case-0005.json",
+      "name": "brutal-0005"
+    },
+    {
+      "path": "../../alns-validation/hard/case-0006.json",
+      "name": "brutal-0006"
+    },
+    {
+      "path": "../../alns-validation/hard/case-0007.json",
+      "name": "brutal-0007"
+    },
+    {
+      "path": "../../alns-validation/hard/case-0008.json",
+      "name": "brutal-0008"
+    },
+    {
+      "path": "../../alns-validation/hard/case-0009.json",
+      "name": "brutal-0009"
+    },
+    {
+      "path": "../../alns-validation/hard/case-0010.json",
+      "name": "brutal-0010"
+    },
+    {
+      "path": "../../alns-validation/hard/case-0011.json",
+      "name": "brutal-0011"
+    },
+    {
+      "path": "../../alns-validation/hard/case-0012.json",
+      "name": "brutal-0012"
+    },
+    {
+      "path": "../../alns-validation/hard/case-0013.json",
+      "name": "brutal-0013"
+    },
+    {
+      "path": "../../alns-validation/hard/case-0014.json",
+      "name": "brutal-0014"
+    },
+    {
+      "path": "../../alns-validation/hard/case-0015.json",
+      "name": "brutal-0015"
+    }
+  ]
+}

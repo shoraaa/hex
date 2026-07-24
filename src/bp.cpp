@@ -23,6 +23,13 @@
 #include <utility>
 
 namespace hexudon {
+using BpDeadline =
+    std::optional<std::chrono::steady_clock::time_point>;
+
+bool bp_expired(const BpDeadline& deadline) {
+  return deadline && std::chrono::steady_clock::now() >= *deadline;
+}
+
 // ============================================================================
 // Branch-and-price policy `stop_bp` / `bp`.
 //
@@ -118,13 +125,14 @@ BpModel bp_build_model(const MapConfig& config, const DayInfo& day,
 std::vector<BpColumn> bp_pricing(const BpModel& m, std::size_t agent,
                                  double gamma_a,
                                  const std::vector<double>& beta,
-                                 std::size_t label_cap, double eps) {
+                                 std::size_t label_cap, double eps,
+                                 const BpDeadline& deadline) {
   const auto& config = *m.config;
   const auto& day = *m.day;
   const auto& graph = *m.graph;
   const int S = m.spot_count;
   std::vector<BpColumn> result;
-  if (S == 0) return result;
+  if (S == 0 || bp_expired(deadline)) return result;
   std::vector<int> spot_node(S);
   for (int i = 0; i < S; ++i) {
     spot_node[i] = graph.node_for_pos.at(config.spots[i].pos);
@@ -136,6 +144,7 @@ std::vector<BpColumn> bp_pricing(const BpModel& m, std::size_t agent,
                                           : lns_path_time(graph, start, spot_node[i]);
   }
   for (int u = 0; u < S; ++u) {
+    if (bp_expired(deadline)) return result;
     for (int v = 0; v < S; ++v) {
       node_to[u * S + v] =
           (spot_node[u] == spot_node[v]) ? 1
@@ -186,6 +195,7 @@ std::vector<BpColumn> bp_pricing(const BpModel& m, std::size_t agent,
   };
 
   for (int i = 0; i < S; ++i) {
+    if (bp_expired(deadline)) return result;
     if (start_to[i] > m.horizon) continue;
     Lbl lbl{brand_gain(i) + static_cast<double>(m.w_servings * m.stocks[i]),
             start_to[i], m.stocks[i], m.brand_bit[i],
@@ -195,7 +205,7 @@ std::vector<BpColumn> bp_pricing(const BpModel& m, std::size_t agent,
 
   bool changed = true;
   int rounds = 0;
-  while (changed && rounds <= S + 2) {
+  while (changed && rounds <= S + 2 && !bp_expired(deadline)) {
     changed = false;
     ++rounds;
     // Snapshot only the size of each label list: labels added during this
@@ -205,6 +215,7 @@ std::vector<BpColumn> bp_pricing(const BpModel& m, std::size_t agent,
     std::vector<std::size_t> base_size(S);
     for (int u = 0; u < S; ++u) base_size[u] = labels[u].size();
     for (int u = 0; u < S; ++u) {
+      if (bp_expired(deadline)) return result;
       for (std::size_t li = 0; li < base_size[u]; ++li) {
         const auto& lbl = labels[u][li];
         for (int v = 0; v < S; ++v) {
@@ -264,7 +275,8 @@ std::vector<BpColumn> bp_pricing(const BpModel& m, std::size_t agent,
 bool bp_simplex_le(const std::vector<double>& c,
                    const std::vector<std::vector<double>>& A,
                    const std::vector<double>& b, std::vector<double>& x,
-                   double& obj, std::vector<double>& dual) {
+                   double& obj, std::vector<double>& dual,
+                   const BpDeadline& deadline) {
   const int n = static_cast<int>(c.size());
   const int m = static_cast<int>(b.size());
   x.assign(n, 0.0);
@@ -316,6 +328,7 @@ bool bp_simplex_le(const std::vector<double>& c,
   rebuild();
   int guard = 0;
   while (++guard < 30000) {
+    if (bp_expired(deadline)) return false;
     int ent = -1;
     for (int k = 0; k < ncols; ++k) {
       if (objrow[k] < -1e-9) {
@@ -356,11 +369,13 @@ struct BpLpSolution {
   std::vector<double> agent_dual;  // per patrol (in m.patrols order)
   std::vector<double> brand_dual;  // per brand index
   double objective{};
+  bool complete{true};
 };
 
 // Solve the restricted master LP over `pool` (filtered by `active`).
 BpLpSolution bp_solve_master(const BpModel& m, const std::vector<BpColumn>& pool,
-                             const std::vector<char>& active) {
+                             const std::vector<char>& active,
+                             const BpDeadline& deadline) {
   BpLpSolution sol;
   const int P = static_cast<int>(pool.size());
   std::vector<int> col_index;
@@ -387,7 +402,9 @@ BpLpSolution bp_solve_master(const BpModel& m, const std::vector<BpColumn>& pool
     }
   }
   std::vector<double> dual;
-  bp_simplex_le(c, A, b, sol.x, sol.objective, dual);
+  sol.complete =
+      bp_simplex_le(c, A, b, sol.x, sol.objective, dual, deadline);
+  if (!sol.complete) return sol;
   sol.agent_dual.assign(agent_rows, 0.0);
   sol.brand_dual.assign(m.brand_count, 0.0);
   for (int a = 0; a < agent_rows; ++a) sol.agent_dual[a] = dual[a];
@@ -414,8 +431,9 @@ double bp_reduced_cost(const BpModel& m, const BpColumn& col, double gamma_a,
 // Column generation at the root. Seeds `pool` with single-spot columns and
 // then prices multi-stop routes until no column with positive reduced cost
 // remains (capped to keep the pool tractable).
-void bp_column_generation(const BpModel& m, std::vector<BpColumn>& pool,
-                          std::size_t label_cap, int max_rounds) {
+bool bp_column_generation(const BpModel& m, std::vector<BpColumn>& pool,
+                          std::size_t label_cap, int max_rounds,
+                          const BpDeadline& deadline) {
   const auto& config = *m.config;
   const auto& day = *m.day;
   const auto& graph = *m.graph;
@@ -435,6 +453,7 @@ void bp_column_generation(const BpModel& m, std::vector<BpColumn>& pool,
 
   // Initial columns: one per reachable (agent, spot) pair.
   for (std::size_t a : m.patrols) {
+    if (bp_expired(deadline)) return false;
     const int start = graph.node_for_pos.at(day.agents[a].pos);
     for (int i = 0; i < m.spot_count; ++i) {
       const int target = graph.node_for_pos.at(config.spots[i].pos);
@@ -451,16 +470,19 @@ void bp_column_generation(const BpModel& m, std::vector<BpColumn>& pool,
       register_col(std::move(col));
     }
   }
-  if (pool.empty()) return;
+  if (pool.empty()) return true;
 
   for (int round = 0; round < max_rounds; ++round) {
+    if (bp_expired(deadline)) return false;
     std::vector<char> active(pool.size(), 1);
-    auto sol = bp_solve_master(m, pool, active);
+    auto sol = bp_solve_master(m, pool, active, deadline);
+    if (!sol.complete) return false;
     bool added = false;
     for (std::size_t ai = 0; ai < m.patrols.size(); ++ai) {
+      if (bp_expired(deadline)) return false;
       const std::size_t a = m.patrols[ai];
       auto cols = bp_pricing(m, a, sol.agent_dual[ai], sol.brand_dual,
-                             label_cap, 1e-7);
+                             label_cap, 1e-7, deadline);
       // Keep the most promising priced columns to bound pool growth.
       if (cols.size() > 24) cols.resize(24);
       for (auto& col : cols) {
@@ -471,6 +493,7 @@ void bp_column_generation(const BpModel& m, std::vector<BpColumn>& pool,
     }
     if (!added) break;
   }
+  return !bp_expired(deadline);
 }
 
 std::int64_t bp_value_of(const BpModel& m, int distinct, int daily,
@@ -490,13 +513,14 @@ struct BpSearch {
   const AgentTypes* types{};
   const AcoGraph* graph{};
   const std::vector<AcoMeetingList>* meeting_cache{};
+  const ActionPlan* incumbent_plan{};
   std::vector<BpColumn> pool;
   std::int64_t best_bigm{std::numeric_limits<std::int64_t>::min()};
   ActionPlan best_plan;
   bool has_best{false};
   std::int64_t node_budget{};
   std::int64_t nodes_used{0};
-  std::optional<std::chrono::steady_clock::time_point> deadline;
+  BpDeadline deadline;
   bool stopped{false};
 
   bool expired() {
@@ -525,11 +549,13 @@ struct BpSearch {
     auto plan = decode_lns_skeleton(*config, *day, *types, *graph,
                                     *meeting_cache, skeleton);
     if (!plan) return;
+    if (incumbent_plan != nullptr && *plan == *incumbent_plan) return;
     auto eval = evaluate_candidate(*config, *day, *history, *plan);
     if (!eval) return;
     const std::int64_t bigm =
         bp_value_of(*model, std::get<0>(eval->value), std::get<1>(eval->value),
                     std::get<2>(eval->value));
+    if (bigm < best_bigm) return;
     if (!has_best || bigm > best_bigm) {
       best_bigm = bigm;
       best_plan = std::move(*plan);
@@ -540,8 +566,15 @@ struct BpSearch {
   void search(std::vector<char> active) {
     if (expired()) return;
     ++nodes_used;
-    auto sol = bp_solve_master(*model, pool, active);
-    if (sol.objective <= static_cast<double>(best_bigm) + 1e-6) return;
+    auto sol = bp_solve_master(*model, pool, active, deadline);
+    if (!sol.complete) {
+      stopped = true;
+      return;
+    }
+    // Equal-objective routes can end at a different position/fuel state. They
+    // are irrelevant to the standalone daily policy but valuable to MLNS's
+    // suffix replay, so prune only a strict upper-bound loss.
+    if (sol.objective + 1e-6 < static_cast<double>(best_bigm)) return;
     // Find fractional column closest to 0.5.
     int frac = -1;
     double dist = 1.0;
@@ -562,6 +595,17 @@ struct BpSearch {
         if (active[i] && sol.x[i] > 0.5) selected.push_back(i);
       }
       maybe_update(selected);
+      // An integral root is normally where branch-and-bound stops. For MLNS we
+      // also need alternative optima, because an equal daily score with a
+      // different ending state can improve later days. Exclude each selected
+      // route in turn and enumerate the next integral solutions within the
+      // same node/deadline budget.
+      for (int index : selected) {
+        if (expired()) break;
+        auto alternate = active;
+        alternate[index] = 0;
+        search(std::move(alternate));
+      }
       return;
     }
     // Branch lambda = 0: remove the column.
@@ -591,7 +635,7 @@ ExactDayResult bp_branch_and_price(
     const AcoGraph& graph, const std::vector<AcoMeetingList>& meeting_cache,
     const ActionPlan& incumbent_plan, const CandidateValue& incumbent_value,
     std::int64_t node_budget,
-    const std::optional<std::chrono::steady_clock::time_point>& deadline) {
+    const BpDeadline& deadline) {
   ExactDayResult result{incumbent_plan, incumbent_value, 0, false};
   if (model.patrols.empty()) {
     result.complete = true;
@@ -605,6 +649,7 @@ ExactDayResult bp_branch_and_price(
   s.types = &types;
   s.graph = &graph;
   s.meeting_cache = &meeting_cache;
+  s.incumbent_plan = &incumbent_plan;
   s.node_budget = node_budget;
   s.deadline = deadline;
   s.best_bigm =
@@ -612,7 +657,10 @@ ExactDayResult bp_branch_and_price(
                   std::get<2>(incumbent_value));
   s.has_best = false;
 
-  bp_column_generation(model, s.pool, 64, 5);
+  if (!bp_column_generation(model, s.pool, 64, 5, deadline)) {
+    result.complete = false;
+    return result;
+  }
   if (s.pool.empty()) {
     result.complete = true;
     return result;
@@ -623,13 +671,63 @@ ExactDayResult bp_branch_and_price(
   result.complete = !s.stopped;
   if (s.has_best) {
     auto eval = evaluate_candidate(config, day, history, s.best_plan);
-    if (eval && alns_official_value(eval->value) >
+    if (eval && alns_official_value(eval->value) >=
                     alns_official_value(incumbent_value)) {
       result.plan = std::move(s.best_plan);
       result.value = eval->value;
     }
   }
   return result;
+}
+
+std::optional<ActionPlan> build_stop_bp_proposal(
+    const MapConfig& config, const DayInfo& day,
+    const PolicyHistory& history, const AgentTypes& types,
+    const ActionPlan& incumbent, const SearchLimits& limits,
+    bool allow_official_tie) {
+  const auto started = std::chrono::steady_clock::now();
+  const bool timed = limits.time_limit_ms >= 0;
+  if (timed && limits.time_limit_ms <= 0) return std::nullopt;
+  auto incumbent_eval = evaluate_candidate(config, day, history, incumbent);
+  if (!incumbent_eval) return std::nullopt;
+
+  std::set<int> brands;
+  for (const auto& spot : config.spots) brands.insert(spot.brand);
+  const bool unit_stock =
+      std::all_of(config.spots.begin(), config.spots.end(),
+                  [](const Spot& spot) { return spot.stocks == 1; });
+  // The current STOP master treats each brand as a single cluster and each
+  // route visit as one serving. Repeated-brand or multi-stock maps require
+  // explicit activation/capacity variables; claiming an exact bound there is
+  // incorrect, so use the warm incumbent until that richer master exists.
+  if (config.spots.empty() || config.spots.size() > 20 ||
+      brands.size() != config.spots.size() || !unit_stock) {
+    return std::nullopt;
+  }
+
+  const auto graph = build_aco_graph(config, day);
+  const auto meeting_cache = build_aco_meeting_cache(graph);
+  const auto model = bp_build_model(config, day, types, graph, history);
+  const BpDeadline deadline =
+      timed ? BpDeadline(started + std::chrono::milliseconds(
+                                      std::max(1, limits.time_limit_ms)))
+            : std::nullopt;
+  const std::int64_t node_budget =
+      limits.exact_nodes > 0 ? limits.exact_nodes : 50;
+  auto result = bp_branch_and_price(
+      model, config, day, history, types, graph, meeting_cache, incumbent,
+      incumbent_eval->value, node_budget, deadline);
+  auto candidate_eval = evaluate_candidate(config, day, history, result.plan);
+  if (!candidate_eval || result.plan == incumbent) {
+    return std::nullopt;
+  }
+  const auto candidate_official = alns_official_value(candidate_eval->value);
+  const auto incumbent_official = alns_official_value(incumbent_eval->value);
+  if (candidate_official < incumbent_official ||
+      (!allow_official_tie && candidate_official == incumbent_official)) {
+    return std::nullopt;
+  }
+  return result.plan;
 }
 
 ActionPlan build_stop_bp_plan(const MapConfig& config, const DayInfo& day,
@@ -639,56 +737,52 @@ ActionPlan build_stop_bp_plan(const MapConfig& config, const DayInfo& day,
   const auto started = std::chrono::steady_clock::now();
   const bool timed = limits.time_limit_ms >= 0;
 
-  // Warm ALNS run provides the incumbent lower bound and continuation state.
-  // It must be at least as strong as standalone `alns` so that days where
-  // branch-and-price cannot improve (oversized map, or a continuation mismatch
-  // on a non-final day) never regress below the `alns` baseline. Match its
-  // default restart count when the caller did not override it.
+  // Warm ALNS supplies the incumbent. In timed mode it owns 70% of the request;
+  // branch-and-price owns the actual remaining window instead of inheriting an
+  // already-expired deadline.
   SearchLimits warm_limits = limits;
-  const int warm_iters =
-      limits.final_alns_iterations > 0 ? limits.final_alns_iterations : 96;
-  warm_limits.min_iterations = warm_iters;
-  warm_limits.max_iterations = warm_iters;
-  warm_limits.stagnation_iterations = warm_iters;
+  if (timed) {
+    warm_limits.time_limit_ms =
+        std::max(1, limits.time_limit_ms * 70 / 100);
+    warm_limits.min_iterations = 0;
+    warm_limits.stagnation_iterations = 0;
+  } else {
+    const int warm_iters =
+        limits.final_alns_iterations > 0 ? limits.final_alns_iterations : 96;
+    warm_limits.min_iterations = warm_iters;
+    warm_limits.max_iterations = warm_iters;
+    warm_limits.stagnation_iterations = warm_iters;
+  }
   warm_limits.alns_restarts = limits.alns_restarts > 0 ? limits.alns_restarts : 2;
   ActionPlan warm = build_alns_multirestart_plan(
       config, day, history, types, warm_limits, kProductionAlnsFeatures);
   auto warm_eval = evaluate_candidate(config, day, history, warm);
   if (!warm_eval) return warm;
 
-  // Scope guard: large or trivial instances fall straight back to warm.
-  std::set<int> brands;
-  for (const auto& s : config.spots) brands.insert(s.brand);
-  if (config.spots.size() > 20 || brands.size() > 20 || config.spots.empty()) {
-    return warm;
+  SearchLimits bp_limits = limits;
+  if (timed) {
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               started + std::chrono::milliseconds(
+                                             std::max(0, limits.time_limit_ms)) -
+                               std::chrono::steady_clock::now())
+                               .count();
+    if (remaining <= 0) return warm;
+    bp_limits.time_limit_ms = static_cast<int>(remaining);
   }
-
-  const auto graph = build_aco_graph(config, day);
-  const auto meeting_cache = build_aco_meeting_cache(graph);
-  const auto model = bp_build_model(config, day, types, graph, history);
-
-  std::int64_t node_budget = limits.exact_nodes > 0 ? limits.exact_nodes : 50;
-  const std::optional<std::chrono::steady_clock::time_point> bp_deadline =
-      timed ? std::optional<std::chrono::steady_clock::time_point>(
-                  started +
-                  std::chrono::milliseconds(
-                      std::max(1, limits.time_limit_ms * 3 / 10)))
-            : std::nullopt;
-
-  auto result = bp_branch_and_price(model, config, day, history, types, graph,
-                                    meeting_cache, warm, warm_eval->value,
-                                    node_budget, bp_deadline);
+  auto proposal =
+      build_stop_bp_proposal(config, day, history, types, warm, bp_limits);
+  if (!proposal) return warm;
 
   // Only replace the warm incumbent on a strict lexicographic improvement;
-  // on non-final days additionally require an equivalent continuation state.
+  // on non-final days retain the warm plan's brands and avoid a large fuel loss.
   auto warm_official = alns_official_value(warm_eval->value);
-  auto candidate_eval = evaluate_candidate(config, day, history, result.plan);
+  auto candidate_eval = evaluate_candidate(config, day, history, *proposal);
   if (!candidate_eval) return warm;
   auto cand_official = alns_official_value(candidate_eval->value);
   if (cand_official <= warm_official) return warm;
   const bool final_day =
       day.day + 1 >= static_cast<int>(config.day_steps.size());
-  if (final_day) return result.plan;
+  if (final_day) return *proposal;
   auto resulting_brands = [&](const CandidateEvaluation& e) {
     std::set<int> b = history.distinct_brands;
     for (const auto& acq : e.trace.acquisitions) {
@@ -697,30 +791,18 @@ ActionPlan build_stop_bp_plan(const MapConfig& config, const DayInfo& day,
     }
     return b;
   };
-// 1. Náº¿u BP cÃ³ Ä‘iá»ƒm cao hÆ¡n má»™t ngÆ°á»¡ng Ä‘Ã¡ng ká»ƒ (VD: hÆ¡n bÃ¹ Ä‘áº¯p Ä‘Æ°á»£c rá»§i ro ngÃ y mai)
-  // Táº¡m thá»i á»Ÿ Ä‘Ã¢y ta chá»‰ cáº§n nÃ³ lá»›n hÆ¡n cháº·t
-  if (cand_official <= warm_official) return warm;
-
-  // 2. Náº¿u lÃ  ngÃ y cuá»‘i, láº¥y luÃ´n BP
-  if (final_day) return result.plan;
-
-  // 3. Kiá»ƒm tra tÃ­nh an toÃ n cho ngÃ y hÃ´m sau (Ná»›i lá»ng continuation)
-  // Äáº£m báº£o BP khÃ´ng tiÃªu láº¹m quÃ¡ nhiá»u xÄƒng so vá»›i ALNS
-  for (size_t a = 0; a < candidate_eval->ending_fuel.size(); ++a) {
-      // Náº¿u BP ngá»‘n nhiá»u hÆ¡n ALNS > 10 Ä‘Æ¡n vá»‹ xÄƒng (báº¡n cÃ³ thá»ƒ tá»± tinh chá»‰nh con sá»‘ 10 nÃ y)
-      if (candidate_eval->ending_fuel[a] < warm_eval->ending_fuel[a] - 10) {
-          return warm; 
-      }
+  for (std::size_t agent = 0; agent < candidate_eval->ending_fuel.size();
+       ++agent) {
+    if (candidate_eval->ending_fuel[agent] <
+        warm_eval->ending_fuel[agent] - 10) {
+      return warm;
+    }
   }
-
-  // Äáº£m báº£o BP láº¥y Ä‘Æ°á»£c ÃT NHáº¤T nhá»¯ng Brand mÃ  ALNS Ä‘Ã£ láº¥y (Ä‘á»ƒ khÃ´ng thá»t Distinct Brands)
   auto bp_brands = resulting_brands(*candidate_eval);
   auto warm_brands = resulting_brands(*warm_eval);
   for (int b : warm_brands) {
-      if (!bp_brands.contains(b)) return warm; // BP bá» sÃ³t brand quan trá»ng -> Vá»©t
+    if (!bp_brands.contains(b)) return warm;
   }
-
-  // Cháº¥p nháº­n nghiá»‡m cá»§a BP, máº·c ká»‡ ending_positions khÃ¡c nhau!
-  return result.plan;
+  return *proposal;
 }
 }  // namespace hexudon
