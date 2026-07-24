@@ -8,7 +8,8 @@ __pycache__/
 .hypothesis/
 cases/
 datasets/
-reports/
+reports/*
+!reports/traffic-1k-test/
 .hexbench-state*/
 .claude/
 
