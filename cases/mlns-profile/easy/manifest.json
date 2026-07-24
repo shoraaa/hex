@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "suite": "mlns-profile-easy-16",
+  "source_tier": "easy",
+  "cases": [
+    {
+      "path": "../../alns-validation/easy/case-0000.json",
+      "name": "easy-0000"
+    },
+    {
+      "path": "../../alns-validation/easy/case-0001.json",
+      "name": "easy-0001"
+    },
+    {
+      "path": "../../alns-validation/easy/case-0002.json",
+      "name": "easy-0002"
+    },
+    {
+      "path": "../../alns-validation/easy/case-0003.json",
+      "name": "easy-0003"
+    },
+    {
+      "path": "../../alns-validation/easy/case-0004.json",
+      "name": "easy-0004"
+    },
+    {
+      "path": "../../alns-validation/easy/case-0005.json",
+      "name": "easy-0005"
+    },
+    {
+      "path": "../../alns-validation/easy/case-0006.json",
+      "name": "easy-0006"
+    },
+    {
+      "path": "../../alns-validation/easy/case-0007.json",
+      "name": "easy-0007"
+    },
+    {
+      "path": "../../alns-validation/easy/case-0008.json",
+      "name": "easy-0008"
+    },
+    {
+      "path": "../../alns-validation/easy/case-0009.json",
+      "name": "easy-0009"
+    },
+    {
+      "path": "../../alns-validation/easy/case-0010.json",
+      "name": "easy-0010"
+    },
+    {
+      "path": "../../alns-validation/easy/case-0011.json",
+      "name": "easy-0011"
+    },
+    {
+      "path": "../../alns-validation/easy/case-0012.json",
+      "name": "easy-0012"
+    },
+    {
+      "path": "../../alns-validation/easy/case-0013.json",
+      "name": "easy-0013"
+    },
+    {
+      "path": "../../alns-validation/easy/case-0014.json",
+      "name": "easy-0014"
+    },
+    {
+      "path": "../../alns-validation/easy/case-0015.json",
+      "name": "easy-0015"
+    }
+  ]
+}

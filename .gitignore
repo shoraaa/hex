@@ -4,9 +4,8 @@ build/
 dist/
 *.egg-info/
 __pycache__/
-.pytest_cache/
-.hypothesis/
-cases/
+cases/*
+!cases/mlns-profile/
 datasets/
 reports/*
 !reports/traffic-1k-test/

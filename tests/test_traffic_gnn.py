@@ -15,6 +15,7 @@ from hexbench.traffic_gnn import (
     graph_samples_from_replay,
     load_traffic_dataset,
     make_traffic_scenario,
+    predict_future_traffic,
     predict_traffic,
     train_traffic_gnn,
 )
@@ -204,6 +205,38 @@ def test_predict_traffic_reports_per_day_model_guesses(tmp_path) -> None:
     assert result["confusion"][1][pos0["predicted"]] >= 1
     assert result["road_count"] == 4
     assert result["matched"] + result["confusion"][1][0] + result["confusion"][1][2] >= 1
+
+
+def test_future_prediction_starts_after_revealed_live_day(tmp_path) -> None:
+    scenario, _ = _replay_fixture()
+    scenario["day_info"] = {
+        "day": 1,
+        "agents": [
+            {"pos": 1, "fuel": 8, "kind": 0},
+            {"pos": 2, "fuel": 8, "kind": 1},
+        ],
+    }
+    checkpoint_path = tmp_path / "model.pt"
+    model = TrafficGNN(len(FEATURE_NAMES), hidden_size=8, layers=1)
+    torch.save(
+        {
+            "state_dict": model.state_dict(),
+            "feature_names": FEATURE_NAMES,
+            "hidden_size": 8,
+            "layers": 1,
+            "classes": TRAFFIC_CLASSES,
+        },
+        checkpoint_path,
+    )
+
+    result = predict_future_traffic(
+        scenario,
+        checkpoint_path,
+        known_day=1,
+        known_traffic={0: 2, 3: 1},
+    )
+
+    assert [day["day"] for day in result] == [2]
 
 
 def test_predict_traffic_rejects_incompatible_checkpoint_schema(tmp_path) -> None:

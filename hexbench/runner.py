@@ -16,6 +16,70 @@ OBJECTIVES = (
     "cumulative_daily_types",
     "total_servings",
 )
+
+
+def _traffic_gnn_enabled(payload: dict[str, Any]) -> bool:
+    for source in (
+        payload,
+        payload.get("search") if isinstance(payload.get("search"), dict) else {},
+        payload.get("hyperparameters")
+        if isinstance(payload.get("hyperparameters"), dict)
+        else {},
+    ):
+        if source.get("use_traffic_gnn") or source.get("useTrafficGnn"):
+            return True
+    return os.environ.get("HEXUDON_USE_TRAFFIC_GNN", "") not in {"", "0"}
+
+
+def _traffic_gnn_checkpoint(payload: dict[str, Any]) -> Path:
+    explicit = payload.get("traffic_model_path") or os.environ.get(
+        "HEXUDON_TRAFFIC_GNN_CHECKPOINT"
+    )
+    candidates = [Path(explicit)] if explicit else []
+    candidates.append(ROOT / "reports" / "traffic-1k-test" / "model.pt")
+    candidates.extend(
+        sorted(
+            (ROOT / "reports").glob("traffic-gnn*/model.pt"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    raise FileNotFoundError(
+        "GNN prediction requested but no traffic checkpoint was found; "
+        "expected reports/traffic-1k-test/model.pt; set "
+        "HEXUDON_TRAFFIC_GNN_CHECKPOINT or train traffic-train first"
+    )
+
+
+def prepare_traffic_prediction_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Attach optional MLNS GNN forecasts so callers can inspect the maps."""
+    if not _traffic_gnn_enabled(payload) or "predictedTraffic" in payload:
+        return payload
+    from .traffic_gnn import predict_future_traffic
+
+    scenario = dict(payload)
+    if isinstance(payload.get("day_info"), dict):
+        scenario["day_info"] = payload["day_info"]
+        known_day = int(payload["day_info"].get("day", 0))
+        known_traffic = {
+            int(item["pos"]): int(item["status"])
+            for item in payload["day_info"].get("traffics", [])
+        }
+    else:
+        known_day = None
+        known_traffic = None
+    predictions = predict_future_traffic(
+        scenario,
+        _traffic_gnn_checkpoint(payload),
+        known_day=known_day,
+        known_traffic=known_traffic,
+    )
+    prepared = dict(payload)
+    prepared["predictedTraffic"] = predictions
+    return prepared
 OPTIMUM_DEFINITION = (
     "Per-case structural upper bound: every brand is collected, every brand "
     "is collected on every day, and every spot serves up to one bowl per "
@@ -41,11 +105,23 @@ def run_core(
     binary: Path,
     timeout: float = 60,
     core_threads: int | None = None,
+    environment_overrides: dict[str, str | None] | None = None,
 ) -> Any:
+    if isinstance(payload, dict) and policy == "mlns":
+        payload = prepare_traffic_prediction_payload(payload)
     environment = None
-    if core_threads is not None:
+    if core_threads is not None or environment_overrides:
         environment = dict(os.environ)
+    if core_threads is not None:
+        assert environment is not None
         environment["HEXUDON_THREADS"] = str(max(1, core_threads))
+    if environment_overrides:
+        assert environment is not None
+        for key, value in environment_overrides.items():
+            if value is None:
+                environment.pop(key, None)
+            else:
+                environment[key] = value
     completed = subprocess.run(
         [str(binary), command, policy],
         input=json.dumps(payload),
@@ -77,6 +153,11 @@ def stream_core(
     The ``timeout`` is a backstop watchdog: it should exceed the solver deadline
     plus a margin. Returns the final (best) record, or ``None`` if nothing streamed.
     """
+    payload = (
+        prepare_traffic_prediction_payload(payload)
+        if policy == "mlns"
+        else payload
+    )
     environment = None
     if core_threads is not None:
         environment = dict(os.environ)
@@ -111,7 +192,8 @@ def stream_core(
                 continue
             record = json.loads(line)
             last = record
-            on_improve(record)
+            if record.get("kind") != "final":
+                on_improve(record)
             if should_stop is not None and should_stop():
                 stopped = True
                 process.kill()
@@ -171,11 +253,20 @@ def grade_suite(
     binary_path: str | None = None,
     jobs: int | None = None,
     timeout: float = 60,
+    time_limit_ms: int | None = None,
+    core_environment: dict[str, str | None] | None = None,
+    core_threads: int | None = None,
+    policy_hyperparameters: dict[str, dict[str, int | float | bool]] | None = None,
 ) -> dict[str, Any]:
     binary = find_binary(binary_path)
     manifest = json.loads(manifest_path.read_text())
     methods = list(dict.fromkeys([method, *baselines]))
     worker_count = max(1, jobs or min(os.cpu_count() or 1, 8))
+    threads_per_core = (
+        max(1, core_threads)
+        if core_threads is not None
+        else (1 if worker_count > 1 else None)
+    )
     scenarios = [
         json.loads((manifest_path.parent / case["path"]).read_text())
         for case in manifest["cases"]
@@ -206,14 +297,33 @@ def grade_suite(
     def evaluate(task: tuple[int, str]) -> tuple[int, str, dict[str, Any]]:
         case_index, name = task
         started = time.perf_counter()
-        result = run_core(
-            "eval",
-            name,
-            scenarios[case_index],
-            binary=binary,
-            timeout=timeout,
-            core_threads=1 if worker_count > 1 else None,
-        )
+        scenario = scenarios[case_index]
+        if time_limit_ms is not None:
+            scenario = dict(scenario)
+            scenario["search"] = {
+                "timeLimitMs": time_limit_ms,
+                "maxIterations": 10_000_000,
+                "stagnationIterations": 0,
+            }
+        if policy_hyperparameters and name in policy_hyperparameters:
+            scenario = dict(scenario)
+            scenario["hyperparameters"] = dict(policy_hyperparameters[name])
+        try:
+            result = run_core(
+                "eval",
+                name,
+                scenario,
+                binary=binary,
+                timeout=timeout,
+                core_threads=threads_per_core,
+                environment_overrides=core_environment,
+            )
+        except subprocess.TimeoutExpired as error:
+            case_path = manifest["cases"][case_index]["path"]
+            raise RuntimeError(
+                f"policy '{name}' timed out on case '{case_path}' after "
+                f"{timeout:.1f} seconds; raise --timeout or reduce --jobs"
+            ) from error
         result["runtime_seconds"] = time.perf_counter() - started
         return case_index, name, result
 
@@ -307,6 +417,8 @@ def grade_suite(
         "case_count": case_count,
         "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
         "jobs": worker_count,
+        "core_threads": threads_per_core,
+        "time_limit_ms": time_limit_ms,
         "wall_seconds": wall_seconds,
         "optimum_definition": OPTIMUM_DEFINITION,
         "aggregates": aggregates,
@@ -320,7 +432,8 @@ def grade_suite(
         f"# HEXUDON benchmark: {method}",
         "",
         f"Suite: `{manifest['suite']}` ({case_count} cases)",
-        f"Workers: `{worker_count}` · wall time: `{wall_seconds:.3f}s`",
+        f"Workers: `{worker_count}` · core threads: `{threads_per_core or 'default'}` · wall time: `{wall_seconds:.3f}s`",
+        f"Per-day solver limit: `{time_limit_ms} ms`" if time_limit_ms is not None else "Per-day solver limit: policy default",
         "",
         f"Optimum: {OPTIMUM_DEFINITION}",
         "",

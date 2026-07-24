@@ -8,6 +8,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -994,6 +995,7 @@ def train_traffic_gnn(
     return report
 
 
+@lru_cache(maxsize=8)
 def load_traffic_model(checkpoint_path: Path) -> TrafficGNN:
     """Reconstruct a trained GNN from a saved checkpoint.
 
@@ -1089,3 +1091,110 @@ def predict_traffic(
         "accuracy": (matched / total_roads) if total_roads else 0.0,
         "confusion": confusion,
     }
+
+
+def predict_future_traffic(
+    scenario: dict[str, Any],
+    checkpoint_path: Path,
+    *,
+    known_day: int | None = None,
+    known_traffic: dict[int, int] | None = None,
+) -> list[dict[str, Any]]:
+    """Forecast road statuses for an MLNS suffix without future labels.
+
+    The predictor is deliberately autoregressive: only day-zero smooth traffic
+    and an optionally supplied currently revealed day are seeded; every later
+    day's model output becomes the next day's history.  This makes the payload
+    safe for local replay and live planning, where future opponent actions are
+    unavailable.  The C++ planner consumes the returned maps only for future
+    suffix simulation; official day evaluation still uses authoritative roads.
+    """
+
+    config = scenario["config"]
+    total_days = len(config["daySteps"])
+    if total_days <= 1:
+        return []
+    width = int(config["map"]["width"])
+    height = int(config["map"]["height"])
+    roads = [
+        position
+        for position, value in enumerate(
+            value for row in config["map"]["cells"] for value in row
+        )
+        if int(value) == 1
+    ]
+    statuses: list[dict[int, int]] = [{position: 0 for position in roads}]
+    if known_day is not None and known_traffic:
+        while len(statuses) <= known_day:
+            statuses.append({position: 0 for position in roads})
+        statuses[known_day] = {
+            position: int(known_traffic.get(position, 0)) for position in roads
+        }
+    model = load_traffic_model(checkpoint_path)
+    agent_starts = [
+        {
+            "cell": int(position),
+            "type": 0,
+            "fuel": int(config["fuelLimits"]),
+        }
+        for position in config.get("agents", [])
+    ]
+    if known_day is not None and known_day >= 0 and known_day < total_days:
+        # A live day carries the actual agent positions/types; retaining those
+        # as the forecast context is better than resetting to map starts.
+        day_agents = scenario.get("day_info", {}).get("agents", [])
+        if day_agents:
+            agent_starts = [
+                {
+                    "cell": int(agent["pos"]),
+                    "type": int(agent.get("kind", 0)),
+                    "fuel": int(agent.get("fuel") or config["fuelLimits"]),
+                }
+                for agent in day_agents
+            ]
+
+    def replay_for(current: list[dict[int, int]]) -> dict[str, Any]:
+        days = []
+        for day, road_status in enumerate(current):
+            days.append(
+                {
+                    "day": day,
+                    "road_condition": {
+                        str(position): int(road_status.get(position, 0))
+                        for position in roads
+                    },
+                    "all_team_starts": [
+                        {"agents": [dict(agent) for agent in agent_starts]}
+                    ],
+                }
+            )
+        return {"replay": {"days": days}}
+
+    output: list[dict[str, Any]] = []
+    first_forecast_day = (
+        max(1, known_day + 1) if known_day is not None else 1
+    )
+    with torch.no_grad():
+        for day in range(first_forecast_day, total_days):
+            if len(statuses) <= day:
+                statuses.append({position: 0 for position in roads})
+            samples = graph_samples_from_replay(scenario, replay_for(statuses))
+            sample = next((item for item in samples if item.day == day), None)
+            if sample is None:
+                break
+            logits = model(sample.features, sample.edge_index, sample.edge_direction)
+            predictions = logits.argmax(dim=1)
+            predicted = {
+                position: int(predictions[position].item()) for position in roads
+            }
+            statuses[day] = predicted
+            output.append(
+                {
+                    "day": day,
+                    "traffics": [
+                        {"pos": position, "status": status}
+                        for position, status in predicted.items()
+                    ],
+                }
+            )
+    return output

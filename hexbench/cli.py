@@ -13,8 +13,17 @@ from .api import (
     practice_benchmark,
     practice_suite,
 )
-from .generator import HARD_TIERS, generate_hard_suite, generate_suite
+from .generator import (
+    HARD_TIERS,
+    VALIDATION_PROFILES,
+    generate_hard_suite,
+    generate_suite,
+    generate_validation_suite,
+)
 from .runner import grade_suite
+from .mlns_profile import DEFAULT_SUITES as MLNS_PROFILE_SUITES, profile_mlns
+from .mlns_tuning import optimize_mlns
+from .palns_tuning import tune_palns
 from .tuning import SEED_PROFILES, tune_alns
 
 
@@ -44,7 +53,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     hard.add_argument("--verify-policy", default="alns")
     hard.add_argument("--max-attempts", type=int, default=80)
+    hard.add_argument("--traffic-timeout", type=float, default=600.0)
     hard.add_argument("--binary")
+
+    validation = subparsers.add_parser(
+        "generate-validation",
+        help="generate deterministic ALNS validation cases per profile",
+    )
+    validation.add_argument(
+        "--out", type=Path, default=Path("cases/alns-validation")
+    )
+    validation.add_argument("--per-profile", type=int, default=32)
+    validation.add_argument(
+        "--profiles",
+        default=",".join(VALIDATION_PROFILES),
+        help="comma-separated subset of " + ",".join(VALIDATION_PROFILES),
+    )
+    validation.add_argument("--traffic-timeout", type=float, default=600.0)
+    validation.add_argument("--traffic-jobs", type=int, default=4)
+    validation.add_argument("--binary")
 
     grade = subparsers.add_parser("grade", help="grade a C++ policy locally")
     grade.add_argument("--cases", type=Path, required=True, help="suite manifest.json")
@@ -54,6 +81,11 @@ def build_parser() -> argparse.ArgumentParser:
     grade.add_argument("--binary")
     grade.add_argument("--jobs", type=int, default=0, help="parallel case/method workers; 0=auto")
     grade.add_argument("--timeout", type=float, default=60, help="per policy-case timeout in seconds")
+    grade.add_argument(
+        "--time-limit-ms",
+        type=int,
+        help="inject the same per-day wall-clock solver limit into every case",
+    )
 
     fetch = subparsers.add_parser("fetch", help="fetch a read-only live fixture")
     fetch.add_argument("--game-id", required=True)
@@ -149,7 +181,11 @@ def build_parser() -> argparse.ArgumentParser:
         "lns-time-benchmark",
         help="measure LNS/ALNS score as the per-day time budget increases",
     )
-    time_curve.add_argument("--method", choices=("lns", "alns"), default="lns")
+    time_curve.add_argument(
+        "--method",
+        choices=("lns", "alns", "palns", "mlns", "simple_lns", "lns_dp"),
+        default="lns",
+    )
     time_curve.add_argument(
         "--game-ids",
         default="auto",
@@ -179,6 +215,107 @@ def build_parser() -> argparse.ArgumentParser:
         "--alns-iterations",
         default="128,256,512,1024,2048,3072,4096,6000",
         help="comma-separated ALNS iteration counts",
+    )
+
+    palns_tune = subparsers.add_parser(
+        "palns-tune",
+        help="tune PALNS projection depth/restarts and report its total-iteration curve",
+    )
+    palns_tune.add_argument("--cases", type=Path, required=True)
+    palns_tune.add_argument("--tuning-total-iterations", type=int, default=1536)
+    palns_tune.add_argument("--projection-iterations", default="1,2,4,8,16,32")
+    palns_tune.add_argument("--restarts", default="1,2,3")
+    palns_tune.add_argument(
+        "--total-iteration-curve",
+        default="128,256,512,1024,1536,2048,3072,4096,6000",
+    )
+    palns_tune.add_argument(
+        "--report", type=Path, default=Path("reports/palns-validation")
+    )
+    palns_tune.add_argument("--binary")
+    palns_tune.add_argument("--jobs", type=int, default=0)
+    palns_tune.add_argument("--timeout", type=float, default=180)
+
+    mlns_tune = subparsers.add_parser(
+        "mlns-tune",
+        help="optimize MLNS controls with resumable Bayesian TPE on the 96-case suite",
+    )
+    mlns_tune.add_argument(
+        "--cases",
+        type=Path,
+        default=Path("cases/alns-validation/manifest.json"),
+    )
+    mlns_tune.add_argument("--trials", type=int, default=32)
+    mlns_tune.add_argument("--startup-trials", type=int, default=8)
+    mlns_tune.add_argument("--time-limit-ms", type=int, default=1_000)
+    mlns_tune.add_argument("--min-iterations", default="0,8,16,32,64")
+    mlns_tune.add_argument("--stagnation-iterations", default="0,16,32,64,96,128,256")
+    mlns_tune.add_argument(
+        "--future-discount-percent",
+        default="25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100",
+    )
+    mlns_tune.add_argument("--seed", type=int, default=20260720)
+    mlns_tune.add_argument("--expected-cases", type=int, default=96)
+    mlns_tune.add_argument(
+        "--report", type=Path, default=Path("reports/mlns-validation")
+    )
+    mlns_tune.add_argument("--binary")
+    mlns_tune.add_argument("--jobs", type=int, default=0)
+    mlns_tune.add_argument("--timeout", type=float, default=180)
+    mlns_tune.add_argument(
+        "--no-resume", action="store_true", help="discard state.json and start a new search"
+    )
+
+    mlns_profile = subparsers.add_parser(
+        "mlns-profile",
+        help="profile MLNS+DP component time and incumbent gain on hard/online suites",
+    )
+    for suite_name, default_path in MLNS_PROFILE_SUITES.items():
+        mlns_profile.add_argument(
+            f"--{suite_name}", type=Path, default=default_path,
+            help=f"{suite_name} suite manifest",
+        )
+    mlns_profile.add_argument("--time-limit-ms", type=int, default=5_000)
+    mlns_profile.add_argument(
+        "--report", type=Path, default=Path("reports/mlns-profile")
+    )
+    mlns_profile.add_argument("--binary")
+    mlns_profile.add_argument("--jobs", type=int, default=0)
+    mlns_profile.add_argument("--core-threads", type=int, default=1)
+    mlns_profile.add_argument(
+        "--neighborhood-mode",
+        choices=("current", "refined", "disabled"),
+        default="current",
+        help="MLNS whole-match neighborhood implementation to profile",
+    )
+    mlns_profile.add_argument(
+        "--timeout",
+        type=float,
+        default=120.0,
+        help=(
+            "minimum per-case watchdog in seconds; automatically raised to "
+            "1.25 x the case's total per-day budget plus 60 seconds"
+        ),
+    )
+    mlns_profile.add_argument(
+        "--log-interval",
+        type=float,
+        default=10.0,
+        help="heartbeat interval in seconds while no case has completed",
+    )
+    mlns_profile.add_argument(
+        "--quiet-progress",
+        action="store_true",
+        help="suppress live progress logs on stderr",
+    )
+    mlns_profile.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="ignore a compatible progress.json checkpoint and rerun every case",
+    )
+    mlns_profile.add_argument(
+        "--max-cases", type=int,
+        help="profile only the first N cases of each suite (smoke/debug use)",
     )
     tune.add_argument("--min-iterations", default="32", help="comma-separated minimum iteration values")
     tune.add_argument(
@@ -275,6 +412,20 @@ def main(argv: list[str] | None = None) -> None:
             verify=not args.no_verify,
             verify_policy=args.verify_policy,
             max_attempts=args.max_attempts,
+            traffic_timeout=args.traffic_timeout,
+        )
+        print(path)
+    elif args.command == "generate-validation":
+        profiles = tuple(
+            item.strip() for item in args.profiles.split(",") if item.strip()
+        )
+        path = generate_validation_suite(
+            args.out,
+            per_profile=args.per_profile,
+            profiles=profiles,
+            binary_path=args.binary,
+            traffic_timeout=args.traffic_timeout,
+            traffic_jobs=args.traffic_jobs,
         )
         print(path)
     elif args.command == "grade":
@@ -287,6 +438,7 @@ def main(argv: list[str] | None = None) -> None:
             args.binary,
             None if args.jobs == 0 else args.jobs,
             args.timeout,
+            args.time_limit_ms,
         )
         print(json.dumps({"report": str(args.report / "report.json"), "cases": report["case_count"]}))
     elif args.command == "fetch":
@@ -442,6 +594,88 @@ def main(argv: list[str] | None = None) -> None:
             case_stride=args.case_stride,
         )
         print(json.dumps({"report": str(args.report / "report.json"), "best": report["best"]["parameters"]}))
+    elif args.command == "palns-tune":
+        def parse_palns_values(raw: str) -> list[int]:
+            return [int(item.strip()) for item in raw.split(",") if item.strip()]
+
+        report = tune_palns(
+            args.cases,
+            args.report,
+            tuning_total_iterations=args.tuning_total_iterations,
+            projection_iterations=parse_palns_values(args.projection_iterations),
+            restarts=parse_palns_values(args.restarts),
+            total_iteration_curve=parse_palns_values(args.total_iteration_curve),
+            binary_path=args.binary,
+            jobs=None if args.jobs == 0 else args.jobs,
+            timeout=args.timeout,
+        )
+        print(
+            json.dumps(
+                {
+                    "report": str(args.report / "report.json"),
+                    "best": report["best_fixed_parameters"],
+                }
+            )
+        )
+    elif args.command == "mlns-tune":
+        def parse_mlns_values(raw: str) -> list[int]:
+            return [int(item.strip()) for item in raw.split(",") if item.strip()]
+
+        report = optimize_mlns(
+            args.cases,
+            args.report,
+            trials=args.trials,
+            startup_trials=args.startup_trials,
+            time_limit_ms=args.time_limit_ms,
+            min_iterations=parse_mlns_values(args.min_iterations),
+            stagnation_iterations=parse_mlns_values(args.stagnation_iterations),
+            future_discount_percent=parse_mlns_values(
+                args.future_discount_percent
+            ),
+            seed=args.seed,
+            expected_cases=args.expected_cases,
+            binary_path=args.binary,
+            jobs=None if args.jobs == 0 else args.jobs,
+            timeout=args.timeout,
+            resume=not args.no_resume,
+        )
+        print(
+            json.dumps(
+                {
+                    "report": str(args.report / "report.json"),
+                    "best": report["best"]["parameters"],
+                }
+            )
+        )
+    elif args.command == "mlns-profile":
+        report = profile_mlns(
+            {
+                "brutal": args.brutal,
+                "steady": args.steady,
+                "easy": args.easy,
+                "online": args.online,
+            },
+            args.report,
+            time_limit_ms=args.time_limit_ms,
+            binary_path=args.binary,
+            jobs=None if args.jobs == 0 else args.jobs,
+            timeout=args.timeout,
+            core_threads=args.core_threads,
+            max_cases=args.max_cases,
+            log_interval_seconds=args.log_interval,
+            progress=not args.quiet_progress,
+            resume=not args.no_resume,
+            neighborhood_mode=args.neighborhood_mode,
+        )
+        print(
+            json.dumps(
+                {
+                    "report": str(args.report / "report.json"),
+                    "cases": report["aggregate"]["case_count"],
+                    "wall_seconds": report["wall_seconds"],
+                }
+            )
+        )
     elif args.command == "traffic-generate":
         from .traffic_gnn import generate_traffic_dataset
 

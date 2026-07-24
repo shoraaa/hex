@@ -55,6 +55,7 @@ struct TeamState {
   std::vector<Score> daily_scores;
   std::vector<std::string> errors;
   PolicyHistory history;
+  std::optional<json::value> planner_state;
 };
 
 struct PendingAction {
@@ -126,6 +127,17 @@ struct LnsSkeleton {
   bool operator==(const LnsSkeleton&) const = default;
 };
 
+// A lightweight proposal produced by the independent LNS-DP request-bank
+// search.  Consumers must treat this as an additive candidate: ALNS/MLNS keep
+// ownership of authoritative rendezvous decoding and whole-match selection.
+struct LnsDpProposal {
+  LnsSkeleton skeleton;
+  ActionPlan plan;
+  CandidateValue value{};
+  int ending_fuel{};
+  int fuel_pressure{};
+};
+
 using AlnsTravelChoices = std::vector<std::vector<std::uint32_t>>;
 
 struct ExactDayResult {
@@ -145,6 +157,7 @@ enum AlnsFeature : unsigned {
   AlnsExactFuelBound = 1U << 6U,
   AlnsAcoSeed = 1U << 7U,
   AlnsSisrRecreate = 1U << 8U,
+  AlnsProjectedObjective = 1U << 9U,
 };
 
 constexpr unsigned kAcceptedExactBoundFeatures =
@@ -153,6 +166,18 @@ constexpr unsigned kAcceptedExactBoundFeatures =
 constexpr unsigned kProductionAlnsFeatures =
     AlnsStableTravel | AlnsSharedPreprocessing | AlnsExactCompletion |
     kAcceptedExactBoundFeatures | AlnsAcoSeed;
+
+struct AlnsAnytimeBudget {
+  int main_ms{};
+  int continuation_ms{};
+  int exact_ms{};
+};
+
+AlnsAnytimeBudget alns_anytime_budget(int total_ms, bool final_day,
+                                      bool allow_continuation,
+                                      bool exact_enabled,
+                                      int continuation_time_percent = 50,
+                                      int exact_time_percent = 30);
 
 // Simulation / parsing helpers.
 const Spot* spot_at(const MapConfig& config, int pos);
@@ -174,6 +199,7 @@ std::map<int, int> road_status_for_day(
 bool is_routing_policy(const std::string& policy);
 
 extern thread_local std::size_t alns_restart_worker_count;
+extern thread_local std::size_t parallel_worker_divisor;
 std::size_t configured_workers(std::size_t tasks);
 
 int path_fuel_cost(const MapConfig& config, int source,
@@ -219,6 +245,11 @@ int lns_path_time(const AcoGraph& graph, int from, int to);
 
 AgentTypes select_lns_agent_types(const MapConfig& config);
 
+std::vector<LnsDpProposal> build_lns_dp_route_proposals(
+    const MapConfig& config, const DayInfo& day,
+    const PolicyHistory& history, const AgentTypes& types,
+    const SearchLimits& limits = {}, int max_proposals = 2);
+
 std::optional<ActionPlan> decode_lns_skeleton(
     const MapConfig& config, const DayInfo& day, const AgentTypes& types,
     const AcoGraph& graph, const std::vector<AcoMeetingList>& meeting_cache,
@@ -253,7 +284,8 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
                            const AgentTypes& types, const SearchLimits& limits,
                            unsigned features, bool allow_continuation = true,
                            std::uint64_t restart_salt = 0,
-                           const ImprovementSink* on_improve = nullptr);
+                           const ImprovementSink* on_improve = nullptr,
+                           std::vector<ActionPlan>* elite_plans = nullptr);
 // Refuel-escort construction seed (empty when there is no refuel car).
 ActionPlan build_escort_plan(const MapConfig& config, const DayInfo& day,
                              const PolicyHistory& history,
@@ -265,10 +297,48 @@ ActionPlan build_alns_multirestart_plan(const MapConfig& config,
                                         const SearchLimits& limits,
                                         unsigned features);
 
+PlannerResult build_mlns_plan(
+    const MapConfig& config, const DayInfo& day,
+    const PolicyHistory& history, const AgentTypes& types,
+    const SearchLimits& limits, const json::value* planner_state = nullptr,
+    const ImprovementSink* on_improve = nullptr);
+
+// Rolling whole-match SISR over classical patrol routes and semantic refuel
+// tasks.  Kept separate from the production LNS/ALNS implementation so its
+// representation and neighborhoods can evolve independently.
+AgentTypes select_simple_lns_agent_types(const MapConfig& config,
+                                         const SearchLimits& limits = {});
+PlannerResult build_simple_lns_plan(
+    const MapConfig& config, const DayInfo& day,
+    const PolicyHistory& history, const AgentTypes& types,
+    const SearchLimits& limits, const json::value* planner_state = nullptr,
+    const ImprovementSink* on_improve = nullptr);
+
+// Independent dynamic-programming LNS policy.  It deliberately does not
+// share the legacy LNS skeleton/decoder; only the authoritative simulator and
+// map primitives are common.
+AgentTypes select_lns_dp_agent_types(const MapConfig& config,
+                                     const SearchLimits& limits = {});
+PlannerResult build_lns_dp_plan(
+    const MapConfig& config, const DayInfo& day,
+    const PolicyHistory& history, const AgentTypes& types,
+    const SearchLimits& limits, const json::value* planner_state = nullptr,
+    const ImprovementSink* on_improve = nullptr);
+
+void reset_palns_diagnostics();
+PalnsDiagnostics current_palns_diagnostics();
+void reset_mlns_diagnostics();
+MlnsDiagnostics current_mlns_diagnostics();
+
 ActionPlan build_stop_bp_plan(const MapConfig& config, const DayInfo& day,
                               const PolicyHistory& history,
                               const AgentTypes& types,
                               const SearchLimits& limits);
+std::optional<ActionPlan> build_stop_bp_proposal(
+    const MapConfig& config, const DayInfo& day,
+    const PolicyHistory& history, const AgentTypes& types,
+    const ActionPlan& incumbent, const SearchLimits& limits,
+    bool allow_official_tie = false);
 
 // Parallel helpers (templates, so defined inline here).
 template <class Function>
@@ -287,15 +357,18 @@ auto parallel_indexed(std::size_t count, Function function) {
     threads.reserve(workers);
     for (std::size_t worker = 0; worker < workers; ++worker) {
       threads.emplace_back([&] {
+        const std::size_t previous_divisor = parallel_worker_divisor;
+        parallel_worker_divisor = previous_divisor * workers;
         while (true) {
           const std::size_t index = next.fetch_add(1);
-          if (index >= count) return;
+          if (index >= count) break;
           try {
             slots[index] = function(index);
           } catch (...) {
             errors[index] = std::current_exception();
           }
         }
+        parallel_worker_divisor = previous_divisor;
       });
     }
     for (auto& thread : threads) thread.join();
@@ -316,8 +389,10 @@ auto parallel_alns_restarts(std::size_t count, Function function) {
   std::vector<std::exception_ptr> errors(count);
   std::vector<std::thread> threads;
   threads.reserve(count);
+  const std::size_t parent_divisor = parallel_worker_divisor;
   for (std::size_t index = 0; index < count; ++index) {
-    threads.emplace_back([&, index] {
+    threads.emplace_back([&, index, parent_divisor] {
+      parallel_worker_divisor = parent_divisor;
       alns_restart_worker_count = count;
       try {
         slots[index] = function(index);
@@ -325,6 +400,7 @@ auto parallel_alns_restarts(std::size_t count, Function function) {
         errors[index] = std::current_exception();
       }
       alns_restart_worker_count = 1;
+      parallel_worker_divisor = 1;
     });
   }
   for (auto& thread : threads) thread.join();

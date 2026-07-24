@@ -387,6 +387,12 @@ PolicyHistory parse_history(const json::value& value) {
       history.submitted_actions.push_back(std::move(plan));
     }
   }
+  if (const auto* daily = root.if_contains("cumulative_daily_types")) {
+    history.cumulative_daily_types = daily->to_number<int>();
+  }
+  if (const auto* servings = root.if_contains("total_servings")) {
+    history.total_servings = servings->to_number<int>();
+  }
   return history;
 }
 
@@ -416,7 +422,7 @@ json::value to_json(const EvaluationResult& result) {
                      {"daily_types", score.cumulative_daily_types},
                      {"servings", score.total_servings}});
   }
-  return json::object{
+  json::object output{
       {"score",
        json::object{{"distinct_types", result.score.distinct_types},
                     {"cumulative_daily_types",
@@ -430,6 +436,57 @@ json::value to_json(const EvaluationResult& result) {
       {"ending_patrol_fuel", result.ending_patrol_fuel},
       {"daily_scores", std::move(daily_scores)},
       {"errors", std::move(errors)}};
+  if (result.palns_diagnostics.total_iterations > 0) {
+    const auto& diagnostics = result.palns_diagnostics;
+    const int fallbacks = diagnostics.projection_iteration_fallbacks +
+                          diagnostics.projection_deadline_fallbacks;
+    const double fallback_percentage =
+        diagnostics.projection_requests == 0
+            ? 0.0
+            : 100.0 * static_cast<double>(fallbacks) /
+                  diagnostics.projection_requests;
+    output["palns_diagnostics"] = json::object{
+        {"total_iterations", diagnostics.total_iterations},
+        {"iterations_used", diagnostics.iterations_used},
+        {"outer_iterations", diagnostics.outer_iterations},
+        {"projection_iterations", diagnostics.projection_iterations},
+        {"projection_requests", diagnostics.projection_requests},
+        {"projection_completed", diagnostics.projection_completed},
+        {"projection_cache_hits", diagnostics.projection_cache_hits},
+        {"projection_iteration_fallbacks",
+         diagnostics.projection_iteration_fallbacks},
+        {"projection_deadline_fallbacks",
+         diagnostics.projection_deadline_fallbacks},
+        {"projection_fallback_percentage", fallback_percentage}};
+  }
+  if (result.mlns_diagnostics.planner_calls > 0) {
+    const auto& diagnostics = result.mlns_diagnostics;
+    json::array components;
+    for (const auto& component : diagnostics.components) {
+      json::array current_gain;
+      json::array projected_gain;
+      for (auto value : component.current_score_gain) {
+        current_gain.push_back(value);
+      }
+      for (auto value : component.projected_score_gain) {
+        projected_gain.push_back(value);
+      }
+      components.push_back(json::object{
+          {"component", component.component},
+          {"calls", component.calls},
+          {"elapsed_microseconds", component.elapsed_microseconds},
+          {"incumbent_updates", component.incumbent_updates},
+          {"final_selections", component.final_selections},
+          {"current_score_gain", std::move(current_gain)},
+          {"projected_score_gain", std::move(projected_gain)},
+          {"ending_patrol_fuel_gain", component.ending_patrol_fuel_gain}});
+    }
+    output["mlns_profile"] = json::object{
+        {"planner_calls", diagnostics.planner_calls},
+        {"elapsed_microseconds", diagnostics.elapsed_microseconds},
+        {"components", std::move(components)}};
+  }
+  return output;
 }
 
 std::optional<int> neighbor(const MapConfig& config, int pos, int direction) {
@@ -524,11 +581,14 @@ bool is_routing_policy(const std::string& policy) {
   return policy == "greedy" || policy == "utility_greedy" ||
          policy == "fuel_aware" || policy == "stock_maximiser" ||
          policy == "coordinated" || policy == "local_search" ||
-         policy == "lns" || policy == "alns" || policy == "aco" ||
+         policy == "lns" || policy == "alns" || policy == "palns" ||
+         policy == "mlns" || policy == "simple_lns" || policy == "lns_dp" ||
+         policy == "aco" ||
          policy == "aco_ls" || policy == "stop_bp" || policy == "bp";
 }
 
 thread_local std::size_t alns_restart_worker_count = 1;
+thread_local std::size_t parallel_worker_divisor = 1;
 
 std::size_t configured_workers(std::size_t tasks) {
   if (tasks <= 1) return tasks;
@@ -542,8 +602,10 @@ std::size_t configured_workers(std::size_t tasks) {
   } else {
     requested = std::max(1u, std::thread::hardware_concurrency());
   }
-  requested = std::max<std::size_t>(
-      1, requested / std::max<std::size_t>(1, alns_restart_worker_count));
+  const std::size_t divisor =
+      std::max<std::size_t>(1, alns_restart_worker_count) *
+      std::max<std::size_t>(1, parallel_worker_divisor);
+  requested = std::max<std::size_t>(1, requested / divisor);
   return std::min({tasks, requested, std::size_t{8}});
 }
 
@@ -1396,7 +1458,8 @@ std::tuple<int, int, int> alns_official_value(const CandidateValue& value) {
 
 
 AgentTypes select_agent_types_online(const std::string& policy,
-                                     const MapConfig& config) {
+                                     const MapConfig& config,
+                                     const SearchLimits& limits) {
   AgentTypes types(config.agents.size(), AgentKind::Patrol);
   if (policy == "wait") return types;
   if (policy == "hotspot") {
@@ -1406,7 +1469,15 @@ AgentTypes select_agent_types_online(const std::string& policy,
   if (!is_routing_policy(policy)) {
     throw std::invalid_argument("unknown policy: " + policy);
   }
-  if (policy == "lns" || policy == "alns" || policy == "stop_bp" ||
+  if (policy == "simple_lns") {
+    return select_simple_lns_agent_types(config, limits);
+  }
+  if (policy == "lns_dp") {
+    return select_lns_dp_agent_types(config, limits);
+  }
+  if (policy == "lns" || policy == "alns" || policy == "palns" ||
+      policy == "mlns" ||
+      policy == "stop_bp" ||
       policy == "bp") {
     return select_lns_agent_types(config);
   }
@@ -1433,12 +1504,13 @@ AgentTypes select_agent_types_online(const std::string& policy,
 }
 
 AgentTypes select_agent_types(const std::string& policy,
-                              const MapConfig& config) {
+                              const MapConfig& config,
+                              const SearchLimits& limits) {
   // The complete daySteps/daySeconds schedule is part of the initial map
   // configuration. Keep it available for the one-time role decision: fuel
   // pressure and useful refueling assignments depend on the actual match
   // horizons, not a synthetic placeholder schedule.
-  return select_agent_types_online(policy, config);
+  return select_agent_types_online(policy, config, limits);
 }
 
 ActionPlan plan_day_online(const std::string& policy, const MapConfig& config,
@@ -1487,8 +1559,34 @@ ActionPlan plan_day_online(const std::string& policy, const MapConfig& config,
   if (policy == "local_search") {
     return build_local_search_plan(config, day, history, fixed_types, limits);
   }
-  if (policy == "lns" || policy == "alns") {
+  if (policy == "simple_lns") {
+    return build_simple_lns_plan(config, day, history, fixed_types, limits,
+                                 nullptr, on_improve)
+        .actions;
+  }
+  if (policy == "lns_dp") {
+    return build_lns_dp_plan(config, day, history, fixed_types, limits,
+                             nullptr, on_improve)
+        .actions;
+  }
+  if (policy == "mlns") {
+    return build_mlns_plan(config, day, history, fixed_types, limits, nullptr,
+                           on_improve)
+        .actions;
+  }
+  if (policy == "lns" || policy == "alns" || policy == "palns") {
     SearchLimits resolved_limits = limits;
+    const bool projected = policy == "palns";
+    if (projected) {
+      if (resolved_limits.total_iterations < 0) {
+        resolved_limits.total_iterations = 1536;
+      }
+      resolved_limits.min_iterations = 0;
+      resolved_limits.max_iterations = resolved_limits.total_iterations;
+      resolved_limits.stagnation_iterations = 0;
+      resolved_limits.continuation_time_percent = 0;
+      resolved_limits.alns_restarts = resolved_limits.palns_restarts;
+    }
     if (resolved_limits.alns_restarts == 0) {
       resolved_limits.alns_restarts = policy == "alns" ? 3 : 1;
     }
@@ -1537,6 +1635,31 @@ ActionPlan plan_day(const std::string& policy, const MapConfig& config,
   // current day's revealed traffic and agent state.
   return plan_day_online(policy, config, day, history, fixed_types, limits,
                          on_improve);
+}
+
+PlannerResult plan_day_with_state(
+    const std::string& policy, const MapConfig& config, const DayInfo& day,
+    const PolicyHistory& history, const AgentTypes& fixed_types,
+    const SearchLimits& limits, const json::value* planner_state,
+    const ImprovementSink* on_improve) {
+  if (day.day < 0 || day.day >= static_cast<int>(config.day_steps.size())) {
+    throw std::invalid_argument("day index outside config");
+  }
+  if (policy == "mlns") {
+    return build_mlns_plan(config, day, history, fixed_types, limits,
+                           planner_state, on_improve);
+  }
+  if (policy == "simple_lns") {
+    return build_simple_lns_plan(config, day, history, fixed_types, limits,
+                                 planner_state, on_improve);
+  }
+  if (policy == "lns_dp") {
+    return build_lns_dp_plan(config, day, history, fixed_types, limits,
+                             planner_state, on_improve);
+  }
+  return {plan_day_online(policy, config, day, history, fixed_types, limits,
+                          on_improve),
+          std::nullopt};
 }
 
 std::optional<std::string> validate_action_plan(const MapConfig& config,
@@ -1608,6 +1731,13 @@ json::value trace_action_plan(const MapConfig& config, const DayInfo& day,
                       {"error", error ? json::value(*error) : json::value()},
                       {"frames", std::move(frames)},
                       {"acquisitions", std::move(acquisitions)}};
+  json::array own_traffic;
+  for (const auto& [pos, volume] : traffic) {
+    if (volume > 0) {
+      own_traffic.push_back(json::object{{"pos", pos}, {"volume", volume}});
+    }
+  }
+  result["own_traffic"] = std::move(own_traffic);
   if (!error) {
     result["score"] = json::object{
         {"distinct_types", static_cast<int>(team.distinct_types.size())},
@@ -1632,7 +1762,37 @@ EvaluationResult evaluate_scenario_impl(const json::value& scenario,
       policies.emplace_back(item.as_string());
     }
   }
-  if (static_cast<int>(policies.size()) != config.players) {
+  std::vector<std::map<int, int>> fixed_opponent_traffic;
+  int fixed_opponent_players = 0;
+  if (const auto* fixed = root.if_contains("fixedOpponentTraffic")) {
+    if (const auto* count = root.if_contains("fixedOpponentPlayers")) {
+      fixed_opponent_players = count->to_number<int>();
+    }
+    if (fixed_opponent_players <= 0 ||
+        static_cast<int>(policies.size()) + fixed_opponent_players !=
+            config.players) {
+      throw std::invalid_argument(
+          "fixed opponent count does not match players");
+    }
+    for (const auto& encoded_day : fixed->as_array()) {
+      std::map<int, int> traffic;
+      for (const auto& encoded_entry : encoded_day.as_array()) {
+        const auto& entry = encoded_entry.as_object();
+        const int pos = entry.at("pos").to_number<int>();
+        const int volume = entry.at("volume").to_number<int>();
+        if (pos < 0 || pos >= config.width * config.height ||
+            config.cells[pos] != Terrain::Road || volume < 0) {
+          throw std::invalid_argument("invalid fixed opponent traffic");
+        }
+        if (volume > 0) traffic[pos] += volume;
+      }
+      fixed_opponent_traffic.push_back(std::move(traffic));
+    }
+    if (fixed_opponent_traffic.size() != config.day_steps.size()) {
+      throw std::invalid_argument(
+          "fixed opponent traffic does not match days");
+    }
+  } else if (static_cast<int>(policies.size()) != config.players) {
     throw std::invalid_argument("scenario opponents do not match players");
   }
   const bool search_for_all_players =
@@ -1656,7 +1816,9 @@ EvaluationResult evaluate_scenario_impl(const json::value& scenario,
     TeamState team;
     team.id = std::to_string(team_index);
     team.policy = policies[team_index];
-    AgentTypes types = select_agent_types(team.policy, config);
+    const SearchLimits type_limits =
+        team_index == 0 || search_for_all_players ? limits : SearchLimits{};
+    AgentTypes types = select_agent_types(team.policy, config, type_limits);
     for (std::size_t index = 0; index < config.agents.size(); ++index) {
       team.agents.push_back(
           {types[index], config.agents[index], config.fuel_limit});
@@ -1669,7 +1831,7 @@ EvaluationResult evaluate_scenario_impl(const json::value& scenario,
   for (int day_index = 0; day_index < static_cast<int>(config.day_steps.size());
        ++day_index) {
     const auto roads =
-        road_status_for_day(config, traffic_history, static_cast<int>(teams.size()));
+        road_status_for_day(config, traffic_history, config.players);
     for (auto& team : teams) {
       team.stock.clear();
       team.daily_types.clear();
@@ -1700,9 +1862,17 @@ EvaluationResult evaluate_scenario_impl(const json::value& scenario,
       SearchLimits team_limits =
           team_index == 0 || search_for_all_players ? limits : SearchLimits{};
       team_limits.random_seed ^= player_seeds[team_index];
-      plans.push_back(plan_day(teams[team_index].policy, config, info,
-                               teams[team_index].history, fixed,
-                               team_limits));
+      auto planned = plan_day_with_state(
+          teams[team_index].policy, config, info, teams[team_index].history,
+          fixed, team_limits,
+          teams[team_index].planner_state
+              ? &*teams[team_index].planner_state
+              : nullptr);
+      plans.push_back(std::move(planned.actions));
+      teams[team_index].planner_state =
+          planned.planner_state
+              ? std::optional<json::value>(json::value(*planned.planner_state))
+              : std::nullopt;
     }
     json::array all_team_actions;
     if (replay_days != nullptr) {
@@ -1713,7 +1883,12 @@ EvaluationResult evaluate_scenario_impl(const json::value& scenario,
       }
     }
 
-    std::map<int, int> day_traffic;
+    std::map<int, int> opponent_day_traffic;
+    if (!fixed_opponent_traffic.empty()) {
+      opponent_day_traffic = fixed_opponent_traffic[day_index];
+    }
+    std::map<int, int> own_day_traffic;
+    std::map<int, int> day_traffic = opponent_day_traffic;
     for (std::size_t team_index = 0; team_index < teams.size(); ++team_index) {
       const int previous_servings = teams[team_index].total_servings;
       auto trial = teams[team_index];
@@ -1731,16 +1906,25 @@ EvaluationResult evaluate_scenario_impl(const json::value& scenario,
       }
       SimulationTrace trace;
       trace.capture_frames = replay_days != nullptr && team_index == 0;
+      std::map<int, int> team_day_traffic;
       auto actual_error = simulate_team_day(
-          config, teams[team_index], plans[team_index], roads, day_traffic,
+          config, teams[team_index], plans[team_index], roads, team_day_traffic,
           trace.capture_frames ? &trace : nullptr);
       if (actual_error) {
         throw std::logic_error("fallback simulation failed: " + *actual_error);
       }
+      for (const auto& [pos, volume] : team_day_traffic) {
+        day_traffic[pos] += volume;
+        if (team_index > 0) opponent_day_traffic[pos] += volume;
+      }
+      if (team_index == 0) own_day_traffic = team_day_traffic;
       teams[team_index].history.submitted_actions.push_back(plans[team_index]);
       teams[team_index].history.distinct_brands = teams[team_index].distinct_types;
       teams[team_index].cumulative_daily_types +=
           static_cast<int>(teams[team_index].daily_types.size());
+      teams[team_index].history.cumulative_daily_types =
+          teams[team_index].cumulative_daily_types;
+      teams[team_index].history.total_servings = teams[team_index].total_servings;
       teams[team_index].daily_scores.push_back(
           {static_cast<int>(teams[team_index].distinct_types.size()),
            static_cast<int>(teams[team_index].daily_types.size()),
@@ -1776,6 +1960,26 @@ EvaluationResult evaluate_scenario_impl(const json::value& scenario,
             {"all_team_actions", std::move(all_team_actions)}});
       }
     }
+    if (replay_days != nullptr) {
+      json::array encoded_opponent_traffic;
+      for (const auto& [pos, volume] : opponent_day_traffic) {
+        if (volume > 0) {
+          encoded_opponent_traffic.push_back(
+              json::object{{"pos", pos}, {"volume", volume}});
+        }
+      }
+      replay_days->back().as_object()["opponent_traffic"] =
+          std::move(encoded_opponent_traffic);
+      json::array encoded_own_traffic;
+      for (const auto& [pos, volume] : own_day_traffic) {
+        if (volume > 0) {
+          encoded_own_traffic.push_back(
+              json::object{{"pos", pos}, {"volume", volume}});
+        }
+      }
+      replay_days->back().as_object()["own_traffic"] =
+          std::move(encoded_own_traffic);
+    }
     traffic_history.push_back(std::move(day_traffic));
   }
 
@@ -1794,7 +1998,8 @@ EvaluationResult evaluate_scenario_impl(const json::value& scenario,
   return {{static_cast<int>(own.distinct_types.size()),
            own.cumulative_daily_types, own.total_servings},
           own.valid_days, own.invalid_days, patrol_agents, refuel_agents,
-          own.refuel_events, ending_patrol_fuel, own.daily_scores, own.errors};
+          own.refuel_events, ending_patrol_fuel, own.daily_scores, own.errors,
+          current_palns_diagnostics(), current_mlns_diagnostics()};
 }
 
 }  // namespace
@@ -1802,12 +2007,16 @@ EvaluationResult evaluate_scenario_impl(const json::value& scenario,
 EvaluationResult evaluate_scenario(const json::value& scenario,
                                    const std::string& policy,
                                    const SearchLimits& limits) {
+  reset_palns_diagnostics();
+  reset_mlns_diagnostics();
   return evaluate_scenario_impl(scenario, policy, limits, nullptr);
 }
 
 json::value evaluate_scenario_replay(const json::value& scenario,
                                      const std::string& policy,
                                      const SearchLimits& limits) {
+  reset_palns_diagnostics();
+  reset_mlns_diagnostics();
   json::array days;
   auto result = evaluate_scenario_impl(scenario, policy, limits, &days);
   auto output = to_json(result).as_object();

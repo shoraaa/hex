@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "suite": "saved-online-practice-all-7",
+  "cases": [
+    {
+      "path": "q01-d2d87157.json",
+      "name": "q01-d2d87157"
+    },
+    {
+      "path": "q02-a759fcca.json",
+      "name": "q02-a759fcca"
+    },
+    {
+      "path": "q03-48e8181f.json",
+      "name": "q03-48e8181f"
+    },
+    {
+      "path": "q04-b73d272a.json",
+      "name": "q04-b73d272a"
+    },
+    {
+      "path": "new-question-52962f8f.json",
+      "name": "new-question-52962f8f"
+    },
+    {
+      "path": "q05-97fcbe8a.json",
+      "name": "q05-97fcbe8a"
+    },
+    {
+      "path": "q06-1cbf1a56.json",
+      "name": "q06-1cbf1a56"
+    }
+  ]
+}
