@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 
 import pytest
 
 from hexbench import api, web
+from hexbench.competition import (
+    CompetitionSessionManager,
+    _simulation_traffic_prediction,
+    _traffic_prediction_accuracy,
+)
 
 
 def test_dashboard_job_benchmarks_selected_policies(monkeypatch, tmp_path: Path) -> None:
@@ -332,6 +338,18 @@ def test_play_ui_exposes_streaming_console_and_original_game_features() -> None:
     assert "convergenceMarkup" in script
     assert "incumbents" in script
     assert "elapsed_seconds" in script
+    assert "day_metrics" in script
+    assert "prediction_accuracy" in script
+    assert "dayResult" in script
+    assert "dayDistinct" in script
+    assert "metric.result" in script
+    assert '${esc(T("daily"))}: ${score.daily}' in script
+    assert "competitive?.prev?.holder_score?.[1]" in script
+    assert "peer.cumulative_daily_types" in script
+    assert 'id="score-daily"' in script
+    assert "updateDayMetricTimers" in script
+    assert "day-metrics-grid" in script
+    assert "convergence-chart" not in script
     assert "internalRankMarkup" in script
     assert "internal_rank" in script
     assert "trafficRank" in script
@@ -346,6 +364,71 @@ def test_play_ui_exposes_streaming_console_and_original_game_features() -> None:
     assert "resetGame" in script
     assert "renderMap" in script
     assert "hex-locale" in script
+
+
+def test_prediction_metrics_compare_simulation_with_authoritative_roads() -> None:
+    config = {
+        "busyThreshold": 2,
+        "jammedThreshold": 4,
+        "map": {"cells": [[1, 0, 1]]},
+    }
+    predicted = _simulation_traffic_prediction(
+        config,
+        [
+            [{"pos": 0, "volume": 2}, {"pos": 2, "volume": 1}],
+            [{"pos": 0, "volume": 2}, {"pos": 2, "volume": 3}],
+        ],
+    )
+
+    assert predicted == [{"pos": 0, "status": 2}, {"pos": 2, "status": 2}]
+    assert _traffic_prediction_accuracy(
+        predicted,
+        [{"pos": 0, "status": 2}, {"pos": 2, "status": 1}],
+    ) == {
+        "matched_roads": 1,
+        "road_count": 2,
+        "prediction_accuracy": 0.5,
+    }
+
+
+def test_session_persists_revealed_gnn_accuracy(tmp_path: Path) -> None:
+    manager = CompetitionSessionManager.__new__(CompetitionSessionManager)
+    manager.report_dir = tmp_path
+    manager._lock = threading.RLock()
+    manager._sessions = {"session": {"id": "session", "day_metrics": []}}
+    journal = {
+        "traffic_predictions": {
+            "1": {
+                "mode": "gnn",
+                "traffics": [
+                    {"pos": 0, "status": 2},
+                    {"pos": 2, "status": 0},
+                ],
+            }
+        }
+    }
+
+    manager._record_prediction_accuracy(
+        "session",
+        journal,
+        {
+            "day": 1,
+            "traffics": [
+                {"pos": 0, "status": 2},
+                {"pos": 2, "status": 1},
+            ],
+        },
+        "simulation",
+    )
+
+    assert manager._sessions["session"]["day_metrics"][0] == {
+        "day": 1,
+        "prediction_mode": "gnn",
+        "prediction_available": True,
+        "matched_roads": 1,
+        "road_count": 2,
+        "prediction_accuracy": 0.5,
+    }
 
 
 def test_day_transition_reuses_the_active_play_session() -> None:

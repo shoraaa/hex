@@ -54,7 +54,8 @@ def _traffic_gnn_checkpoint(payload: dict[str, Any]) -> Path:
     )
 
 
-def _prepare_traffic_gnn_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def prepare_traffic_prediction_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Attach optional MLNS GNN forecasts so callers can inspect the maps."""
     if not _traffic_gnn_enabled(payload) or "predictedTraffic" in payload:
         return payload
     from .traffic_gnn import predict_future_traffic
@@ -107,7 +108,7 @@ def run_core(
     environment_overrides: dict[str, str | None] | None = None,
 ) -> Any:
     if isinstance(payload, dict) and policy == "mlns":
-        payload = _prepare_traffic_gnn_payload(payload)
+        payload = prepare_traffic_prediction_payload(payload)
     environment = None
     if core_threads is not None or environment_overrides:
         environment = dict(os.environ)
@@ -152,7 +153,11 @@ def stream_core(
     The ``timeout`` is a backstop watchdog: it should exceed the solver deadline
     plus a margin. Returns the final (best) record, or ``None`` if nothing streamed.
     """
-    payload = _prepare_traffic_gnn_payload(payload) if policy == "mlns" else payload
+    payload = (
+        prepare_traffic_prediction_payload(payload)
+        if policy == "mlns"
+        else payload
+    )
     environment = None
     if core_threads is not None:
         environment = dict(os.environ)

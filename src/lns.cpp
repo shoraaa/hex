@@ -4824,6 +4824,36 @@ PlannerResult build_mlns_plan(
       }
     }
   };
+  // Test one transition from the actual incumbent before longer root searches
+  // can consume the request. The variant generator is a no-op when staging is
+  // irrelevant, and the ordinary whole-match comparator still protects the
+  // current-day coverage floor.
+  int maximum_patrol_fuel = 0;
+  int patrol_count = 0;
+  for (std::size_t agent = 0; agent < types.size(); ++agent) {
+    if (types[agent] != AgentKind::Patrol) continue;
+    ++patrol_count;
+    maximum_patrol_fuel = std::max(
+        maximum_patrol_fuel, best.days.front().evaluation.ending_fuel[agent]);
+  }
+  const bool fuel_starved_transition =
+      patrol_count > 0 &&
+      maximum_patrol_fuel <= std::max(1, config.fuel_limit / 5);
+  if (!expired() && remaining_days > 1 && fuel_starved_transition) {
+    const auto transition_started = std::chrono::steady_clock::now();
+    const auto transition_deadline =
+        timed ? std::min(deadline,
+                         transition_started +
+                             std::chrono::milliseconds(std::clamp(
+                                 limits.time_limit_ms / 10, 250, 1000)))
+              : std::chrono::steady_clock::time_point::max();
+    for (const auto& staged : refuel_staging_variants(
+             config, day, types, history, best.days.front().plan)) {
+      consider_root_seed(staged, /*strong_suffix=*/false,
+                         transition_deadline);
+      break;
+    }
+  }
   const bool use_dp_proposals = lns_dp_proposals_enabled(limits);
   // Preserve a bounded production-ALNS current-day floor while leaving most of
   // the request available to the whole-match search.
@@ -4989,9 +5019,10 @@ PlannerResult build_mlns_plan(
     auto root_seed =
         build_aco_plan(config, day, history, types, true, seed_limits);
     consider_root_seed(root_seed, /*strong_suffix=*/true);
-    if (auto evaluation = evaluate_candidate(config, day, history, root_seed)) {
+    if (auto evaluation = evaluate_candidate(
+            config, day, history, best.days.front().plan)) {
       for (const auto& staged : refuel_staging_variants(
-               config, day, types, history, root_seed)) {
+               config, day, types, history, best.days.front().plan)) {
         consider_root_seed(staged);
       }
     }

@@ -45,6 +45,7 @@ void test_simple_lns_intercepts_and_serializes_suffix() {
   const auto trace =
       hexudon::trace_action_plan(config, day, {}, planned.actions).as_object();
   assert(trace.at("valid").as_bool());
+  assert(trace.at("own_traffic").is_array());
   const auto& score = trace.at("score").as_object();
   assert(score.at("servings").as_int64() >= 1);
   assert(score.at("refuel_events").as_int64() >= 1);

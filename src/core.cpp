@@ -1731,6 +1731,13 @@ json::value trace_action_plan(const MapConfig& config, const DayInfo& day,
                       {"error", error ? json::value(*error) : json::value()},
                       {"frames", std::move(frames)},
                       {"acquisitions", std::move(acquisitions)}};
+  json::array own_traffic;
+  for (const auto& [pos, volume] : traffic) {
+    if (volume > 0) {
+      own_traffic.push_back(json::object{{"pos", pos}, {"volume", volume}});
+    }
+  }
+  result["own_traffic"] = std::move(own_traffic);
   if (!error) {
     result["score"] = json::object{
         {"distinct_types", static_cast<int>(team.distinct_types.size())},

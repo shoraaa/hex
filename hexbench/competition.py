@@ -38,7 +38,12 @@ from .api import (
     trace_action_plan,
 )
 from .models import validate_action_shape, validate_agent_types
-from .runner import find_binary, run_core, stream_core
+from .runner import (
+    find_binary,
+    prepare_traffic_prediction_payload,
+    run_core,
+    stream_core,
+)
 
 
 def _now() -> str:
@@ -80,6 +85,55 @@ def _score_triplet(value: Any) -> tuple[int, int, int]:
     if not isinstance(value, (list, tuple)) or len(value) < 3:
         raise ValueError("competitive holder score is missing or invalid")
     return tuple(int(value[index]) for index in range(3))
+
+
+def _traffic_map(items: Any, value_key: str) -> dict[int, int]:
+    if not isinstance(items, list):
+        return {}
+    return {
+        int(item["pos"]): int(item[value_key])
+        for item in items
+        if isinstance(item, dict) and "pos" in item and value_key in item
+    }
+
+
+def _traffic_prediction_accuracy(
+    predicted: list[dict[str, Any]], actual: list[dict[str, Any]]
+) -> dict[str, int | float] | None:
+    """Compare one forecast with the authoritative status of every road."""
+    actual_map = _traffic_map(actual, "status")
+    if not actual_map:
+        return None
+    predicted_map = _traffic_map(predicted, "status")
+    matched = sum(
+        predicted_map.get(position) == status
+        for position, status in actual_map.items()
+    )
+    roads = len(actual_map)
+    return {
+        "matched_roads": matched,
+        "road_count": roads,
+        "prediction_accuracy": matched / roads,
+    }
+
+
+def _simulation_traffic_prediction(
+    config: dict[str, Any], traffic_history: list[list[dict[str, Any]]]
+) -> list[dict[str, int]]:
+    """Reproduce MLNS's symmetric next-day self-traffic simulation."""
+    recent = [_traffic_map(items, "volume") for items in traffic_history[-2:]]
+    busy = int(config["busyThreshold"])
+    jammed = int(config["jammedThreshold"])
+    output: list[dict[str, int]] = []
+    for position, terrain in enumerate(
+        value for row in config["map"]["cells"] for value in row
+    ):
+        if int(terrain) != 1:
+            continue
+        volume = sum(day.get(position, 0) for day in recent)
+        status = 2 if volume >= jammed else 1 if volume >= busy else 0
+        output.append({"pos": position, "status": status})
+    return output
 
 
 def _challenge_score(
@@ -173,6 +227,7 @@ class CompetitionSessionManager:
                 continue
             if not isinstance(session, dict) or not session.get("id"):
                 continue
+            session.setdefault("day_metrics", [])
             if session.get("state") in {
                 "planning",
                 "awaiting_role_approval",
@@ -274,6 +329,7 @@ class CompetitionSessionManager:
                 "cumulative_daily_types": 0,
                 "total_servings": 0,
                 "planner_state": None,
+                "traffic_predictions": {},
             },
         )
 
@@ -376,6 +432,7 @@ class CompetitionSessionManager:
                 "proposal": None,
                 "last_submission": None,
                 "incumbents": [],
+                "day_metrics": [],
                 "created_at": _now(),
                 "updated_at": _now(),
                 "progress": {"status": "starting"},
@@ -730,6 +787,56 @@ class CompetitionSessionManager:
                 session["events"] = compacted[-300:]
             _write_json(self._session_path(session_id), session)
 
+    def _update_day_metric(
+        self, session_id: str, day: int, **values: Any
+    ) -> None:
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return
+            metrics = session.setdefault("day_metrics", [])
+            metric = next(
+                (item for item in metrics if int(item.get("day", -1)) == day),
+                None,
+            )
+            if metric is None:
+                metric = {"day": day}
+                metrics.append(metric)
+                metrics.sort(key=lambda item: int(item.get("day", -1)))
+            metric.update(copy.deepcopy(values))
+            session["updated_at"] = _now()
+            _write_json(self._session_path(session_id), session)
+
+    def _record_prediction_accuracy(
+        self,
+        session_id: str,
+        journal: dict[str, Any],
+        day: dict[str, Any],
+        default_mode: str,
+    ) -> None:
+        day_index = int(day["day"])
+        prediction = journal.setdefault("traffic_predictions", {}).get(
+            str(day_index)
+        )
+        if not isinstance(prediction, dict):
+            self._update_day_metric(
+                session_id,
+                day_index,
+                prediction_mode=default_mode,
+                prediction_available=False,
+            )
+            return
+        accuracy = _traffic_prediction_accuracy(
+            prediction.get("traffics", []), day.get("traffics", [])
+        )
+        self._update_day_metric(
+            session_id,
+            day_index,
+            prediction_mode=str(prediction.get("mode", default_mode)),
+            prediction_available=accuracy is not None,
+            **(accuracy or {}),
+        )
+
     def _record_incumbent(
         self,
         session_id: str,
@@ -838,6 +945,7 @@ class CompetitionSessionManager:
         journal.setdefault("competitive_day_baselines", {})
         journal.setdefault("types", None)
         journal.setdefault("planner_state", None)
+        journal.setdefault("traffic_predictions", {})
         return path, journal
 
     def _sync_actions(
@@ -1374,6 +1482,15 @@ class CompetitionSessionManager:
             )
         )
         binary = find_binary(self.binary_path)
+        prediction_mode = (
+            "gnn"
+            if bool(session.get("hyperparameters", {}).get("use_traffic_gnn"))
+            else "simulation"
+        )
+        self._record_prediction_accuracy(
+            session_id, journal, day, prediction_mode
+        )
+        timer_started_at = _now()
 
         stream_state: dict[str, Any] = {
             "count": 0,
@@ -1384,18 +1501,36 @@ class CompetitionSessionManager:
             "last_submit": 0.0,
         }
         debounce = 0.25
-        previous_incumbents = (self.get_session(session_id) or {}).get(
-            "incumbents", []
-        )
-        elapsed_offset = max(
+        current_session = self.get_session(session_id) or {}
+        previous_incumbents = current_session.get("incumbents", [])
+        previous_metric_elapsed = max(
             (
-                float(row.get("elapsed_seconds", 0.0))
-                for row in previous_incumbents
-                if int(row.get("day", -1)) == day_index
+                float(metric.get("elapsed_seconds", 0.0))
+                for metric in current_session.get("day_metrics", [])
+                if int(metric.get("day", -1)) == day_index
             ),
             default=0.0,
         )
+        elapsed_offset = max(
+            previous_metric_elapsed,
+            max(
+                (
+                    float(row.get("elapsed_seconds", 0.0))
+                    for row in previous_incumbents
+                    if int(row.get("day", -1)) == day_index
+                ),
+                default=0.0,
+            ),
+        )
         search_started = time.monotonic()
+        self._update_day_metric(
+            session_id,
+            day_index,
+            elapsed_seconds=elapsed_offset,
+            timer_started_at=timer_started_at,
+            budget_seconds=budget,
+            timer_running=True,
+        )
 
         def submit(
             actions: list[list[int]], score: Any, incumbent_sequence: int | None = None
@@ -1434,6 +1569,8 @@ class CompetitionSessionManager:
                     "submission_count": stream_state["count"],
                     "incumbent_count": stream_state["incumbent_count"],
                     "budget_seconds": budget,
+                    "timer_started_at": timer_started_at,
+                    "elapsed_offset_seconds": elapsed_offset,
                 },
             )
 
@@ -1485,6 +1622,8 @@ class CompetitionSessionManager:
                 "budget_seconds": budget,
                 "submission_count": 0,
                 "incumbent_count": 0,
+                "timer_started_at": timer_started_at,
+                "elapsed_offset_seconds": elapsed_offset,
             },
         )
         payload = {
@@ -1514,6 +1653,18 @@ class CompetitionSessionManager:
             and saved_state.get("method") == session["method"]
         ):
             payload["planner_state"] = saved_state.get("state")
+        if session["method"] == "mlns":
+            payload = prepare_traffic_prediction_payload(payload)
+        predicted_next = next(
+            (
+                copy.deepcopy(item.get("traffics", []))
+                for item in payload.get("predictedTraffic", [])
+                if int(item.get("day", -1)) == day_index + 1
+            ),
+            None,
+        )
+        if predicted_next is not None:
+            prediction_mode = "gnn"
         final_record: dict[str, Any] | None = None
         try:
             final_record = stream_core(
@@ -1530,6 +1681,15 @@ class CompetitionSessionManager:
                 try:
                     submit(fallback, [0, 0, 0])
                 except Exception:
+                    self._update_day_metric(
+                        session_id,
+                        day_index,
+                        elapsed_seconds=(
+                            elapsed_offset + time.monotonic() - search_started
+                        ),
+                        timer_started_at=None,
+                        timer_running=False,
+                    )
                     self._update(
                         session_id,
                         state="failed",
@@ -1562,6 +1722,7 @@ class CompetitionSessionManager:
             return
         if current.get("paused"):
             # Resume re-streams this day; the partial best already stands.
+            paused_elapsed = elapsed_offset + time.monotonic() - search_started
             self._update(
                 session_id,
                 progress={
@@ -1570,7 +1731,15 @@ class CompetitionSessionManager:
                     "submission_count": stream_state["count"],
                     "incumbent_count": stream_state["incumbent_count"],
                     "budget_seconds": budget,
+                    "elapsed_seconds": paused_elapsed,
                 },
+            )
+            self._update_day_metric(
+                session_id,
+                day_index,
+                elapsed_seconds=paused_elapsed,
+                timer_started_at=None,
+                timer_running=False,
             )
             return
         if stream_state["best"] is None:
@@ -1578,16 +1747,45 @@ class CompetitionSessionManager:
             submit(fallback, [0, 0, 0])
 
         final_actions = journal["submitted_days"].get(key)
+        day_result = None
         if final_actions is not None:
             trace = trace_action_plan(
                 config, day, history, final_actions, binary_path=self.binary_path
             )
+            trace_score = trace.get("score") or {}
+            day_result = {
+                "distinct_types": int(trace_score.get("distinct_types", 0)),
+                "daily_types": int(trace_score.get("daily_types", 0)),
+                "servings": int(trace_score.get("servings", 0)),
+            }
             journal["day_snapshots"][key] = {
                 "day_info": day,
                 "actions": final_actions,
                 "trace": trace,
                 "submitted_at": _now(),
             }
+            next_day = day_index + 1
+            if next_day < len(config.get("daySteps", [])):
+                if predicted_next is None:
+                    traffic_history = [
+                        (snapshot.get("trace") or {}).get("own_traffic", [])
+                        for snapshot_day, snapshot in sorted(
+                            journal.get("day_snapshots", {}).items(),
+                            key=lambda item: int(item[0]),
+                        )
+                        if int(snapshot_day) <= day_index
+                    ]
+                    predicted_next = _simulation_traffic_prediction(
+                        config, traffic_history
+                    )
+                    prediction_mode = "simulation"
+                journal.setdefault("traffic_predictions", {})[
+                    str(next_day)
+                ] = {
+                    "source_day": day_index,
+                    "mode": prediction_mode,
+                    "traffics": predicted_next,
+                }
             collected_positions = {
                 int(position)
                 for frame in trace.get("frames", [])
@@ -1613,6 +1811,16 @@ class CompetitionSessionManager:
             )
             _write_json(state_path, journal)
 
+        elapsed_seconds = elapsed_offset + time.monotonic() - search_started
+        self._update_day_metric(
+            session_id,
+            day_index,
+            elapsed_seconds=elapsed_seconds,
+            timer_started_at=None,
+            budget_seconds=budget,
+            timer_running=False,
+            **({"result": day_result} if day_result is not None else {}),
+        )
         self._update(
             session_id,
             state="waiting_for_day",
@@ -1626,6 +1834,7 @@ class CompetitionSessionManager:
                 "submission_count": stream_state["count"],
                 "incumbent_count": stream_state["incumbent_count"],
                 "budget_seconds": budget,
+                "elapsed_seconds": elapsed_seconds,
             },
         )
 
