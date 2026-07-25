@@ -2305,7 +2305,8 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
                             bool allow_continuation,
                             std::uint64_t restart_salt,
                             const ImprovementSink* on_improve,
-                            std::vector<ActionPlan>* elite_plans) {
+                            std::vector<ActionPlan>* elite_plans,
+                            ActionPlan* myopic_plan) {
   const auto started = std::chrono::steady_clock::now();
   const bool timed = limits.time_limit_ms >= 0;
   const auto deadline =
@@ -3121,6 +3122,12 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
     std::fprintf(stderr, "%s\n", line.str().c_str());
     std::fflush(stderr);
   }
+
+  // Whole-match callers may need both the strongest realized route from the
+  // current-day phase and the route selected by ALNS's continuation rollout.
+  // Capture the former before either continuation tier changes `best` so the
+  // caller can evaluate both boundary states without running a second search.
+  if (myopic_plan != nullptr) *myopic_plan = best;
 
   // A refuel car is normally moved only when the current day's patrol route
   // needs a rendezvous.  That is good for the daily score, but it can leave
@@ -4866,8 +4873,11 @@ PlannerResult build_mlns_plan(
         started + std::chrono::milliseconds(
                       std::max(1, limits.time_limit_ms * 60 / 100));
     SearchLimits current_limits = limits;
-    current_limits.time_limit_ms =
-        std::max(250, limits.time_limit_ms * 50 / 100);
+    const bool self_traffic_fleet_coupling =
+        config.players == 1 && patrol_count >= 3;
+    current_limits.time_limit_ms = std::max(
+        250, limits.time_limit_ms *
+                 (self_traffic_fleet_coupling ? 60 : 50) / 100);
     current_limits.min_iterations = 0;
     current_limits.max_iterations = std::max(1, limits.max_iterations);
     current_limits.stagnation_iterations = 0;
@@ -4875,19 +4885,36 @@ PlannerResult build_mlns_plan(
     // This is the protected baseline chain. Its budget must remain comparable
     // to ordinary ALNS; DP proposals are evaluated separately by MLNS below.
     current_limits.use_lns_dp_proposals = false;
-    // Do not spend the floor's slice on its own continuation look-ahead: MLNS
-    // already searches the whole match around this seed, so an internal
-    // continuation phase is redundant and (via alns_anytime_budget's 50/50
-    // split) halves the floor's current-day search. On coverage-saturated maps
-    // that lost servings the whole-match machinery cannot recover, because the
-    // floor is the only component that optimizes the committed day's servings.
-    // Running it current-day-only lifts its effective budget from ~25% to ~50%
-    // of the request, matching standalone ALNS's current-day effort.
-    auto current_seed = build_alns_plan(
-        config, day, history, types, current_limits,
-        kProductionAlnsFeatures, /*allow_continuation=*/false);
-    consider_root_seed(current_seed,
-        /*strong_suffix=*/false, floor_deadline);
+    if (self_traffic_fleet_coupling) {
+      // With one team the future roads are generated entirely by our own
+      // routes. Three or more patrols sharing one refuel car also make today's
+      // rendezvous positions strongly constrain tomorrow. Spend a small tail
+      // of the existing floor on the simulator-backed ALNS continuation and
+      // expose both its myopic and continuation-selected roots to MLNS. This
+      // keeps the reliable daily floor while adding the boundary state MLNS's
+      // cheaper decoder otherwise misses.
+      current_limits.continuation_time_percent = 15;
+      ActionPlan myopic_seed;
+      auto continuation_seed = build_alns_plan(
+          config, day, history, types, current_limits,
+          kProductionAlnsFeatures, /*allow_continuation=*/true,
+          /*restart_salt=*/0, /*on_improve=*/nullptr,
+          /*elite_plans=*/nullptr, &myopic_seed);
+      consider_root_seed(myopic_seed, /*strong_suffix=*/false,
+                         evaluation_deadline);
+      if (continuation_seed != myopic_seed) {
+        consider_root_seed(continuation_seed, /*strong_suffix=*/false,
+                           evaluation_deadline);
+      }
+    } else {
+      // Opponent traffic is uncertain, or only two patrols share the support
+      // car. Preserve the proven current-day-only floor in that regime.
+      auto current_seed = build_alns_plan(
+          config, day, history, types, current_limits,
+          kProductionAlnsFeatures, /*allow_continuation=*/false);
+      consider_root_seed(current_seed, /*strong_suffix=*/false,
+                         floor_deadline);
+    }
     record_phase("protected_alns_floor", profile_before, profile_started);
   }
   // Near the end of the match there is no value in spending the complete
@@ -5107,9 +5134,7 @@ PlannerResult build_mlns_plan(
     record_phase("warm_start", profile_before, profile_started);
   }
   MlnsSolution current = best;
-  auto emit = [&] {
-    if (on_improve == nullptr || best.days.empty()) return;
-    const auto official = alns_official_value(best.days.front().evaluation.value);
+  auto returned_rank = [&] {
     IncumbentRank rank;
     rank.available = true;
     rank.objective_mode = "mlns";
@@ -5123,6 +5148,12 @@ PlannerResult build_mlns_plan(
     for (std::size_t index = 0; index < rank.weighted_match.size(); ++index) {
       rank.weighted_match[index] = mlns_wide_string(best.rank.weighted[index]);
     }
+    return rank;
+  };
+  auto emit = [&] {
+    if (on_improve == nullptr || best.days.empty()) return;
+    const auto official = alns_official_value(best.days.front().evaluation.value);
+    const auto rank = returned_rank();
     (*on_improve)(best.days.front().plan,
                   Score{std::get<0>(official), std::get<1>(official),
                         std::get<2>(official)},
@@ -5396,7 +5427,7 @@ PlannerResult build_mlns_plan(
                      mlns_profile_snapshot(best), best);
   ++mlns_profile_component(winning_component).final_selections;
   mlns_diagnostics.elapsed_microseconds += mlns_elapsed_microseconds(started);
-  return {best.days.front().plan, std::move(serialized_state)};
+  return {best.days.front().plan, std::move(serialized_state), returned_rank()};
 }
 
 LnsSkeleton build_rollout_skeleton(const MapConfig& config,

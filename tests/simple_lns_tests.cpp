@@ -88,10 +88,32 @@ void test_simple_lns_can_collect_multiple_stock_copies() {
   assert(trace.at("score").as_object().at("servings").as_int64() == 5);
 }
 
+void test_real_match_opponents_may_hide_fuel() {
+  const auto payload = boost::json::parse(R"json({
+    "day": 0,
+    "agents": [{"kind": 0, "pos": 4, "fuel": 12}],
+    "others": [{
+      "id": 6,
+      "agents": [{"kind": 1, "pos": 9}, {"kind": 0, "pos": 10}]
+    }],
+    "traffics": [{"pos": 2, "status": 0}]
+  })json");
+
+  const auto day = hexudon::parse_day_info(payload);
+  assert(day.agents.size() == 1);
+  assert(day.agents[0].fuel == 12);
+  assert(day.others.size() == 1);
+  assert(day.others[0].id == "6");
+  assert(day.others[0].agents.size() == 2);
+  assert(day.others[0].agents[0].fuel == 0);
+  assert(day.others[0].agents[1].fuel == 0);
+}
+
 }  // namespace
 
 int main() {
   test_simple_lns_intercepts_and_serializes_suffix();
   test_simple_lns_can_collect_multiple_stock_copies();
+  test_real_match_opponents_may_hide_fuel();
   std::cout << "simple_lns tests passed\n";
 }

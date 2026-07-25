@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from .api import (
     BASE_URL,
+    _token_team_id,
     _official_score_key,
     _score_detail,
     _suite_map_summary,
@@ -210,7 +211,71 @@ class DashboardApp:
 
     def list_all_games(self) -> list[dict[str, Any]]:
         token = load_token(self.env_path)
-        return discover_assigned_games(token, self.base_url)
+        live = discover_assigned_games(token, self.base_url)
+        return self._merge_saved_games(live, token)
+
+    def _merge_saved_games(
+        self, live: list[dict[str, Any]], token: str
+    ) -> list[dict[str, Any]]:
+        saved = self._competition.saved_games()
+        saved_by_id = {str(game["question_id"]): game for game in saved}
+        own_team_id = _token_team_id(token)
+
+        def enrich(game: dict[str, Any]) -> dict[str, Any]:
+            game = copy.deepcopy(game)
+            session_id = game.get("saved_session_id")
+            session = (
+                self._competition.get_session(str(session_id))
+                if session_id
+                else None
+            )
+            result = session.get("result") if isinstance(session, dict) else None
+            if isinstance(result, dict) and own_team_id is not None:
+                detail = result.get("detail", {}).get(str(own_team_id))
+                ranking = [str(value) for value in result.get("ranking", [])]
+                if isinstance(detail, dict):
+                    game["score"] = copy.deepcopy(detail)
+                if str(own_team_id) in ranking:
+                    game["rank"] = ranking.index(str(own_team_id)) + 1
+                    game["rank_count"] = len(ranking)
+            return game
+
+        merged: list[dict[str, Any]] = []
+        live_ids: set[str] = set()
+        for game in live:
+            game_id = str(game.get("question_id", ""))
+            live_ids.add(game_id)
+            retained = saved_by_id.get(game_id)
+            if retained is not None:
+                game = {
+                    **retained,
+                    **game,
+                    "saved": True,
+                    "archived": False,
+                    "saved_session_id": retained["saved_session_id"],
+                    "saved_at": retained["saved_at"],
+                    "session_state": retained["session_state"],
+                }
+            merged.append(enrich(game))
+        merged.extend(
+            enrich(game)
+            for game in saved
+            if str(game.get("question_id", "")) not in live_ids
+        )
+        return merged
+
+    def archived_games(self) -> list[dict[str, Any]]:
+        try:
+            token = load_token(self.env_path)
+        except (RuntimeError, ValueError):
+            token = ""
+        return self._merge_saved_games([], token)
+
+    def own_team_id(self) -> str | None:
+        try:
+            return _token_team_id(load_token(self.env_path))
+        except (RuntimeError, ValueError):
+            return None
 
     def local_cases(self) -> dict[str, Any]:
         """Return only manifest-declared local cases, grouped for the UI."""
@@ -387,7 +452,66 @@ class DashboardApp:
             return {"error": str(error)}
 
     def snapshot(self, game_id: str) -> dict[str, Any]:
-        return fetch_game_snapshot(load_token(self.env_path), game_id, self.base_url)
+        try:
+            return fetch_game_snapshot(
+                load_token(self.env_path), game_id, self.base_url
+            )
+        except (RuntimeError, ValueError):
+            saved = self._competition.saved_snapshot(game_id)
+            if saved is None:
+                raise
+            return saved
+
+    def _saved_replay(self, game_id: str) -> dict[str, Any] | None:
+        journal = self._competition.saved_journal(game_id)
+        session = self._competition.saved_session_for_game(game_id)
+        if journal is None or session is None:
+            return None
+        config = session.get("snapshot", {}).get("config", {})
+        team_id = self.own_team_id() or "saved"
+        days: list[dict[str, Any]] = []
+        for key, saved in sorted(
+            journal.get("day_snapshots", {}).items(),
+            key=lambda item: int(item[0]),
+        ):
+            if not isinstance(saved, dict) or not isinstance(saved.get("trace"), dict):
+                continue
+            day_index = int(key)
+            day_info = saved.get("day_info", {})
+            trace = saved["trace"]
+            frames = trace.get("frames", [])
+            final_frame = frames[-1] if frames else {}
+            days.append(
+                {
+                    "day": day_index,
+                    "steps": int(
+                        day_info.get("steps")
+                        or config.get("daySteps", [])[day_index]
+                    ),
+                    "road_condition": {
+                        str(item["pos"]): int(item["status"])
+                        for item in day_info.get("traffics", [])
+                        if isinstance(item, dict)
+                        and "pos" in item
+                        and "status" in item
+                    },
+                    "teams": [
+                        {
+                            "team_id": str(team_id),
+                            "frames": copy.deepcopy(frames),
+                            "servings": int(final_frame.get("servings", 0)),
+                            "types": int(final_frame.get("types", 0)),
+                        }
+                    ],
+                }
+            )
+        if not days:
+            return None
+        return {
+            "game_id": str(session.get("game_id") or game_id),
+            "archived": True,
+            "replay": {"days": days},
+        }
 
     def replay(self, game_id: str, team_id: str | None = None) -> dict[str, Any]:
         from .api import GameClient
@@ -403,6 +527,13 @@ class DashboardApp:
             else:
                 endpoint = "/game/replay"
             return {"game_id": resolved, "replay": client.get(endpoint, resolved)}
+        except RuntimeError:
+            if team_id is not None:
+                raise
+            saved = self._saved_replay(game_id)
+            if saved is None:
+                raise
+            return saved
         finally:
             client.close()
 
@@ -470,6 +601,32 @@ class DashboardApp:
             board = client.get("/game/board", game_id)
             resolved = str(board.get("game_id", game_id))
             return {"game_id": resolved, **client.get("/game/actions", resolved)}
+        except RuntimeError:
+            journal = self._competition.saved_journal(game_id)
+            session = self._competition.saved_session_for_game(game_id)
+            if journal is None or session is None:
+                raise
+            team_id = self.own_team_id() or "saved"
+            snapshots = journal.get("day_snapshots", {})
+            return {
+                "game_id": str(session.get("game_id") or game_id),
+                "archived": True,
+                "actions": [
+                    {
+                        "team_id": str(team_id),
+                        "day": int(day),
+                        "plan": copy.deepcopy(plan),
+                        "submit_count": 1,
+                        "submitted_at": (
+                            snapshots.get(str(day), {}).get("submitted_at")
+                        ),
+                    }
+                    for day, plan in sorted(
+                        journal.get("submitted_days", {}).items(),
+                        key=lambda item: int(item[0]),
+                    )
+                ],
+            }
         finally:
             client.close()
 
@@ -971,13 +1128,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 # The LOCAL workspace is deliberately usable without a token or
                 # network connection; surface the online failure without making
                 # the whole static application fail to boot.
-                games = []
+                games = self.app.archived_games()
                 online_error = str(error)
             self._json(
                 HTTPStatus.OK,
                 {
                     "schema_version": 3,
                     "games": games,
+                    "own_team_id": self.app.own_team_id(),
                     "online_error": online_error,
                     "policies": POLICIES,
                     "hyperparameters": POLICY_HYPERPARAMETERS,

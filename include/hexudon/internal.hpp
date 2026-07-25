@@ -285,7 +285,8 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
                            unsigned features, bool allow_continuation = true,
                            std::uint64_t restart_salt = 0,
                            const ImprovementSink* on_improve = nullptr,
-                           std::vector<ActionPlan>* elite_plans = nullptr);
+                           std::vector<ActionPlan>* elite_plans = nullptr,
+                           ActionPlan* myopic_plan = nullptr);
 // Refuel-escort construction seed (empty when there is no refuel car).
 ActionPlan build_escort_plan(const MapConfig& config, const DayInfo& day,
                              const PolicyHistory& history,

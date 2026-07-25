@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -76,6 +77,51 @@ def _maybe_enable_mlns_portfolio(method: str) -> None:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _agent_selection_wait_seconds(
+    config: dict[str, Any],
+    day_index: int,
+    *,
+    now: float | None = None,
+) -> float:
+    """Return how long Day 1 must wait for agent selection to close.
+
+    The schema defines ``startsAt`` as the start of the match, with agent type
+    selection occurring before it. Some servers can briefly expose
+    ``in_progress`` before that wall-clock boundary, so status alone is not
+    sufficient to make a Day 1 submission safe.
+    """
+    if day_index != 0:
+        return 0.0
+    raw_starts_at = config.get("startsAt")
+    if isinstance(raw_starts_at, bool):
+        return 0.0
+    try:
+        starts_at = float(raw_starts_at)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(starts_at):
+        return 0.0
+    current_time = time.time() if now is None else float(now)
+    return max(0.0, starts_at - current_time)
+
+
+def _advanced_day_from_submission_error(
+    error: Exception, expected_day: int
+) -> int | None:
+    """Recognize a harmless action POST that lost a day-boundary race."""
+    match = re.search(
+        r"POST /game/actions failed \(409\): day (-?\d+) "
+        r"is not the current day \((-?\d+)\)",
+        str(error),
+    )
+    if match is None:
+        return None
+    submitted_day, current_day = (int(value) for value in match.groups())
+    if submitted_day != expected_day or current_day <= expected_day:
+        return None
+    return current_day
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:
@@ -257,17 +303,39 @@ class CompetitionSessionManager:
                 continue
             session.setdefault("day_metrics", [])
             if session.get("state") in {
+                "starting",
                 "planning",
                 "awaiting_role_approval",
                 "awaiting_plan_approval",
                 "submitting",
+                "submitted",
                 "waiting_for_day",
+                "streaming",
             }:
                 session["state"] = "interrupted"
                 session["error"] = "dashboard restarted; resume explicitly"
+                session["recoverable"] = True
                 session["updated_at"] = _now()
                 _write_json(path, session)
+            elif (
+                session.get("state") in {"failed", "interrupted"}
+                and "recoverable" not in session
+            ):
+                # Sessions written by older dashboard versions did not carry
+                # this flag. Preserve their explicit recovery path after an
+                # upgrade; the UI still checks the live server day before
+                # offering the button.
+                session["recoverable"] = True
+                _write_json(path, session)
             self._sessions[str(session["id"])] = session
+
+    def _restart_after_thread(
+        self, session_id: str, predecessor: threading.Thread
+    ) -> None:
+        """Restart a failed controller once its previous thread has unwound."""
+        predecessor.join()
+        if not self._closed:
+            self._run(session_id)
 
     def _resume_result_sessions(self) -> None:
         """Safely resume read-only result polling after a dashboard restart."""
@@ -302,6 +370,97 @@ class CompetitionSessionManager:
             )
             return copy.deepcopy(rows[:20])
 
+    def saved_session_for_game(self, game_id: str) -> dict[str, Any] | None:
+        """Return the newest durable controller record for one game."""
+        with self._lock:
+            candidates = [
+                session
+                for session in self._sessions.values()
+                if game_id
+                in {
+                    str(session.get("requested_game_id", "")),
+                    str(session.get("game_id", "")),
+                }
+                and isinstance(session.get("snapshot", {}).get("config"), dict)
+            ]
+            if not candidates:
+                return None
+            latest = max(
+                candidates,
+                key=lambda session: str(
+                    session.get("updated_at") or session.get("created_at") or ""
+                ),
+            )
+            return copy.deepcopy(latest)
+
+    def saved_games(self) -> list[dict[str, Any]]:
+        """Build one retained match-card descriptor per persisted game."""
+        with self._lock:
+            sessions = sorted(
+                self._sessions.values(),
+                key=lambda session: str(
+                    session.get("updated_at") or session.get("created_at") or ""
+                ),
+                reverse=True,
+            )
+            games: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for session in sessions:
+                game_id = str(
+                    session.get("requested_game_id") or session.get("game_id") or ""
+                )
+                snapshot = session.get("snapshot", {})
+                config = snapshot.get("config", {})
+                if not game_id or game_id in seen or not isinstance(config, dict):
+                    continue
+                descriptor = copy.deepcopy(session.get("game") or {})
+                game_map = config.get("map", {})
+                descriptor.update(
+                    question_id=game_id,
+                    name=str(descriptor.get("name") or game_id),
+                    width=descriptor.get("width") or game_map.get("width"),
+                    height=descriptor.get("height") or game_map.get("height"),
+                    total_days=(
+                        descriptor.get("total_days")
+                        or len(config.get("daySteps", []))
+                    ),
+                    saved=True,
+                    archived=True,
+                    saved_session_id=str(session["id"]),
+                    saved_at=(
+                        session.get("updated_at") or session.get("created_at")
+                    ),
+                    session_state=str(session.get("state") or "unknown"),
+                )
+                games.append(descriptor)
+                seen.add(game_id)
+            return games
+
+    def saved_snapshot(self, game_id: str) -> dict[str, Any] | None:
+        """Return a read-only analysis snapshot when the online match expires."""
+        session = self.saved_session_for_game(game_id)
+        if session is None:
+            return None
+        snapshot = copy.deepcopy(session["snapshot"])
+        snapshot.update(
+            archived=True,
+            archived_at=session.get("updated_at") or session.get("created_at"),
+            archived_session_id=session["id"],
+            archived_result=copy.deepcopy(session.get("result")),
+        )
+        state = dict(snapshot.get("state") or {})
+        if session.get("state") == "finished":
+            state["status"] = "finished"
+        snapshot["state"] = state
+        return snapshot
+
+    def saved_journal(self, game_id: str) -> dict[str, Any] | None:
+        session = self.saved_session_for_game(game_id)
+        if session is None:
+            return None
+        _, journal = self._journal(str(session["game_id"]))
+        return copy.deepcopy(journal)
+
     def get_session(self, session_id: str) -> dict[str, Any] | None:
         with self._lock:
             value = self._sessions.get(session_id)
@@ -316,11 +475,11 @@ class CompetitionSessionManager:
                 if session.get("game_id") != game_id or session.get("state") in {
                     "finished",
                     "cancelled",
-                    "failed",
                 }:
                     continue
                 session.update(
                     state="cancelled",
+                    recoverable=False,
                     proposal=None,
                     approval=None,
                     error=None,
@@ -456,6 +615,7 @@ class CompetitionSessionManager:
                 "target_day": target_day,
                 "time_limit_seconds": time_limit_seconds,
                 "state": "starting",
+                "recoverable": False,
                 "snapshot": snapshot,
                 "proposal": None,
                 "last_submission": None,
@@ -515,7 +675,7 @@ class CompetitionSessionManager:
                 {"at": session["updated_at"], "status": "approval_received"}
             )
             _write_json(self._session_path(session_id), session)
-            self._events[session_id].set()
+            self._events.setdefault(session_id, threading.Event()).set()
             return copy.deepcopy(session)
 
     def submit_proposal(
@@ -746,22 +906,48 @@ class CompetitionSessionManager:
                 session["paused"] = True
                 session["progress"] = {"status": "paused"}
             elif action == "resume":
+                resumable_states = {"interrupted", "paused", "failed"}
+                previous_state = session.get("state")
+                if previous_state not in resumable_states:
+                    raise ValueError(
+                        "resume is only available for an interrupted, paused, "
+                        "or failed session"
+                    )
+                if (
+                    session.get("state") != "paused"
+                    and session.get("recoverable") is not True
+                ):
+                    raise ValueError("session is not recoverable")
                 session["paused"] = False
-                session["progress"] = {"status": "resuming"}
-                if session.get("state") in {"interrupted", "paused"}:
-                    session["state"] = "starting"
-                    event = self._events.setdefault(session_id, threading.Event())
-                    thread = self._threads.get(session_id)
-                    if thread is None or not thread.is_alive():
-                        thread = threading.Thread(
-                            target=self._run,
-                            args=(session_id,),
-                            daemon=True,
-                            name=f"hexbench-competition-{session_id[:8]}",
-                        )
-                        self._threads[session_id] = thread
-                        thread.start()
-                    event.set()
+                session["state"] = "starting"
+                session["recoverable"] = False
+                session["proposal"] = None
+                session["approval"] = None
+                session["error"] = None
+                session["progress"] = {"status": "resuming_from_server"}
+                event = self._events.setdefault(session_id, threading.Event())
+                event.clear()
+                thread = self._threads.get(session_id)
+                if thread is None or not thread.is_alive():
+                    thread = threading.Thread(
+                        target=self._run,
+                        args=(session_id,),
+                        daemon=True,
+                        name=f"hexbench-competition-{session_id[:8]}",
+                    )
+                    self._threads[session_id] = thread
+                    thread.start()
+                elif previous_state != "paused":
+                    predecessor = thread
+                    thread = threading.Thread(
+                        target=self._restart_after_thread,
+                        args=(session_id, predecessor),
+                        daemon=True,
+                        name=f"hexbench-competition-{session_id[:8]}-resume",
+                    )
+                    self._threads[session_id] = thread
+                    thread.start()
+                event.set()
             elif action == "replan":
                 if session.get("state") != "awaiting_plan_approval":
                     raise ValueError("replan is only available for a proposed day plan")
@@ -773,7 +959,7 @@ class CompetitionSessionManager:
                 {"at": session["updated_at"], "status": action}
             )
             _write_json(self._session_path(session_id), session)
-            self._events[session_id].set()
+            self._events.setdefault(session_id, threading.Event()).set()
             return copy.deepcopy(session)
 
     def _update(self, session_id: str, **values: Any) -> None:
@@ -1528,6 +1714,8 @@ class CompetitionSessionManager:
             "best_score": None,
             "pending": None,
             "last_submit": 0.0,
+            "day_closed": False,
+            "advanced_to_day": None,
         }
         debounce = 0.25
         current_session = self.get_session(session_id) or {}
@@ -1564,10 +1752,38 @@ class CompetitionSessionManager:
         def submit(
             actions: list[list[int]], score: Any, incumbent_sequence: int | None = None
         ) -> None:
-            response = client.post(
-                endpoint,
-                {"game_id": api_game_id, "day": day_index, "actions": actions},
-            )
+            if stream_state["day_closed"]:
+                return
+            try:
+                response = client.post(
+                    endpoint,
+                    {"game_id": api_game_id, "day": day_index, "actions": actions},
+                )
+            except RuntimeError as error:
+                advanced_to_day = _advanced_day_from_submission_error(
+                    error, day_index
+                )
+                if advanced_to_day is None:
+                    raise
+                # The previously accepted submission (or the server's default
+                # wait) already stands. Stop this solver and let the outer loop
+                # reconnect to the new authoritative day instead of failing.
+                stream_state["day_closed"] = True
+                stream_state["advanced_to_day"] = advanced_to_day
+                stream_state["pending"] = None
+                self._update(
+                    session_id,
+                    state="waiting_for_day",
+                    error=None,
+                    progress={
+                        "status": "day_advanced",
+                        "day": day_index,
+                        "server_day": advanced_to_day,
+                        "submission_count": stream_state["count"],
+                        "incumbent_count": stream_state["incumbent_count"],
+                    },
+                )
+                return
             stream_state["count"] += 1
             stream_state["last_submit"] = time.monotonic()
             stream_state["best"] = actions
@@ -1604,6 +1820,8 @@ class CompetitionSessionManager:
             )
 
         def on_improve(record: dict[str, Any]) -> None:
+            if stream_state["day_closed"]:
+                return
             actions = record.get("actions")
             score = record.get("score")
             internal_rank = record.get("internal_rank")
@@ -1638,6 +1856,7 @@ class CompetitionSessionManager:
                 current is None
                 or current.get("state") in {"cancelled", "failed"}
                 or bool(current.get("paused"))
+                or bool(stream_state["day_closed"])
             )
 
         self._update(
@@ -1722,14 +1941,19 @@ class CompetitionSessionManager:
                     self._update(
                         session_id,
                         state="failed",
+                        recoverable=True,
                         error=str(error),
-                        progress={"status": "failed"},
+                        progress={"status": "failed", "day": day_index},
                     )
                     return
         # Ensure the best plan is the last valid submission for this day.
-        if stream_state["pending"] is not None:
+        if not stream_state["day_closed"] and stream_state["pending"] is not None:
             submit(*stream_state["pending"])
-        if isinstance(final_record, dict) and final_record.get("kind") == "final":
+        if (
+            not stream_state["day_closed"]
+            and isinstance(final_record, dict)
+            and final_record.get("kind") == "final"
+        ):
             final_actions = final_record.get("actions")
             if isinstance(final_actions, list):
                 validate_action_shape(final_actions, len(types))
@@ -1771,7 +1995,7 @@ class CompetitionSessionManager:
                 timer_running=False,
             )
             return
-        if stream_state["best"] is None:
+        if stream_state["best"] is None and not stream_state["day_closed"]:
             fallback = [[-int(config["daySteps"][day_index])] for _ in types]
             submit(fallback, [0, 0, 0])
 
@@ -2334,6 +2558,26 @@ class CompetitionSessionManager:
                     self._update(session_id, state="waiting_for_day", progress={"status": status.get("status", "waiting")})
                     self._wait(session_id, self.poll_interval)
                     continue
+                selection_wait = _agent_selection_wait_seconds(config, day_index)
+                if selection_wait > 0:
+                    # Do not trust an early in_progress transition for Day 1:
+                    # agent selection occurs before the match, and the action
+                    # endpoint remains closed until startsAt.
+                    self._update(
+                        session_id,
+                        state="waiting_for_day",
+                        progress={
+                            "status": "waiting_for_agent_selection",
+                            "day": day_index,
+                            "starts_at": float(config["startsAt"]),
+                            "remaining_seconds": selection_wait,
+                        },
+                    )
+                    self._wait(
+                        session_id,
+                        min(self.poll_interval, selection_wait),
+                    )
+                    continue
                 if day_index >= len(config.get("daySteps", [])):
                     self._update(
                         session_id,
@@ -2366,7 +2610,18 @@ class CompetitionSessionManager:
                 )
                 self._wait(session_id, self.poll_interval)
         except Exception as error:
-            self._update(session_id, state="failed", error=str(error), progress={"status": "failed"})
+            current = self.get_session(session_id) or {}
+            current_progress = current.get("progress", {})
+            failed_progress = {"status": "failed"}
+            if isinstance(current_progress.get("day"), int):
+                failed_progress["day"] = current_progress["day"]
+            self._update(
+                session_id,
+                state="failed",
+                recoverable=True,
+                error=str(error),
+                progress=failed_progress,
+            )
         finally:
             if client is not None:
                 client.close()

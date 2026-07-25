@@ -201,6 +201,7 @@ struct SearchLimits {
 struct PlannerResult {
   ActionPlan actions;
   std::optional<json::object> planner_state;
+  std::optional<IncumbentRank> rank;
 };
 
 MapConfig parse_map_config(const json::value& value);

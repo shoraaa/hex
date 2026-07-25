@@ -343,13 +343,17 @@ DayInfo parse_day_info(const json::value& value) {
     result.ends_at = ends->to_number<double>();
   }
   result.day = int_at(root, "day");
-  auto parse_agent = [](const json::value& item) {
+  auto parse_agent = [](const json::value& item, bool require_fuel) {
     const auto& agent = item.as_object();
+    int fuel = 0;
+    if (agent.if_contains("fuel") || require_fuel) {
+      fuel = int_at(agent, "fuel");
+    }
     return AgentView{static_cast<AgentKind>(int_at(agent, "kind")),
-                     int_at(agent, "pos"), int_at(agent, "fuel")};
+                     int_at(agent, "pos"), fuel};
   };
   for (const auto& item : root.at("agents").as_array()) {
-    result.agents.push_back(parse_agent(item));
+    result.agents.push_back(parse_agent(item, true));
   }
   if (const auto* others = root.if_contains("others")) {
     for (const auto& item : others->as_array()) {
@@ -359,7 +363,10 @@ DayInfo parse_day_info(const json::value& value) {
       team.id = id.is_string() ? std::string(id.as_string())
                                : std::to_string(id.to_number<std::int64_t>());
       for (const auto& agent : object.at("agents").as_array()) {
-        team.agents.push_back(parse_agent(agent));
+        // Real-match payloads intentionally hide opponent fuel. Other-team
+        // views are informational only; planning and validation use our own
+        // agents, whose fuel remains required above.
+        team.agents.push_back(parse_agent(agent, false));
       }
       result.others.push_back(std::move(team));
     }
@@ -1534,8 +1541,21 @@ int mlns_portfolio_count() {
   return value;
 }
 
-// Run `count` MLNS trajectories in parallel and keep the one whose committed
-// current-day plan has the best official (distinct, daily, servings) score.
+// Compare non-negative decimal integers without narrowing MLNS's uint128
+// discounted ranks. Values are emitted canonically, but trimming leading zeros
+// keeps this helper robust to older/custom planners.
+int compare_decimal_rank(std::string_view left, std::string_view right) {
+  while (left.size() > 1 && left.front() == '0') left.remove_prefix(1);
+  while (right.size() > 1 && right.front() == '0') right.remove_prefix(1);
+  if (left.size() != right.size()) return left.size() < right.size() ? -1 : 1;
+  if (left == right) return 0;
+  return left < right ? -1 : 1;
+}
+
+// Run `count` MLNS trajectories in parallel and keep the one with the same
+// continuation-aware rank used inside MLNS. Comparing only the committed day's
+// official score is greedy: it can select one extra serving today while
+// stranding the shared refuel car for tomorrow, making best-of-K worse than K=1.
 // The timed search is nondeterministic run-to-run (wall-clock cutoffs) with a
 // wide spread; because `configured_workers` caps each trajectory's intra-search
 // parallelism at 8, machines with more cores have spare capacity that a
@@ -1586,16 +1606,64 @@ PlannerResult build_mlns_portfolio(const MapConfig& config, const DayInfo& day,
   for (auto& error : errors) {
     if (error) std::rethrow_exception(error);
   }
-  auto key = [&](std::size_t index) {
-    const auto& score = scores[index];
-    return score ? std::tuple{score->distinct_types,
-                              score->cumulative_daily_types,
-                              score->total_servings}
-                 : std::tuple{-1, -1, -1};
+  auto better = [&](std::size_t left, std::size_t right) {
+    const auto& left_score = scores[left];
+    const auto& right_score = scores[right];
+    if (static_cast<bool>(left_score) != static_cast<bool>(right_score)) {
+      return left_score.has_value();
+    }
+    if (!left_score) return false;
+    const auto& left_rank = plans[left].rank;
+    const auto& right_rank = plans[right].rank;
+    if (static_cast<bool>(left_rank) != static_cast<bool>(right_rank)) {
+      return left_rank.has_value();
+    }
+    if (left_rank && right_rank && left_rank->available &&
+        right_rank->available && left_rank->predicted_final_available &&
+        right_rank->predicted_final_available) {
+      if (left_rank->predicted_final[0] != right_rank->predicted_final[0]) {
+        return left_rank->predicted_final[0] > right_rank->predicted_final[0];
+      }
+      const int distinct_weight = compare_decimal_rank(
+          left_rank->weighted_match[0], right_rank->weighted_match[0]);
+      if (distinct_weight != 0) return distinct_weight > 0;
+      if (left_score->cumulative_daily_types !=
+          right_score->cumulative_daily_types) {
+        return left_score->cumulative_daily_types >
+               right_score->cumulative_daily_types;
+      }
+      if (left_score->total_servings != right_score->total_servings) {
+        return left_score->total_servings > right_score->total_servings;
+      }
+      for (std::size_t objective = 1; objective < 3; ++objective) {
+        const int weighted = compare_decimal_rank(
+            left_rank->weighted_match[objective],
+            right_rank->weighted_match[objective]);
+        if (weighted != 0) return weighted > 0;
+      }
+      if (left_rank->predicted_final != right_rank->predicted_final) {
+        return left_rank->predicted_final > right_rank->predicted_final;
+      }
+      if (left_rank->predicted_ending_patrol_fuel !=
+          right_rank->predicted_ending_patrol_fuel) {
+        return left_rank->predicted_ending_patrol_fuel >
+               right_rank->predicted_ending_patrol_fuel;
+      }
+    }
+    const auto left_official =
+        std::tuple{left_score->distinct_types,
+                   left_score->cumulative_daily_types,
+                   left_score->total_servings};
+    const auto right_official =
+        std::tuple{right_score->distinct_types,
+                   right_score->cumulative_daily_types,
+                   right_score->total_servings};
+    if (left_official != right_official) return left_official > right_official;
+    return plans[left].actions < plans[right].actions;
   };
   std::size_t best = 0;
   for (std::size_t index = 1; index < k; ++index) {
-    if (key(index) > key(best)) best = index;
+    if (better(index, best)) best = index;
   }
   return std::move(plans[best]);
 }
