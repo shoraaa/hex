@@ -176,7 +176,7 @@ struct AlnsAnytimeBudget {
 AlnsAnytimeBudget alns_anytime_budget(int total_ms, bool final_day,
                                       bool allow_continuation,
                                       bool exact_enabled,
-                                      int continuation_time_percent = 50,
+                                      int continuation_time_percent = 25,
                                       int exact_time_percent = 30);
 
 // Simulation / parsing helpers.

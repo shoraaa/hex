@@ -74,7 +74,7 @@ TRAFFIC_GNN_HYPERPARAMETER = {
 }
 ALNS_HYPERPARAMETERS = (
     {"key": "time_limit_ms", "label": "ALNS wall-clock limit", "unit": "ms", "type": "integer", "min": 50, "step": 50, "ui_max": 10_000, "help": "Timed mode; mutually exclusive with ALNS iterations."},
-    {"key": "continuation_time_percent", "label": "Continuation time share", "unit": "%", "type": "integer", "min": 0, "max": 100, "step": 1, "recommended": 50, "help": "Percentage of every timed non-final day reserved for remaining-match simulation; current-day ALNS receives the remainder."},
+    {"key": "continuation_time_percent", "label": "Continuation time share", "unit": "%", "type": "integer", "min": 0, "max": 100, "step": 1, "recommended": 25, "help": "Percentage of every timed non-final day reserved for remaining-match simulation; current-day ALNS receives the remainder."},
     {"key": "exact_time_percent", "label": "Final exact-search time share", "unit": "%", "type": "integer", "min": 0, "max": 100, "step": 1, "recommended": 30, "help": "Percentage of every timed final day reserved for exact completion when a positive exact-node budget is enabled."},
     {"key": "alns_iterations", "label": "ALNS iterations on days 1–6", "unit": "iterations/day", "type": "integer", "min": 1, "step": 1, "ui_min": 32, "ui_max": 12_000, "ui_step": 32, "recommended": 1_536, "help": "Literal untimed ALNS loop count on every non-final day; exact-search nodes are additional work."},
     {"key": "final_alns_iterations", "label": "ALNS iterations on final day", "unit": "iterations", "type": "integer", "min": 1, "max": 12_000, "step": 1, "recommended": 1_024, "help": "Literal final-day ALNS loop count. Leave blank to reuse the non-final count."},
@@ -324,20 +324,37 @@ class GameClient:
         )
         raise RuntimeError(f"GET {path} failed ({status})") from None
 
-    def post(self, path: str, payload: dict[str, Any]) -> Any:
+    def post(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        timeout: float | httpx.Timeout | None = None,
+    ) -> Any:
         try:
-            response = self._client.post(path, json=payload)
+            request_kwargs = {"json": payload}
+            if timeout is not None:
+                request_kwargs["timeout"] = timeout
+            response = self._client.post(path, **request_kwargs)
             response.raise_for_status()
             return response.json() if response.content else {}
         except httpx.HTTPStatusError as error:
             try:
                 body = error.response.json()
-                detail = body.get("detail", "request rejected") if isinstance(body, dict) else "request rejected"
+                detail = (
+                    body.get("detail", "request rejected")
+                    if isinstance(body, dict)
+                    else "request rejected"
+                )
             except ValueError:
                 detail = "request rejected"
-            raise RuntimeError(f"POST {path} failed ({error.response.status_code}): {detail}") from None
+            raise RuntimeError(
+                f"POST {path} failed ({error.response.status_code}): {detail}"
+            ) from None
         except httpx.TransportError:
-            raise RuntimeError(f"POST {path} failed (ambiguous network error; not retried)") from None
+            raise RuntimeError(
+                f"POST {path} failed (ambiguous network error)"
+            ) from None
 
 
 def fetch_game_snapshot(
@@ -500,8 +517,13 @@ def planning_budget(
 
 
 def solver_time_limit_ms(method: str, budget: float) -> int:
-    """Use MLNS's complete safe window; retain the legacy reserve elsewhere."""
-    milliseconds_per_second = 1000 if method == "mlns" else 850
+    """Reserve enough of the process window to return a valid timed plan."""
+    # A best-of-K MLNS run joins several saturated worker groups after their
+    # search deadlines. Giving search the entire subprocess allowance can make
+    # the Python watchdog replace a completed high-quality plan with the wait
+    # fallback during that teardown. Five percent keeps the solver dominant
+    # while leaving deterministic serialization/join headroom.
+    milliseconds_per_second = 950 if method == "mlns" else 850
     return max(50, int(budget * milliseconds_per_second))
 
 

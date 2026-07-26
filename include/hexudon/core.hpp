@@ -177,7 +177,7 @@ struct SearchLimits {
   int alns_restarts{};
   // Percentage of a timed non-final-day budget reserved for continuation
   // simulation. The remainder belongs to current-day ALNS.
-  int continuation_time_percent{50};
+  int continuation_time_percent{25};
   // Percentage of a timed final-day budget reserved for exact completion when
   // a positive exact-node allowance is enabled.
   int exact_time_percent{30};

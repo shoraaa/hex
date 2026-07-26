@@ -6,6 +6,7 @@
   "required": ["startsAt", "daySeconds", "daySteps", "map", "spots", "agents", "fuelLimits", "players", "busyThreshold", "jammedThreshold"],
   "properties": {
     "startsAt": {"type": "number"},
+    "agent_selection_time_limit": {"type": "number", "minimum": 0},
     "daySeconds": {"type": "array", "minItems": 1, "items": {"type": "number", "exclusiveMinimum": 0}},
     "daySteps": {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 1}},
     "map": {
