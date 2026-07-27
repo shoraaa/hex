@@ -29,6 +29,7 @@ from .api import (
     STATEFUL_DEFAULTS,
     STATEFUL_POLICIES,
     _token_team_id,
+    agent_type_payload,
     discover_assigned_games,
     fetch_game_snapshot,
     load_token,
@@ -2879,19 +2880,19 @@ class CompetitionSessionManager:
                         # event, while avoiding rapid rejected POST retries.
                         self._wait(session_id, selection_open_wait)
                         continue
-                    type_payload = (
-                        {
-                            "config": config,
-                            "hyperparameters": current.get("hyperparameters", {}),
-                        }
-                        if current["method"] in {"simple_lns", "lns_dp"}
-                        else config
+                    type_payload, type_budget = agent_type_payload(
+                        current["method"],
+                        config,
+                        current.get("snapshot", {}).get("board", {}),
+                        current.get("hyperparameters", {}),
+                        deadline_margin=2.0,
                     )
                     types = run_core(
                         "types",
                         current["method"],
                         type_payload,
                         binary=find_binary(self.binary_path),
+                        timeout=max(60.0, type_budget + 2.0),
                     )
                     validate_agent_types(types, len(config["agents"]))
                     try:

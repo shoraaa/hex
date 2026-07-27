@@ -315,6 +315,38 @@ def test_day_one_waits_until_agent_selection_deadline() -> None:
     assert _agent_selection_wait_seconds({"startsAt": "invalid"}, 0, now=990.5) == 0.0
 
 
+def test_agent_selection_budget_uses_remaining_window_and_margin() -> None:
+    board = {"agent_selection_time_limit": 30.0}
+    config = {"startsAt": 1_000.0}
+
+    assert api.agent_selection_budget(
+        board, config, deadline_margin=2.0, now=990.0
+    ) == 8.0
+    assert api.agent_selection_budget(
+        board, config, deadline_margin=2.0, now=950.0
+    ) == 28.0
+
+
+def test_mlns_agent_type_payload_spends_selection_budget(monkeypatch) -> None:
+    monkeypatch.setattr(api.time, "time", lambda: 990.0)
+    payload, budget = api.agent_type_payload(
+        "mlns",
+        {"startsAt": 1_000.0},
+        {"agent_selection_time_limit": 30.0},
+        {"time_limit_ms": 123, "use_lns_dp_proposals": True},
+        deadline_margin=2.0,
+    )
+
+    assert budget == 8.0
+    assert payload["search"] == {
+        "timeLimitMs": 7_200,
+        "minIterations": 0,
+        "maxIterations": api.MLNS_ANYTIME_ITERATION_CEILING,
+        "stagnationIterations": 0,
+    }
+    assert payload["hyperparameters"] == {"use_lns_dp_proposals": True}
+
+
 def test_agent_selection_not_open_error_exposes_server_timing() -> None:
     error = RuntimeError(
         "POST /game/agent-types failed (400): agent type selection has not "

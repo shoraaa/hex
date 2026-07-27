@@ -53,6 +53,15 @@ int main() {
   assert(types.size() == config.agents.size());
   assert(std::find(types.begin(), types.end(), hexudon::AgentKind::Patrol) !=
          types.end());
+  auto timed_role_limits = limits;
+  timed_role_limits.time_limit_ms = 100;
+  timed_role_limits.max_iterations = 1'000'000;
+  timed_role_limits.use_lns_dp_proposals = true;
+  const auto timed_types =
+      hexudon::select_lns_dp_agent_types(config, timed_role_limits);
+  assert(timed_types.size() == config.agents.size());
+  assert(std::find(timed_types.begin(), timed_types.end(),
+                   hexudon::AgentKind::Patrol) != timed_types.end());
   const auto day0 = first_day(config, types);
   hexudon::PolicyHistory history;
   int callbacks = 0;

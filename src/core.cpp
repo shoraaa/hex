@@ -1486,7 +1486,7 @@ AgentTypes select_agent_types_online(const std::string& policy,
       policy == "mlns" ||
       policy == "stop_bp" ||
       policy == "bp") {
-    return select_lns_agent_types(config);
+    return select_lns_agent_types(config, limits);
   }
   const int refuel_count = std::max(1, static_cast<int>(types.size()) / 4);
   std::vector<std::pair<int, int>> candidates;

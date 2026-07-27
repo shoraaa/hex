@@ -243,7 +243,8 @@ unsigned alns_features_for_policy(const std::string& policy);
 
 int lns_path_time(const AcoGraph& graph, int from, int to);
 
-AgentTypes select_lns_agent_types(const MapConfig& config);
+AgentTypes select_lns_agent_types(const MapConfig& config,
+                                  const SearchLimits& limits);
 
 std::vector<LnsDpProposal> build_lns_dp_route_proposals(
     const MapConfig& config, const DayInfo& day,

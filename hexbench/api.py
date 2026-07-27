@@ -516,6 +516,76 @@ def planning_budget(
     return budget
 
 
+def agent_selection_budget(
+    board: dict[str, Any],
+    config: dict[str, Any],
+    *,
+    deadline_margin: float,
+    now: float | None = None,
+) -> float:
+    """Return safe compute time remaining before agent selection closes."""
+    candidates: list[float] = []
+    raw_limit = board.get(
+        "agent_selection_time_limit",
+        config.get("agent_selection_time_limit"),
+    )
+    if not isinstance(raw_limit, bool):
+        try:
+            advertised = float(raw_limit)
+        except (TypeError, ValueError):
+            advertised = 0.0
+        if math.isfinite(advertised) and advertised > 0:
+            candidates.append(advertised)
+    raw_starts_at = config.get("startsAt")
+    if not isinstance(raw_starts_at, bool):
+        try:
+            remaining = float(raw_starts_at) - (
+                time.time() if now is None else float(now)
+            )
+        except (TypeError, ValueError):
+            remaining = 0.0
+        if math.isfinite(remaining) and remaining > 0:
+            candidates.append(remaining)
+    if not candidates:
+        return 0.0
+    # Leave both the caller's network margin and a small process teardown
+    # reserve. The C++ selector receives 90% of this value below.
+    return max(0.0, min(candidates) - max(0.25, deadline_margin))
+
+
+def agent_type_payload(
+    method: str,
+    config: dict[str, Any],
+    board: dict[str, Any],
+    hyperparameters: dict[str, int | float | bool],
+    *,
+    deadline_margin: float,
+) -> tuple[dict[str, Any] | list[Any], float]:
+    """Build a role-selection request and its subprocess watchdog budget."""
+    if method not in {"mlns", "lns_dp", "simple_lns"}:
+        return config, 0.0
+    budget = agent_selection_budget(
+        board, config, deadline_margin=deadline_margin
+    )
+    selection_hyperparameters = {
+        key: value
+        for key, value in hyperparameters.items()
+        if key != "time_limit_ms"
+    }
+    payload: dict[str, Any] = {
+        "config": config,
+        "hyperparameters": selection_hyperparameters,
+    }
+    if method in {"mlns", "lns_dp"} and budget > 0:
+        payload["search"] = {
+            "timeLimitMs": max(50, int(budget * 900)),
+            "minIterations": 0,
+            "maxIterations": MLNS_ANYTIME_ITERATION_CEILING,
+            "stagnationIterations": 0,
+        }
+    return payload, budget
+
+
 def solver_time_limit_ms(method: str, budget: float) -> int:
     """Reserve enough of the process window to return a valid timed plan."""
     # A best-of-K MLNS run joins several saturated worker groups after their
@@ -668,12 +738,20 @@ def deploy(
                 "planner_state": None,
             }
             emit({"game_id": resolved_id, "status": "selecting_agent_types"})
-            type_payload = (
-                {"config": config, "hyperparameters": normalized_hyperparameters}
-                if method in {"simple_lns", "lns_dp"}
-                else config
+            type_payload, type_budget = agent_type_payload(
+                method,
+                config,
+                board,
+                normalized_hyperparameters,
+                deadline_margin=deadline_margin,
             )
-            types = run_core("types", method, type_payload, binary=binary)
+            types = run_core(
+                "types",
+                method,
+                type_payload,
+                binary=binary,
+                timeout=max(60.0, type_budget + 2.0),
+            )
             validate_agent_types(types, len(config["agents"]))
             if dry_run:
                 return emit({"dry_run": True, "game_id": resolved_id, "types": types})

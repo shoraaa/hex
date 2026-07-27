@@ -5829,7 +5829,9 @@ AgentTypes select_one_refuel_agent_types(const MapConfig& config) {
   return select_remote_refuel_agent_types(config, 1);
 }
 
-AgentTypes select_lns_agent_types(const MapConfig& config) {
+AgentTypes select_lns_agent_types(const MapConfig& config,
+                                  const SearchLimits& limits) {
+  const auto selection_started = std::chrono::steady_clock::now();
   const std::size_t count = config.agents.size();
   constexpr int rollout_cycles = 7;
   // Keep the synthetic 1x/2x/4x stress horizons for robustness, but also
@@ -5885,7 +5887,7 @@ AgentTypes select_lns_agent_types(const MapConfig& config) {
     int patrols{};
     unsigned mask{};
   };
-  const auto ranked = parallel_indexed(masks.size(), [&](std::size_t index) {
+  auto ranked = parallel_indexed(masks.size(), [&](std::size_t index) {
     const unsigned mask = masks[index];
     AgentTypes types(count, AgentKind::Patrol);
     for (std::size_t agent = 0; agent < count; ++agent) {
@@ -5939,27 +5941,308 @@ AgentTypes select_lns_agent_types(const MapConfig& config) {
     return left.mask > right.mask;
   };
   const auto selected = std::max_element(ranked.begin(), ranked.end(), better);
-  const int selected_refuelers =
-      static_cast<int>(count) - selected->patrols;
-  if (selected_refuelers == 1 ||
-      (count <= 3 && selected_refuelers > 1)) {
-    return select_one_refuel_agent_types(config);
+  auto legacy_choice = [&](const RankedTypes& choice) {
+    const int selected_refuelers =
+        static_cast<int>(count) - choice.patrols;
+    if (selected_refuelers == 1 ||
+        (count <= 3 && selected_refuelers > 1)) {
+      return select_one_refuel_agent_types(config);
+    }
+    int total_stock = 0;
+    for (const auto& spot : config.spots) total_stock += spot.stocks;
+    const bool multi_refuel_pressure =
+        total_stock > 2 * config.fuel_limit ||
+        (config.spots.size() >= 15 && config.fuel_limit < 50) ||
+        (config.width * config.height > 500 &&
+         total_stock > config.fuel_limit);
+    if (minimum_refuelers <= 1 && selected_refuelers > 1 &&
+        !multi_refuel_pressure) {
+      return select_one_refuel_agent_types(config);
+    }
+    if (config.players > 1 && count <= 6 &&
+        config.width * config.height <= 300 && selected_refuelers == 1) {
+      return select_one_refuel_agent_types(config);
+    }
+    return choice.types;
+  };
+  const AgentTypes fallback = legacy_choice(*selected);
+  if (limits.time_limit_ms < 50 || ranked.size() < 2) return fallback;
+
+  // The fixed rollout above is a cheap robust screen. Spend the optional
+  // agent-selection budget on rolling full-match simulations for a small,
+  // role-diverse finalist set. Each simulated day uses the same MLNS
+  // continuation decoder (and optional LNS-DP proposals) as production, then
+  // commits its fuel, position, traffic, and planner state before replanning.
+  const auto deadline = selection_started +
+                        std::chrono::milliseconds(limits.time_limit_ms);
+  std::sort(ranked.begin(), ranked.end(), [&](const auto& left,
+                                               const auto& right) {
+    return better(right, left);
+  });
+  const std::size_t finalist_limit = std::min<std::size_t>(
+      ranked.size(), limits.time_limit_ms < 10'000 ? 2
+                     : limits.time_limit_ms < 30'000 ? 3
+                                                     : 4);
+  std::vector<std::size_t> finalists;
+  auto add_finalist = [&](std::size_t index) {
+    if (finalists.size() >= finalist_limit ||
+        std::find(finalists.begin(), finalists.end(), index) !=
+            finalists.end()) {
+      return;
+    }
+    finalists.push_back(index);
+  };
+  const auto fallback_match = std::find_if(
+      ranked.begin(), ranked.end(), [&](const RankedTypes& candidate) {
+        return candidate.types == fallback;
+      });
+  if (fallback_match != ranked.end()) {
+    add_finalist(
+        static_cast<std::size_t>(fallback_match - ranked.begin()));
   }
-  int total_stock = 0;
-  for (const auto& spot : config.spots) total_stock += spot.stocks;
-  const bool multi_refuel_pressure =
-      total_stock > 2 * config.fuel_limit ||
-      (config.spots.size() >= 15 && config.fuel_limit < 50) ||
-      (config.width * config.height > 500 &&
-       total_stock > config.fuel_limit);
-  if (minimum_refuelers <= 1 && selected_refuelers > 1 &&
-      !multi_refuel_pressure) {
-    return select_one_refuel_agent_types(config);
+  add_finalist(0);
+  for (int refuelers = minimum_refuelers; refuelers <= 3; ++refuelers) {
+    const auto found = std::find_if(
+        ranked.begin(), ranked.end(), [&](const RankedTypes& candidate) {
+          return static_cast<int>(count) - candidate.patrols == refuelers;
+        });
+    if (found != ranked.end()) {
+      add_finalist(static_cast<std::size_t>(found - ranked.begin()));
+    }
   }
-  if (config.players > 1 && count <= 6 &&
-      config.width * config.height <= 300 && selected_refuelers == 1) {
-    return select_one_refuel_agent_types(config);
+  for (std::size_t index = 0;
+       index < ranked.size() && finalists.size() < finalist_limit; ++index) {
+    add_finalist(index);
   }
-  return selected->types;
+
+  struct TimedRoleResult {
+    std::size_t ranked_index{};
+    std::array<int, 3> score{};
+    int ending_fuel{};
+  };
+  auto simulate_remaining_match = [&](std::size_t ranked_index,
+                                      SearchLimits role_limits,
+                                      auto candidate_deadline,
+                                      std::uint64_t selection_seed)
+      -> std::optional<TimedRoleResult> {
+    const auto& types = ranked[ranked_index].types;
+    TeamState team;
+    team.id = "timed-role-rollout";
+    team.policy = "mlns";
+    for (std::size_t agent = 0; agent < count; ++agent) {
+      team.agents.push_back(
+          {types[agent], config.agents[agent], config.fuel_limit});
+    }
+    team.visited_today.resize(count);
+    std::vector<std::map<int, int>> traffic_history;
+    for (int day_index = 0;
+         day_index < static_cast<int>(config.day_steps.size()); ++day_index) {
+      const auto now = std::chrono::steady_clock::now();
+      const auto remaining =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              candidate_deadline - now)
+              .count();
+      const int days_left =
+          static_cast<int>(config.day_steps.size()) - day_index;
+      if (remaining < 10 || days_left <= 0) return std::nullopt;
+      // Search deadlines have small fixed teardown/serialization costs. Keep
+      // 20% of every per-day slice outside MLNS so one large map cannot consume
+      // the next finalist's allocation.
+      role_limits.time_limit_ms = std::max<int>(
+          5, static_cast<int>((remaining * 8) / (10 * days_left)));
+      // Compare every role mask with the same stochastic stream. Varying the
+      // seed by mask confounds role quality with trajectory luck and made
+      // short selection windows systematically unstable.
+      role_limits.random_seed = selection_seed;
+
+      team.stock.clear();
+      team.daily_types.clear();
+      for (auto& visited : team.visited_today) visited.clear();
+      for (const auto& spot : config.spots) team.stock[spot.pos] = spot.stocks;
+      const auto roads =
+          road_status_for_day(config, traffic_history, config.players);
+      DayInfo day;
+      day.day = day_index;
+      day.traffics = roads;
+      for (const auto& agent : team.agents) {
+        day.agents.push_back({agent.kind, agent.pos, agent.fuel});
+      }
+      for (int pos = 0; pos < config.width * config.height; ++pos) {
+        if (config.cells[pos] == Terrain::Road &&
+            !day.traffics.contains(pos)) {
+          day.traffics[pos] = 0;
+        }
+      }
+      auto planned = build_mlns_plan(
+          config, day, team.history, types, role_limits,
+          team.planner_state ? &*team.planner_state : nullptr, nullptr);
+      std::map<int, int> day_traffic;
+      if (simulate_team_day(config, team, planned.actions, day.traffics,
+                            day_traffic)) {
+        return std::nullopt;
+      }
+      team.planner_state =
+          planned.planner_state
+              ? std::optional<json::value>(json::value(*planned.planner_state))
+              : std::nullopt;
+      team.history.submitted_actions.push_back(planned.actions);
+      team.history.distinct_brands = team.distinct_types;
+      team.cumulative_daily_types += static_cast<int>(team.daily_types.size());
+      team.history.cumulative_daily_types = team.cumulative_daily_types;
+      team.history.total_servings = team.total_servings;
+      traffic_history.push_back(std::move(day_traffic));
+    }
+    int ending_fuel = 0;
+    for (const auto& agent : team.agents) {
+      if (agent.kind == AgentKind::Patrol) ending_fuel += agent.fuel;
+    }
+    if (std::chrono::steady_clock::now() >
+        candidate_deadline + std::chrono::milliseconds(25)) {
+      return std::nullopt;
+    }
+    return TimedRoleResult{
+        ranked_index,
+        {static_cast<int>(team.distinct_types.size()),
+         team.cumulative_daily_types, team.total_servings},
+        ending_fuel};
+  };
+  auto meaningfully_better = [](const std::array<int, 3>& candidate,
+                                const std::array<int, 3>& baseline) {
+    if (candidate <= baseline) return false;
+    if (candidate[0] != baseline[0] || candidate[1] != baseline[1]) {
+      return true;
+    }
+    const int minimum_serving_gain =
+        std::max(3, (baseline[2] + 19) / 20);
+    return candidate[2] - baseline[2] >= minimum_serving_gain;
+  };
+  std::optional<TimedRoleResult> timed_best;
+  std::optional<TimedRoleResult> timed_fallback;
+  std::optional<TimedRoleResult> screening_challenger;
+  reset_mlns_diagnostics();
+  const bool require_confirmation = limits.time_limit_ms >= 10'000;
+  const auto screening_deadline =
+      require_confirmation
+          ? selection_started +
+                std::chrono::milliseconds(limits.time_limit_ms * 3 / 5)
+          : deadline;
+  for (std::size_t order = 0; order < finalists.size(); ++order) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               screening_deadline - now)
+                               .count();
+    const auto candidates_left = finalists.size() - order;
+    if (remaining < 20 || candidates_left == 0) break;
+    const auto candidate_budget =
+        std::max<std::int64_t>(10, remaining / candidates_left);
+    const auto candidate_deadline =
+        now + std::chrono::milliseconds(candidate_budget);
+    SearchLimits role_limits = limits;
+    role_limits.min_iterations = 0;
+    role_limits.max_iterations = std::max(1'000'000, limits.max_iterations);
+    role_limits.stagnation_iterations = 0;
+    try {
+      auto candidate = simulate_remaining_match(
+          finalists[order], role_limits, candidate_deadline,
+          limits.random_seed);
+      if (!candidate) continue;
+      if (ranked[candidate->ranked_index].types == fallback) {
+        timed_fallback = *candidate;
+        timed_best = *candidate;
+        continue;
+      }
+      if (!screening_challenger ||
+          candidate->score > screening_challenger->score) {
+        screening_challenger = *candidate;
+      }
+      // The committed role choice is deliberately asymmetric: an unevaluated
+      // or tied challenger cannot displace the known-safe fallback. When only
+      // servings differ, require a small material gain because short timed
+      // trajectories commonly fluctuate by one bowl while agreeing on both
+      // higher-priority objectives.
+      if (!timed_fallback ||
+          !meaningfully_better(candidate->score, timed_fallback->score)) {
+        continue;
+      }
+      auto timed_better = [&](const TimedRoleResult& left,
+                              const TimedRoleResult& right) {
+        if (left.score != right.score) {
+          return left.score > right.score;
+        }
+        const auto& left_screen = ranked[left.ranked_index];
+        const auto& right_screen = ranked[right.ranked_index];
+        if (left_screen.scheduled != right_screen.scheduled) {
+          return left_screen.scheduled > right_screen.scheduled;
+        }
+        if (left_screen.worst != right_screen.worst) {
+          return left_screen.worst > right_screen.worst;
+        }
+        if (left.ending_fuel != right.ending_fuel) {
+          return left.ending_fuel > right.ending_fuel;
+        }
+        if (left_screen.patrols != right_screen.patrols) {
+          return left_screen.patrols > right_screen.patrols;
+        }
+        return left_screen.mask < right_screen.mask;
+      };
+      if (!timed_best || timed_better(*candidate, *timed_best)) {
+        timed_best = *candidate;
+      }
+    } catch (const std::exception&) {
+      // A finalist that cannot produce a valid full-match replay before its
+      // slice expires is simply ineligible; the deterministic rollout remains
+      // safe.
+    }
+  }
+  if (require_confirmation && timed_fallback && screening_challenger) {
+    const TimedRoleResult confirmation_target =
+        timed_best && timed_best->ranked_index != timed_fallback->ranked_index
+            ? *timed_best
+            : *screening_challenger;
+    const auto now = std::chrono::steady_clock::now();
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               deadline - now)
+                               .count();
+    if (remaining < 40) {
+      timed_best = timed_fallback;
+    } else {
+      const auto half = std::max<std::int64_t>(20, remaining / 2);
+      SearchLimits confirmation_limits = limits;
+      confirmation_limits.min_iterations = 0;
+      confirmation_limits.max_iterations =
+          std::max(1'000'000, limits.max_iterations);
+      confirmation_limits.stagnation_iterations = 0;
+      const std::uint64_t confirmation_seed =
+          limits.random_seed ^ 0xd1b54a32d192ed03ULL;
+      auto confirmed_fallback = simulate_remaining_match(
+          timed_fallback->ranked_index, confirmation_limits,
+          now + std::chrono::milliseconds(half), confirmation_seed);
+      const auto challenger_started = std::chrono::steady_clock::now();
+      const auto challenger_remaining =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              deadline - challenger_started)
+              .count();
+      auto confirmed_challenger =
+          challenger_remaining < 20
+              ? std::optional<TimedRoleResult>{}
+              : simulate_remaining_match(
+                    confirmation_target.ranked_index, confirmation_limits,
+                    challenger_started +
+                        std::chrono::milliseconds(challenger_remaining),
+                    confirmation_seed);
+      if (!confirmed_fallback || !confirmed_challenger ||
+          confirmation_target.score <= timed_fallback->score ||
+          !meaningfully_better(confirmed_challenger->score,
+                               confirmed_fallback->score)) {
+        timed_best = timed_fallback;
+      } else {
+        timed_best = confirmation_target;
+      }
+    }
+  }
+  reset_mlns_diagnostics();
+  return timed_fallback && timed_best
+             ? ranked[timed_best->ranked_index].types
+             : fallback;
 }
 }  // namespace hexudon
