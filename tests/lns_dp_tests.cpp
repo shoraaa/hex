@@ -43,6 +43,41 @@ hexudon::DayInfo first_day(const hexudon::MapConfig &config,
 } // namespace
 
 int main() {
+  // The first mask wins screening by distinct (20 vs 19), but its confirmation
+  // drops to 18 while the second mask holds 19. More patrols must not override
+  // the second mask's higher robust distinct value (19 vs 18).
+  const hexudon::RoleConfirmationEvidence volatile_first{20, 18, 4};
+  const hexudon::RoleConfirmationEvidence stable_second{19, 19, 3};
+  if (hexudon::choose_role_confirmation(
+          volatile_first, stable_second,
+          /*confirmation_prefers_second=*/true,
+          /*aggregate_prefers_second=*/true) !=
+      hexudon::RoleConfirmationChoice::Second) {
+    return 1;
+  }
+  // When robust distinct ties, a one-vote-each disagreement still resolves
+  // toward more patrols, preserving the intended refueler parsimony rule.
+  const hexudon::RoleConfirmationEvidence q03_one_refuel{20, 20, 4};
+  const hexudon::RoleConfirmationEvidence q03_two_refuel{20, 20, 3};
+  if (hexudon::choose_role_confirmation(
+          q03_one_refuel, q03_two_refuel,
+          /*confirmation_prefers_second=*/true,
+          /*aggregate_prefers_second=*/true) !=
+      hexudon::RoleConfirmationChoice::First) {
+    return 2;
+  }
+  // The gate is symmetric: neither a confirmation flip, aggregate score, nor
+  // an extra patrol may displace a first mask with higher robust distinct.
+  const hexudon::RoleConfirmationEvidence stable_first{20, 20, 3};
+  const hexudon::RoleConfirmationEvidence volatile_second{19, 19, 4};
+  if (hexudon::choose_role_confirmation(
+          stable_first, volatile_second,
+          /*confirmation_prefers_second=*/true,
+          /*aggregate_prefers_second=*/true) !=
+      hexudon::RoleConfirmationChoice::First) {
+    return 3;
+  }
+
   const auto config = test_config();
   hexudon::SearchLimits limits;
   limits.min_iterations = 0;
@@ -62,6 +97,17 @@ int main() {
   assert(timed_types.size() == config.agents.size());
   assert(std::find(timed_types.begin(), timed_types.end(),
                    hexudon::AgentKind::Patrol) != timed_types.end());
+  std::vector<hexudon::AgentTypes> role_incumbents;
+  const hexudon::AgentTypeImprovementSink role_sink =
+      [&](const hexudon::AgentTypes &candidate, const hexudon::Score &,
+          const std::string &phase) {
+        assert(!phase.empty());
+        role_incumbents.push_back(candidate);
+      };
+  const auto streamed_types = hexudon::select_lns_dp_agent_types(
+      config, timed_role_limits, &role_sink);
+  assert(!role_incumbents.empty());
+  assert(role_incumbents.back() == streamed_types);
   auto long_high_fuel = config;
   long_high_fuel.day_steps.assign(10, 20);
   long_high_fuel.day_seconds.assign(10, 30.0);
@@ -71,6 +117,12 @@ int main() {
   assert(horizon_limited_types.size() == long_high_fuel.agents.size());
   assert(std::find(horizon_limited_types.begin(), horizon_limited_types.end(),
                    hexudon::AgentKind::Patrol) !=
+         horizon_limited_types.end());
+  // With ample fuel, an additional refueler cannot demonstrate a daily
+  // coverage benefit. Role selection should retain every patrol instead of
+  // chasing a short-rollout serving fluctuation.
+  assert(std::find(horizon_limited_types.begin(), horizon_limited_types.end(),
+                   hexudon::AgentKind::Refuel) ==
          horizon_limited_types.end());
   const auto day0 = first_day(config, types);
   hexudon::PolicyHistory history;

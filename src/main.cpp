@@ -55,7 +55,8 @@ boost::json::value incumbent_rank_to_json(
       {"predicted_final_available", rank.predicted_final_available},
       {"predicted_final", std::move(predicted_final)},
       {"predicted_ending_patrol_fuel",
-       rank.predicted_ending_patrol_fuel}};
+       rank.predicted_ending_patrol_fuel},
+      {"prediction_horizon_days", rank.prediction_horizon_days}};
   if (rank.objective_mode == "mlns" ||
       rank.objective_mode == "simple_lns" ||
       rank.objective_mode == "lns_dp") {
@@ -128,6 +129,7 @@ hexudon::SearchLimits parse_search_limits(const boost::json::object& object,
            limits.palns_projection_iterations);
     assign(search, "palnsRestarts", limits.palns_restarts);
     assign(search, "futureDiscountPercent", limits.future_discount_percent);
+    assign(search, "mlnsLookaheadDays", limits.mlns_lookahead_days);
     assign(search, "acoAnts", limits.aco_ants);
     assign(search, "acoIterations", limits.aco_iterations);
     assign_double(search, "acoEvaporation", limits.aco_evaporation);
@@ -170,6 +172,7 @@ hexudon::SearchLimits parse_search_limits(const boost::json::object& object,
     assign(hyperparameters, "total_iterations", limits.total_iterations);
     assign(hyperparameters, "future_discount_percent",
            limits.future_discount_percent);
+    assign(hyperparameters, "lookahead_days", limits.mlns_lookahead_days);
     assign(hyperparameters, "aco_ants", limits.aco_ants);
     assign(hyperparameters, "aco_iterations", limits.aco_iterations);
     assign_double(hyperparameters, "aco_evaporation", limits.aco_evaporation);
@@ -249,6 +252,7 @@ hexudon::SearchLimits parse_search_limits(const boost::json::object& object,
       limits.palns_projection_iterations < 1 || limits.palns_restarts < 1 ||
       limits.future_discount_percent < 1 ||
       limits.future_discount_percent > 100 ||
+      limits.mlns_lookahead_days < 0 ||
       limits.continuation_time_percent < 0 ||
       limits.continuation_time_percent > 100 ||
       limits.exact_time_percent < 0 || limits.exact_time_percent > 100 ||
@@ -280,6 +284,37 @@ int main(int argc, char** argv) {
         const auto config = hexudon::parse_map_config(input);
         output = hexudon::to_json(hexudon::select_agent_types(policy, config));
       }
+    } else if (command == "select") {
+      const auto& object = input.as_object();
+      const auto config = hexudon::parse_map_config(object.at("config"));
+      const auto limits = parse_search_limits(object, policy);
+      bool emitted = false;
+      boost::json::object last_line;
+      const hexudon::AgentTypeImprovementSink sink =
+          [&](const hexudon::AgentTypes& types, const hexudon::Score& score,
+              const std::string& phase) {
+            boost::json::object line{
+                {"types", hexudon::to_json(types)},
+                {"score", boost::json::array{score.distinct_types,
+                                             score.cumulative_daily_types,
+                                             score.total_servings}},
+                {"phase", phase}};
+            last_line = line;
+            std::cout << boost::json::serialize(line) << '\n';
+            std::cout.flush();
+            emitted = true;
+          };
+      const auto types =
+          hexudon::select_agent_types(policy, config, limits, &sink);
+      if (!emitted || !last_line.if_contains("types") ||
+          last_line.at("types") != hexudon::to_json(types)) {
+        sink(types, {}, "final");
+      }
+      last_line["kind"] = "final";
+      last_line["types"] = hexudon::to_json(types);
+      std::cout << boost::json::serialize(last_line) << '\n';
+      std::cout.flush();
+      return 0;
     } else if (command == "plan") {
       const auto& object = input.as_object();
       const auto config = hexudon::parse_map_config(object.at("config"));

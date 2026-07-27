@@ -10,6 +10,7 @@ def test_mlns_defaults_are_deadline_governed() -> None:
     normalized = normalize_hyperparameters(["mlns"], {})["mlns"]
     assert normalized == MLNS_TUNED_DEFAULTS
     assert normalized["stagnation_iterations"] == 0
+    assert normalized["lookahead_days"] == 3
 
 
 def test_mlns_uses_complete_safe_day_window() -> None:
@@ -23,6 +24,14 @@ def test_mlns_accepts_optional_gnn_prediction() -> None:
     )["mlns"]
 
     assert normalized["use_traffic_gnn"] is True
+
+
+def test_mlns_accepts_bounded_lookahead() -> None:
+    normalized = normalize_hyperparameters(
+        ["mlns"], {"mlns": {"lookahead_days": 2}}
+    )["mlns"]
+
+    assert normalized["lookahead_days"] == 2
 
 
 def test_mlns_uses_bundled_pretrained_gnn_by_default(monkeypatch) -> None:

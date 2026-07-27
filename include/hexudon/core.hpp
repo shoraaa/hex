@@ -74,6 +74,9 @@ struct Score {
   int total_servings{};
 };
 
+using AgentTypeImprovementSink = std::function<void(
+    const AgentTypes&, const Score&, const std::string&)>;
+
 // Exact secondary rank used to distinguish plans with the same official score.
 // Each array is compared lexicographically and higher is better. Congestion
 // mode is "disabled", "current", or "rolling"; the latter includes prior-day
@@ -90,6 +93,8 @@ struct IncumbentRank {
   std::string objective_mode{"daily"};
   int future_discount_percent{};
   std::array<std::string, 3> weighted_match{};
+  // Number of days represented by predicted_final for bounded MLNS runs.
+  int prediction_horizon_days{};
 };
 
 struct PalnsDiagnostics {
@@ -191,6 +196,9 @@ struct SearchLimits {
   // MLNS discounts each additional prediction horizon geometrically by this
   // integer percentage. 90 means 1, 0.9, 0.9^2, ... .
   int future_discount_percent{90};
+  // Optional MLNS rolling horizon. Zero preserves the complete suffix;
+  // positive values simulate only that many days from the revealed day.
+  int mlns_lookahead_days{};
   // Replace MLNS's symmetric self-traffic suffix forecast with maps supplied
   // by the optional traffic-GNN predictor. The current revealed day remains
   // authoritative; entries are used only for future suffix days.
@@ -219,7 +227,8 @@ void validate_config(const MapConfig& config);
 
 AgentTypes select_agent_types(const std::string& policy,
                               const MapConfig& config,
-                              const SearchLimits& limits = {});
+                              const SearchLimits& limits = {},
+                              const AgentTypeImprovementSink* on_improve = nullptr);
 // When `on_improve` is non-null the ALNS policies run as a single sequential
 // anytime search and invoke the sink on every strictly better incumbent; other
 // policies are unaffected (the caller emits their single result).
