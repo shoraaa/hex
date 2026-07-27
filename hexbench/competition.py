@@ -138,6 +138,57 @@ def _agent_selection_open_wait_seconds(status: dict[str, Any]) -> float:
     return max(0.0, wait) if math.isfinite(wait) else 0.0
 
 
+def _match_starts_at(config: dict[str, Any]) -> float | None:
+    """Return the server's stable identifier for one use of a game id."""
+    raw_starts_at = config.get("startsAt")
+    if isinstance(raw_starts_at, bool):
+        return None
+    try:
+        starts_at = float(raw_starts_at)
+    except (TypeError, ValueError):
+        return None
+    return starts_at if math.isfinite(starts_at) else None
+
+
+def _team_types_selected(
+    status: dict[str, Any], team_id: str | None
+) -> bool | None:
+    """Read the server-authoritative role-selection state for our team."""
+    if team_id is None:
+        return None
+    teams = status.get("teams")
+    if not isinstance(teams, dict):
+        return None
+    team = teams.get(str(team_id))
+    if not isinstance(team, dict):
+        return None
+    if team.get("missed_selection") is True:
+        return False
+    selected = team.get("types_selected")
+    return selected if isinstance(selected, bool) else None
+
+
+def _reset_match_journal(
+    journal: dict[str, Any], match_starts_at: float | None
+) -> None:
+    """Discard state belonging to an earlier use of the same game id."""
+    journal.clear()
+    journal.update(
+        {
+            "match_starts_at": match_starts_at,
+            "types": None,
+            "submitted_days": {},
+            "day_snapshots": {},
+            "distinct_brands": [],
+            "cumulative_daily_types": 0,
+            "total_servings": 0,
+            "competitive_day_baselines": {},
+            "planner_state": None,
+            "traffic_predictions": {},
+        }
+    )
+
+
 def _is_rate_limit_error(error: Exception | str) -> bool:
     """Recognize a server throttle response that is safe to retry."""
     return (
@@ -1280,6 +1331,7 @@ class CompetitionSessionManager:
                 journal = {}
         else:
             journal = {}
+        journal.setdefault("match_starts_at", None)
         journal.setdefault("distinct_brands", [])
         journal.setdefault("cumulative_daily_types", 0)
         journal.setdefault("total_servings", 0)
@@ -2825,9 +2877,36 @@ class CompetitionSessionManager:
                                 "planner_state": None,
                             }
                             _write_json(state_path, journal)
-                    if journal.get("types"):
+                    match_starts_at = _match_starts_at(config)
+                    saved_match_starts_at = journal.get("match_starts_at")
+                    server_types_selected = _team_types_selected(
+                        status, own_team_id
+                    )
+                    same_match = (
+                        match_starts_at is not None
+                        and saved_match_starts_at == match_starts_at
+                    )
+                    if not competitive_practice and not same_match:
+                        # Competition ids can be recycled. A journal keyed only
+                        # by that id may therefore contain roles and days from a
+                        # previous match. The live config's startsAt identifies
+                        # the current use of the id.
+                        _reset_match_journal(journal, match_starts_at)
+                        _write_json(state_path, journal)
+                    elif (
+                        server_types_selected is False and journal.get("types")
+                    ):
+                        # Server truth wins over a local success marker. This
+                        # also repairs legacy journals without a match marker.
+                        _reset_match_journal(journal, match_starts_at)
+                        _write_json(state_path, journal)
+                    if server_types_selected is True or (
+                        journal.get("types") and same_match
+                    ):
                         # Roles are chosen once per match and already submitted;
                         # wait for the first day to open.
+                        journal["match_starts_at"] = match_starts_at
+                        _write_json(state_path, journal)
                         match_open_wait = _agent_selection_wait_seconds(config, 0)
                         self._update(
                             session_id,
@@ -2928,6 +3007,7 @@ class CompetitionSessionManager:
                         )
                         continue
                     journal["types"] = types
+                    journal["match_starts_at"] = match_starts_at
                     _write_json(state_path, journal)
                     match_open_wait = _agent_selection_wait_seconds(config, 0)
                     self._update(

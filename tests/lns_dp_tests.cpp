@@ -62,6 +62,16 @@ int main() {
   assert(timed_types.size() == config.agents.size());
   assert(std::find(timed_types.begin(), timed_types.end(),
                    hexudon::AgentKind::Patrol) != timed_types.end());
+  auto long_high_fuel = config;
+  long_high_fuel.day_steps.assign(10, 20);
+  long_high_fuel.day_seconds.assign(10, 30.0);
+  long_high_fuel.fuel_limit = 1'000;
+  const auto horizon_limited_types =
+      hexudon::select_lns_dp_agent_types(long_high_fuel, timed_role_limits);
+  assert(horizon_limited_types.size() == long_high_fuel.agents.size());
+  assert(std::find(horizon_limited_types.begin(), horizon_limited_types.end(),
+                   hexudon::AgentKind::Patrol) !=
+         horizon_limited_types.end());
   const auto day0 = first_day(config, types);
   hexudon::PolicyHistory history;
   int callbacks = 0;

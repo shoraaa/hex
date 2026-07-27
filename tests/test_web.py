@@ -346,6 +346,17 @@ def test_mlns_agent_type_payload_spends_selection_budget(monkeypatch) -> None:
     }
     assert payload["hyperparameters"] == {"use_lns_dp_proposals": True}
 
+    monkeypatch.setattr(api.time, "time", lambda: 950.0)
+    payload, budget = api.agent_type_payload(
+        "mlns",
+        {"startsAt": 1_000.0},
+        {"agent_selection_time_limit": 30.0},
+        {"use_lns_dp_proposals": True},
+        deadline_margin=2.0,
+    )
+    assert budget == 28.0
+    assert payload["search"]["timeLimitMs"] == 25_200
+
 
 def test_agent_selection_not_open_error_exposes_server_timing() -> None:
     error = RuntimeError(
@@ -446,6 +457,7 @@ def test_controller_retries_rate_limited_state_poll(
         }
     }
     journal = {
+        "match_starts_at": 1_010.0,
         "types": [0],
         "submitted_days": {},
         "day_snapshots": {},
@@ -478,6 +490,98 @@ def test_controller_retries_rate_limited_state_poll(
     ]
     assert manager._sessions["session"]["state"] == "waiting_for_day"
     assert manager._sessions["session"].get("error") is None
+
+
+def test_reused_game_id_does_not_skip_agent_type_post(
+    monkeypatch, tmp_path: Path
+) -> None:
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.posts: list[tuple[str, dict]] = []
+
+        def get(self, path: str, _game_id: str) -> dict:
+            if path == "/game/config":
+                return {"startsAt": 1_100.0, "daySteps": [10], "agents": [0]}
+            if path == "/game/state":
+                return {
+                    "status": "selecting_agents",
+                    "day": 0,
+                    "teams": {"13": {"types_selected": False}},
+                }
+            raise AssertionError(path)
+
+        def post(self, path: str, payload: dict) -> dict:
+            self.posts.append((path, payload))
+            return {"ok": True}
+
+        def close(self) -> None:
+            return None
+
+    fake_client = FakeClient()
+    monkeypatch.setattr(
+        competition, "GameClient", lambda *_args, **_kwargs: fake_client
+    )
+    monkeypatch.setattr(competition, "load_token", lambda _path: "token")
+    monkeypatch.setattr(competition, "_token_team_id", lambda _token: "13")
+    monkeypatch.setattr(competition.time, "time", lambda: 1_000.0)
+    monkeypatch.setattr(competition, "find_binary", lambda _path: "hexudon")
+    monkeypatch.setattr(competition, "run_core", lambda *_args, **_kwargs: [1])
+
+    manager = CompetitionSessionManager.__new__(CompetitionSessionManager)
+    manager.env_path = tmp_path / ".env"
+    manager.state_dir = tmp_path / "state"
+    manager.report_dir = tmp_path / "reports"
+    manager.binary_path = None
+    manager.base_url = "https://example.invalid"
+    manager.poll_interval = 0.05
+    manager._lock = threading.RLock()
+    manager._closed = False
+    manager._events = {}
+    manager._threads = {}
+    manager._sessions = {
+        "session": {
+            "id": "session",
+            "game_id": "reused-game",
+            "requested_game_id": "reused-game",
+            "game": {"is_practice": False, "no_reset": False},
+            "method": "alns",
+            "hyperparameters": {},
+            "state": "starting",
+            "snapshot": {"board": {}},
+            "events": [],
+        }
+    }
+    journal = {
+        "match_starts_at": 900.0,
+        "types": [0],
+        "submitted_days": {"0": [[-10]]},
+        "day_snapshots": {"0": {"day": 0}},
+        "distinct_brands": [1],
+        "cumulative_daily_types": 1,
+        "total_servings": 1,
+        "planner_state": None,
+    }
+    manager._journal = lambda _game_id: (  # type: ignore[method-assign]
+        tmp_path / "state.json",
+        journal,
+    )
+    manager._sync_actions = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+
+    def stop_after_submission(_session_id: str, _seconds: float) -> None:
+        if manager._sessions["session"]["progress"]["status"] == "roles_submitted":
+            manager._closed = True
+
+    manager._wait = stop_after_submission  # type: ignore[method-assign]
+
+    manager._run("session")
+
+    assert fake_client.posts == [
+        ("/game/agent-types", {"game_id": "reused-game", "types": [1]})
+    ]
+    assert journal["match_starts_at"] == 1_100.0
+    assert journal["types"] == [1]
+    assert journal["submitted_days"] == {}
+    assert journal["day_snapshots"] == {}
 
 
 def test_start_queues_until_agent_selection_opens(
