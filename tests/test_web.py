@@ -1399,7 +1399,8 @@ def test_dashboard_parameter_ui_has_prefills_sliders_and_preview() -> None:
 
     assert "plannerParameters" in script
     assert 'parameterControl(field,values,"data-param",disabled)' in script
-    assert 'state.bootstrap.policies.includes("alns")' in script
+    assert 'state.bootstrap.policies.includes("mlns")' in script
+    assert 'use_lns_dp_proposals:true' in script
     assert "collectParams" in script
     assert "agentSelectionMarkup" in script
     assert "agent_selection_metric" in script

@@ -4262,9 +4262,12 @@ bool mlns_reward_better(const MlnsRank& left, const MlnsRank& right) {
 // already contains the realized current day at full weight plus the discounted
 // suffix, so inside a small current-day gap it directly answers "does the better
 // continuation outweigh the current-day deficit?". Outside the band the realized
-// advantage is protected from the biased forecast. Tuned on the
-// brutal/steady/easy + online suite; override with HEXUDON_MLNS_COMMIT_TOLERANCE.
-constexpr int kMlnsCommitToleranceDefault = 0;
+// advantage is protected from the biased forecast. The bounded default
+// protects against forecast-only replacements: it keeps a small serving slack
+// when continuation is better, but prevents overwriting a 97-serving plan with
+// a 67-serving plan merely because two more future daily types are predicted.
+// Override with HEXUDON_MLNS_COMMIT_TOLERANCE.
+constexpr int kMlnsCommitToleranceDefault = 8;
 int mlns_commit_tolerance() {
   static const int value = [] {
     const char* raw = std::getenv("HEXUDON_MLNS_COMMIT_TOLERANCE");
@@ -4303,6 +4306,15 @@ bool mlns_commit_better(const MlnsRank& left, const MlnsRank& right) {
   if (left.current_daily != right.current_daily) {
     return left.current_daily > right.current_daily;
   }
+  // Do not let a noisy suffix forecast erase a materially better realized
+  // current-day serving result. Small gaps remain eligible for continuation
+  // tie-breaking below, preserving daily-first behavior with bounded slack.
+  const int tolerance = mlns_commit_tolerance();
+  const long long serving_gap =
+      static_cast<long long>(left.current_servings) -
+      static_cast<long long>(right.current_servings);
+  if (serving_gap > tolerance) return true;
+  if (serving_gap < -tolerance) return false;
   // The second official objective spans all days. Protect a suffix forecast
   // that reaches its structural maximum, without letting small/noisy forecast
   // differences dominate today's reliable serving count.
@@ -4313,11 +4325,6 @@ bool mlns_commit_better(const MlnsRank& left, const MlnsRank& right) {
   if (left.weighted[0] != right.weighted[0]) {
     return left.weighted[0] > right.weighted[0];
   }
-  const int tolerance = mlns_commit_tolerance();
-  const long long gap = static_cast<long long>(left.current_servings) -
-                        static_cast<long long>(right.current_servings);
-  if (gap > tolerance) return true;
-  if (gap < -tolerance) return false;
   // Current-day servings are within tolerance. Optionally prefer the larger
   // carried-out fuel reserve (a non-forecast continuation signal) before the
   // biased whole-match forecast.
