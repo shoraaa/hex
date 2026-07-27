@@ -176,7 +176,7 @@ struct AlnsAnytimeBudget {
 AlnsAnytimeBudget alns_anytime_budget(int total_ms, bool final_day,
                                       bool allow_continuation,
                                       bool exact_enabled,
-                                      int continuation_time_percent = 50,
+                                      int continuation_time_percent = 25,
                                       int exact_time_percent = 30);
 
 // Simulation / parsing helpers.
@@ -243,7 +243,8 @@ unsigned alns_features_for_policy(const std::string& policy);
 
 int lns_path_time(const AcoGraph& graph, int from, int to);
 
-AgentTypes select_lns_agent_types(const MapConfig& config);
+AgentTypes select_lns_agent_types(const MapConfig& config,
+                                  const SearchLimits& limits);
 
 std::vector<LnsDpProposal> build_lns_dp_route_proposals(
     const MapConfig& config, const DayInfo& day,
@@ -285,7 +286,8 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
                            unsigned features, bool allow_continuation = true,
                            std::uint64_t restart_salt = 0,
                            const ImprovementSink* on_improve = nullptr,
-                           std::vector<ActionPlan>* elite_plans = nullptr);
+                           std::vector<ActionPlan>* elite_plans = nullptr,
+                           ActionPlan* myopic_plan = nullptr);
 // Refuel-escort construction seed (empty when there is no refuel car).
 ActionPlan build_escort_plan(const MapConfig& config, const DayInfo& day,
                              const PolicyHistory& history,

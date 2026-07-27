@@ -2305,7 +2305,8 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
                             bool allow_continuation,
                             std::uint64_t restart_salt,
                             const ImprovementSink* on_improve,
-                            std::vector<ActionPlan>* elite_plans) {
+                            std::vector<ActionPlan>* elite_plans,
+                            ActionPlan* myopic_plan) {
   const auto started = std::chrono::steady_clock::now();
   const bool timed = limits.time_limit_ms >= 0;
   const auto deadline =
@@ -3122,6 +3123,12 @@ ActionPlan build_alns_plan(const MapConfig& config, const DayInfo& day,
     std::fflush(stderr);
   }
 
+  // Whole-match callers may need both the strongest realized route from the
+  // current-day phase and the route selected by ALNS's continuation rollout.
+  // Capture the former before either continuation tier changes `best` so the
+  // caller can evaluate both boundary states without running a second search.
+  if (myopic_plan != nullptr) *myopic_plan = best;
+
   // A refuel car is normally moved only when the current day's patrol route
   // needs a rendezvous.  That is good for the daily score, but it can leave
   // the support car in a poor position for tomorrow.  Generate a small set of
@@ -3659,6 +3666,10 @@ struct MlnsRank {
   // genuinely needs multi-day look-ahead.
   int current_daily{};
   int current_servings{};
+  // True when the immediate next-day forecast reaches every available brand.
+  // MLNS replans after that day is revealed, so this one-step structural floor
+  // is more reliable than comparing the approximate whole suffix.
+  bool full_next_daily_projection{};
   // Total patrol fuel carried out of the committed current day. Among plans that
   // realize the identical current-day official triple, a larger reserve enters
   // the next day fuller, so it needs fewer/later refuel rendezvous and wastes
@@ -3833,22 +3844,33 @@ bool mlns_rank_better(const MlnsRank& left, const MlnsRank& right) {
   if (std::get<0>(left.projected) != std::get<0>(right.projected)) {
     return std::get<0>(left.projected) > std::get<0>(right.projected);
   }
-  // 2. Among equal predicted final distinct, prefer collecting brands earlier
-  //    (weighted[0] discounts later days), which is robust to later-day traffic
-  //    and fuel uncertainty.
-  if (left.weighted[0] != right.weighted[0]) {
-    return left.weighted[0] > right.weighted[0];
-  }
-  // 3-4. Bank the committed day's realized daily types, then servings. These
-  //    reset every morning and are re-planned next day, so the reliable
-  //    submitted value outranks the weak whole-match forecast below.
+  // 2. Bank the committed day's realized daily types. Cumulative daily types
+  //    are the second official objective, whereas collecting the same final
+  //    distinct set earlier is only a robustness tie-break. Letting that
+  //    tie-break go first can submit 19 types despite an available 20-type
+  //    plan, permanently losing one official score point.
   if (left.current_daily != right.current_daily) {
     return left.current_daily > right.current_daily;
   }
+  // 3. Protect an immediate next day that reaches the structural daily
+  //    maximum. Comparing arbitrary whole-suffix totals here over-trusts the
+  //    approximate decoder and destroys serving quality.
+  if (left.full_next_daily_projection !=
+      right.full_next_daily_projection) {
+    return left.full_next_daily_projection;
+  }
+  // 4. Among equal daily projections, prefer collecting brands earlier
+  //    (weighted[0] discounts later days) for robustness to traffic and fuel.
+  if (left.weighted[0] != right.weighted[0]) {
+    return left.weighted[0] > right.weighted[0];
+  }
+  // 5. Only after distinct and cumulative-daily quality is tied, bank the
+  //    committed day's realized servings.
   if (left.current_servings != right.current_servings) {
     return left.current_servings > right.current_servings;
   }
-  // 5-6. Discounted whole-match daily / servings forecasts break remaining ties.
+  // 6-7. Discounted whole-match daily / servings forecasts break remaining
+  //      ties after the reliable committed values.
   if (left.weighted[1] != right.weighted[1]) {
     return left.weighted[1] > right.weighted[1];
   }
@@ -3868,6 +3890,8 @@ bool mlns_rank_equal(const MlnsRank& left, const MlnsRank& right) {
   return left.weighted == right.weighted &&
          left.current_daily == right.current_daily &&
          left.current_servings == right.current_servings &&
+         left.full_next_daily_projection ==
+             right.full_next_daily_projection &&
          left.projected == right.projected &&
          left.ending_fuel == right.ending_fuel && left.hash == right.hash;
 }
@@ -3876,11 +3900,15 @@ bool mlns_reward_better(const MlnsRank& left, const MlnsRank& right) {
   if (std::get<0>(left.projected) != std::get<0>(right.projected)) {
     return std::get<0>(left.projected) > std::get<0>(right.projected);
   }
-  if (left.weighted[0] != right.weighted[0]) {
-    return left.weighted[0] > right.weighted[0];
-  }
   if (left.current_daily != right.current_daily) {
     return left.current_daily > right.current_daily;
+  }
+  if (left.full_next_daily_projection !=
+      right.full_next_daily_projection) {
+    return left.full_next_daily_projection;
+  }
+  if (left.weighted[0] != right.weighted[0]) {
+    return left.weighted[0] > right.weighted[0];
   }
   if (left.current_servings != right.current_servings) {
     return left.current_servings > right.current_servings;
@@ -3945,11 +3973,18 @@ bool mlns_commit_better(const MlnsRank& left, const MlnsRank& right) {
   if (std::get<0>(left.projected) != std::get<0>(right.projected)) {
     return std::get<0>(left.projected) > std::get<0>(right.projected);
   }
-  if (left.weighted[0] != right.weighted[0]) {
-    return left.weighted[0] > right.weighted[0];
-  }
   if (left.current_daily != right.current_daily) {
     return left.current_daily > right.current_daily;
+  }
+  // The second official objective spans all days. Protect a suffix forecast
+  // that reaches its structural maximum, without letting small/noisy forecast
+  // differences dominate today's reliable serving count.
+  if (left.full_next_daily_projection !=
+      right.full_next_daily_projection) {
+    return left.full_next_daily_projection;
+  }
+  if (left.weighted[0] != right.weighted[0]) {
+    return left.weighted[0] > right.weighted[0];
   }
   const int tolerance = mlns_commit_tolerance();
   const long long gap = static_cast<long long>(left.current_servings) -
@@ -3963,11 +3998,11 @@ bool mlns_commit_better(const MlnsRank& left, const MlnsRank& right) {
       left.current_ending_fuel != right.current_ending_fuel) {
     return left.current_ending_fuel > right.current_ending_fuel;
   }
-  // Otherwise let the discounted whole-match forecast (which includes today at
-  // full weight) pick the better continuation.
   if (left.weighted[1] != right.weighted[1]) {
     return left.weighted[1] > right.weighted[1];
   }
+  // Otherwise let the discounted whole-match forecast (which includes today at
+  // full weight) pick the better continuation.
   if (left.weighted[2] != right.weighted[2]) {
     return left.weighted[2] > right.weighted[2];
   }
@@ -4257,7 +4292,11 @@ MlnsRank mlns_build_rank(const MapConfig& config,
         root_history.cumulative_daily_types, root_history.total_servings};
   }
   result.hash = mlns_solution_hash(days);
-  (void)config;
+  std::set<int> available_brands;
+  for (const auto& spot : config.spots) available_brands.insert(spot.brand);
+  result.full_next_daily_projection =
+      days.size() < 2 ||
+      days[1].reward[1] >= static_cast<int>(available_brands.size());
   return result;
 }
 
@@ -4767,6 +4806,38 @@ PlannerResult build_mlns_plan(
   MlnsSolution best = *cold;
   mlns_profile_phase("cold_seed", cold_started, std::nullopt, best);
   std::string winning_component = "cold_seed";
+  auto returned_rank = [&] {
+    IncumbentRank rank;
+    rank.available = true;
+    rank.objective_mode = "mlns";
+    rank.patrol_fuel = std::get<3>(best.days.front().evaluation.value);
+    rank.predicted_final_available = true;
+    rank.predicted_final = {
+        std::get<0>(best.rank.projected), std::get<1>(best.rank.projected),
+        std::get<2>(best.rank.projected)};
+    rank.predicted_ending_patrol_fuel = best.rank.ending_fuel;
+    rank.future_discount_percent = limits.future_discount_percent;
+    for (std::size_t index = 0; index < rank.weighted_match.size(); ++index) {
+      rank.weighted_match[index] = mlns_wide_string(best.rank.weighted[index]);
+    }
+    return rank;
+  };
+  std::optional<ActionPlan> emitted_actions;
+  auto emit = [&] {
+    if (on_improve == nullptr || best.days.empty()) return;
+    const auto& actions = best.days.front().plan;
+    if (emitted_actions && *emitted_actions == actions) return;
+    const auto official = alns_official_value(best.days.front().evaluation.value);
+    (*on_improve)(actions,
+                  Score{std::get<0>(official), std::get<1>(official),
+                        std::get<2>(official)},
+                  returned_rank());
+    emitted_actions = actions;
+  };
+  // The cold solution is a real, simulator-validated MLNS incumbent. Stream it
+  // before expensive suffix/root refinement so the controller can submit a
+  // useful plan immediately, then replace it on every later action improvement.
+  emit();
   auto record_phase = [&](std::string_view name,
                           const MlnsProfileSnapshot& before,
                           std::chrono::steady_clock::time_point phase_started) {
@@ -4774,6 +4845,7 @@ PlannerResult build_mlns_plan(
     mlns_profile_phase(name, phase_started, before, best);
     if (mlns_profile_committed_plan_changed(before, after)) {
       winning_component = name;
+      emit();
     }
   };
   // A timed Web search still needs a credible multi-day root.  Disabling the
@@ -4790,11 +4862,44 @@ PlannerResult build_mlns_plan(
                           : std::min(limits.time_limit_ms < 5000 ? 64 : 256,
                                      limits.max_iterations))
                    : std::min(96, limits.max_iterations));
+  auto staging_endpoint_rank = [&](const MlnsSolution& solution) {
+    int maximum_distance = 0;
+    int total_distance = 0;
+    int fuel_starved_patrols = 0;
+    int minimum_patrol_fuel = std::numeric_limits<int>::max();
+    for (std::size_t agent = 0; agent < types.size(); ++agent) {
+      if (types[agent] != AgentKind::Patrol) continue;
+      const int fuel =
+          solution.days.front().evaluation.ending_fuel[agent];
+      fuel_starved_patrols +=
+          fuel <= std::max(1, config.fuel_limit / 5);
+      minimum_patrol_fuel = std::min(minimum_patrol_fuel, fuel);
+    }
+    for (const auto& spot : config.spots) {
+      const int spot_row = spot.pos / config.width;
+      const int spot_column = spot.pos % config.width;
+      int nearest = std::numeric_limits<int>::max();
+      for (std::size_t agent = 0; agent < types.size(); ++agent) {
+        if (types[agent] != AgentKind::Patrol) continue;
+        const int endpoint =
+            solution.days.front().evaluation.ending_positions[agent];
+        nearest = std::min(
+            nearest,
+            std::abs(spot_row - endpoint / config.width) +
+                std::abs(spot_column - endpoint % config.width));
+      }
+      maximum_distance = std::max(maximum_distance, nearest);
+      total_distance += nearest;
+    }
+    return std::tuple{fuel_starved_patrols, -minimum_patrol_fuel,
+                      maximum_distance, total_distance};
+  };
   auto consider_root_seed = [&](const ActionPlan& root_seed,
                                 bool strong_suffix = false,
                                 std::optional<
                                     std::chrono::steady_clock::time_point>
-                                    seed_deadline = std::nullopt) {
+                                    seed_deadline = std::nullopt,
+                                bool prefer_staging = false) {
     if (root_seed.empty()) return;
     if (!seed_deadline) seed_deadline = evaluation_deadline;
     std::vector<LnsSkeleton> seed_skeletons(remaining_days);
@@ -4817,12 +4922,57 @@ PlannerResult build_mlns_plan(
                      std::get<1>(candidate_current)};
       const auto best_coverage =
           std::tuple{std::get<0>(best_current), std::get<1>(best_current)};
+      const bool shorter_next_day =
+          remaining_days > 1 &&
+          config.day_steps[static_cast<std::size_t>(day.day + 1)] <
+              config.day_steps[static_cast<std::size_t>(day.day)];
+      const bool staging_improves =
+          prefer_staging && shorter_next_day &&
+          candidate_coverage == best_coverage &&
+          std::get<2>(candidate_current) + 8 >= std::get<2>(best_current) &&
+          staging_endpoint_rank(*candidate) < staging_endpoint_rank(best);
       if (candidate_coverage > best_coverage ||
           (candidate_coverage == best_coverage &&
-           mlns_commit_better(candidate->rank, best.rank))) {
+           (staging_improves ||
+            mlns_commit_better(candidate->rank, best.rank)))) {
         best = std::move(*candidate);
+        emit();
       }
     }
+  };
+  auto stage_patrols_toward_next_day = [&]() -> ActionPlan {
+    if (best.days.size() < 2 || best.days.front().plan.size() != types.size()) {
+      return {};
+    }
+    ActionPlan staged = best.days.front().plan;
+    const auto& current = best.days.front();
+    const auto& next = best.days[1];
+    bool changed = false;
+    for (std::size_t agent = 0; agent < types.size(); ++agent) {
+      if (types[agent] != AgentKind::Patrol || staged[agent].empty() ||
+          staged[agent].back() >= 0 ||
+          agent >= next.skeleton.routes.size() ||
+          next.skeleton.routes[agent].empty()) {
+        continue;
+      }
+      const int available = -staged[agent].back();
+      const int spot_index = next.skeleton.routes[agent].front();
+      if (spot_index < 0 ||
+          static_cast<std::size_t>(spot_index) >= config.spots.size()) {
+        continue;
+      }
+      const int target = config.spots[static_cast<std::size_t>(spot_index)].pos;
+      auto path = shortest_path(config,
+                                current.evaluation.ending_positions[agent],
+                                target, day.traffics);
+      if (path.cost <= 0 || path.cost > available) continue;
+      staged[agent].pop_back();
+      staged[agent].insert(staged[agent].end(), path.directions.begin(),
+                           path.directions.end());
+      if (available > path.cost) staged[agent].push_back(-(available - path.cost));
+      changed = true;
+    }
+    return changed ? staged : ActionPlan{};
   };
   // Test one transition from the actual incumbent before longer root searches
   // can consume the request. The variant generator is a no-op when staging is
@@ -4866,8 +5016,11 @@ PlannerResult build_mlns_plan(
         started + std::chrono::milliseconds(
                       std::max(1, limits.time_limit_ms * 60 / 100));
     SearchLimits current_limits = limits;
-    current_limits.time_limit_ms =
-        std::max(250, limits.time_limit_ms * 50 / 100);
+    const bool self_traffic_fleet_coupling =
+        config.players == 1 && patrol_count >= 3;
+    current_limits.time_limit_ms = std::max(
+        250, limits.time_limit_ms *
+                 (self_traffic_fleet_coupling ? 60 : 50) / 100);
     current_limits.min_iterations = 0;
     current_limits.max_iterations = std::max(1, limits.max_iterations);
     current_limits.stagnation_iterations = 0;
@@ -4875,19 +5028,36 @@ PlannerResult build_mlns_plan(
     // This is the protected baseline chain. Its budget must remain comparable
     // to ordinary ALNS; DP proposals are evaluated separately by MLNS below.
     current_limits.use_lns_dp_proposals = false;
-    // Do not spend the floor's slice on its own continuation look-ahead: MLNS
-    // already searches the whole match around this seed, so an internal
-    // continuation phase is redundant and (via alns_anytime_budget's 50/50
-    // split) halves the floor's current-day search. On coverage-saturated maps
-    // that lost servings the whole-match machinery cannot recover, because the
-    // floor is the only component that optimizes the committed day's servings.
-    // Running it current-day-only lifts its effective budget from ~25% to ~50%
-    // of the request, matching standalone ALNS's current-day effort.
-    auto current_seed = build_alns_plan(
-        config, day, history, types, current_limits,
-        kProductionAlnsFeatures, /*allow_continuation=*/false);
-    consider_root_seed(current_seed,
-        /*strong_suffix=*/false, floor_deadline);
+    if (self_traffic_fleet_coupling) {
+      // With one team the future roads are generated entirely by our own
+      // routes. Three or more patrols sharing one refuel car also make today's
+      // rendezvous positions strongly constrain tomorrow. Spend a small tail
+      // of the existing floor on the simulator-backed ALNS continuation and
+      // expose both its myopic and continuation-selected roots to MLNS. This
+      // keeps the reliable daily floor while adding the boundary state MLNS's
+      // cheaper decoder otherwise misses.
+      current_limits.continuation_time_percent = 15;
+      ActionPlan myopic_seed;
+      auto continuation_seed = build_alns_plan(
+          config, day, history, types, current_limits,
+          kProductionAlnsFeatures, /*allow_continuation=*/true,
+          /*restart_salt=*/0, /*on_improve=*/nullptr,
+          /*elite_plans=*/nullptr, &myopic_seed);
+      consider_root_seed(myopic_seed, /*strong_suffix=*/false,
+                         evaluation_deadline);
+      if (continuation_seed != myopic_seed) {
+        consider_root_seed(continuation_seed, /*strong_suffix=*/false,
+                           evaluation_deadline);
+      }
+    } else {
+      // Opponent traffic is uncertain, or only two patrols share the support
+      // car. Preserve the proven current-day-only floor in that regime.
+      auto current_seed = build_alns_plan(
+          config, day, history, types, current_limits,
+          kProductionAlnsFeatures, /*allow_continuation=*/false);
+      consider_root_seed(current_seed, /*strong_suffix=*/false,
+                         floor_deadline);
+    }
     record_phase("protected_alns_floor", profile_before, profile_started);
   }
   // Near the end of the match there is no value in spending the complete
@@ -5018,7 +5188,132 @@ PlannerResult build_mlns_plan(
     }
     auto root_seed =
         build_aco_plan(config, day, history, types, true, seed_limits);
-    consider_root_seed(root_seed, /*strong_suffix=*/true);
+    std::vector<ActionPlan> transition_roots{root_seed};
+    if (remaining_days > 1 &&
+        config.day_steps[static_cast<std::size_t>(day.day + 1)] <
+            config.day_steps[static_cast<std::size_t>(day.day)]) {
+      if (auto root_evaluation =
+              evaluate_candidate(config, day, history, root_seed)) {
+        const auto root_skeleton = lns_skeleton_from_trace(
+            config, day.agents.size(), root_evaluation->trace);
+        auto graph = build_aco_graph(config, day);
+        auto meetings = build_aco_meeting_cache(graph, std::size_t{6});
+        std::vector<std::size_t> patrols;
+        for (std::size_t agent = 0; agent < types.size(); ++agent) {
+          if (types[agent] == AgentKind::Patrol) patrols.push_back(agent);
+        }
+        std::set<int> available_brands;
+        for (const auto& spot : config.spots) {
+          available_brands.insert(spot.brand);
+        }
+        struct StagingChoice {
+          std::vector<std::size_t> trims;
+          std::tuple<int, int, int, int, std::vector<std::size_t>> rank;
+        };
+        auto staging_rank = [&](const std::vector<std::size_t>& trims) {
+          std::set<int> brands;
+          std::vector<int> endpoints;
+          int visits = 0;
+          for (std::size_t patrol_index = 0;
+               patrol_index < patrols.size(); ++patrol_index) {
+            const std::size_t agent = patrols[patrol_index];
+            const auto& route = root_skeleton.routes[agent];
+            const std::size_t kept =
+                route.size() - std::min(trims[patrol_index], route.size());
+            visits += static_cast<int>(kept);
+            for (std::size_t index = 0; index < kept; ++index) {
+              brands.insert(config.spots[static_cast<std::size_t>(route[index])]
+                                .brand);
+            }
+            endpoints.push_back(
+                kept > 0
+                    ? config.spots[static_cast<std::size_t>(route[kept - 1])]
+                          .pos
+                    : day.agents[agent].pos);
+          }
+          int maximum_distance = 0;
+          int total_distance = 0;
+          for (const auto& spot : config.spots) {
+            const int spot_row = spot.pos / config.width;
+            const int spot_column = spot.pos % config.width;
+            int nearest = std::numeric_limits<int>::max();
+            for (int endpoint : endpoints) {
+              const int endpoint_row = endpoint / config.width;
+              const int endpoint_column = endpoint % config.width;
+              nearest = std::min(
+                  nearest, std::abs(spot_row - endpoint_row) +
+                               std::abs(spot_column - endpoint_column));
+            }
+            maximum_distance = std::max(maximum_distance, nearest);
+            total_distance += nearest;
+          }
+          return std::tuple{-static_cast<int>(brands.size()), maximum_distance,
+                            total_distance, -visits, trims};
+        };
+        std::vector<StagingChoice> beam{{
+            std::vector<std::size_t>(patrols.size(), 0), {}}};
+        beam.front().rank = staging_rank(beam.front().trims);
+        for (std::size_t patrol_index = 0;
+             patrol_index < patrols.size(); ++patrol_index) {
+          std::vector<StagingChoice> expanded;
+          for (const auto& choice : beam) {
+            const auto& route =
+                root_skeleton.routes[patrols[patrol_index]];
+            const std::size_t maximum_trim =
+                route.empty() ? 0 : std::min<std::size_t>(6, route.size() - 1);
+            for (std::size_t trim = 0; trim <= maximum_trim; ++trim) {
+              auto next = choice.trims;
+              next[patrol_index] = trim;
+              expanded.push_back({next, staging_rank(next)});
+            }
+          }
+          std::sort(expanded.begin(), expanded.end(),
+                    [](const StagingChoice& left,
+                       const StagingChoice& right) {
+                      return left.rank < right.rank;
+                    });
+          if (expanded.size() > 64) expanded.resize(64);
+          beam = std::move(expanded);
+        }
+        int decoded_count = 0;
+        for (const auto& choice : beam) {
+          if (std::get<0>(choice.rank) !=
+              -static_cast<int>(available_brands.size())) {
+            continue;
+          }
+          if (std::none_of(choice.trims.begin(), choice.trims.end(),
+                           [](std::size_t trim) { return trim > 0; })) {
+            continue;
+          }
+          auto staged_skeleton = root_skeleton;
+          for (std::size_t patrol_index = 0;
+               patrol_index < patrols.size(); ++patrol_index) {
+            auto& route = staged_skeleton.routes[patrols[patrol_index]];
+            route.resize(route.size() - choice.trims[patrol_index]);
+          }
+          if (auto decoded = decode_lns_skeleton(
+                  config, day, types, graph, meetings, staged_skeleton,
+                  nullptr, /*strict_travel=*/false)) {
+            transition_roots.push_back(std::move(*decoded));
+            if (++decoded_count >= 4) break;
+          }
+        }
+      }
+    }
+    for (std::size_t root_index = 0; root_index < transition_roots.size();
+         ++root_index) {
+      if (expired()) break;
+      consider_root_seed(transition_roots[root_index],
+                         /*strong_suffix=*/true, std::nullopt,
+                         /*prefer_staging=*/root_index > 0);
+    }
+    // Use the first credible suffix immediately, before later root searches
+    // can consume the deadline, to turn current-day wait slack into next-day
+    // positioning.
+    if (!expired()) {
+      consider_root_seed(stage_patrols_toward_next_day(),
+                         /*strong_suffix=*/true);
+    }
     if (auto evaluation = evaluate_candidate(
             config, day, history, best.days.front().plan)) {
       for (const auto& staged : refuel_staging_variants(
@@ -5107,28 +5402,6 @@ PlannerResult build_mlns_plan(
     record_phase("warm_start", profile_before, profile_started);
   }
   MlnsSolution current = best;
-  auto emit = [&] {
-    if (on_improve == nullptr || best.days.empty()) return;
-    const auto official = alns_official_value(best.days.front().evaluation.value);
-    IncumbentRank rank;
-    rank.available = true;
-    rank.objective_mode = "mlns";
-    rank.patrol_fuel = std::get<3>(best.days.front().evaluation.value);
-    rank.predicted_final_available = true;
-    rank.predicted_final = {
-        std::get<0>(best.rank.projected), std::get<1>(best.rank.projected),
-        std::get<2>(best.rank.projected)};
-    rank.predicted_ending_patrol_fuel = best.rank.ending_fuel;
-    rank.future_discount_percent = limits.future_discount_percent;
-    for (std::size_t index = 0; index < rank.weighted_match.size(); ++index) {
-      rank.weighted_match[index] = mlns_wide_string(best.rank.weighted[index]);
-    }
-    (*on_improve)(best.days.front().plan,
-                  Score{std::get<0>(official), std::get<1>(official),
-                        std::get<2>(official)},
-                  rank);
-  };
-  emit();
 
   std::mt19937_64 random(lns_seed(config, day, history) ^
                          limits.random_seed ^ 0x4d4c4e535f4c4e53ULL);
@@ -5396,7 +5669,7 @@ PlannerResult build_mlns_plan(
                      mlns_profile_snapshot(best), best);
   ++mlns_profile_component(winning_component).final_selections;
   mlns_diagnostics.elapsed_microseconds += mlns_elapsed_microseconds(started);
-  return {best.days.front().plan, std::move(serialized_state)};
+  return {best.days.front().plan, std::move(serialized_state), returned_rank()};
 }
 
 LnsSkeleton build_rollout_skeleton(const MapConfig& config,
@@ -5467,6 +5740,7 @@ LnsSkeleton build_rollout_skeleton(const MapConfig& config,
 struct TypeRolloutResult {
   std::tuple<int, int, int> score;
   int residual_fuel{};
+  int fuel_pressure_day{};
 };
 
 TypeRolloutResult run_type_rollout(
@@ -5483,6 +5757,7 @@ TypeRolloutResult run_type_rollout(
         {types[index], config.agents[index], config.fuel_limit});
   }
   int cumulative_daily = 0;
+  int fuel_pressure_day = static_cast<int>(config.day_steps.size());
   for (int day_index = 0;
        day_index < static_cast<int>(config.day_steps.size()); ++day_index) {
     DayInfo day;
@@ -5510,6 +5785,7 @@ TypeRolloutResult run_type_rollout(
     ActionPlan actions =
         plan ? std::move(*plan)
              : wait_plan(types.size(), config.day_steps[day_index]);
+    const int previous_refuels = team.refuel_events;
     std::map<int, int> traffic;
     if (auto error =
             simulate_team_day(config, team, actions, day.traffics, traffic)) {
@@ -5518,6 +5794,15 @@ TypeRolloutResult run_type_rollout(
     team.history.submitted_actions.push_back(actions);
     team.history.distinct_brands = team.distinct_types;
     cumulative_daily += static_cast<int>(team.daily_types.size());
+    const bool refuel_used = team.refuel_events > previous_refuels;
+    const bool low_patrol_fuel = std::any_of(
+        team.agents.begin(), team.agents.end(), [&](const MutableAgent& agent) {
+          return agent.kind == AgentKind::Patrol &&
+                 agent.fuel <= std::max(1, config.fuel_limit / 5);
+        });
+    if (refuel_used || low_patrol_fuel) {
+      fuel_pressure_day = std::min(fuel_pressure_day, day_index);
+    }
   }
   int residual_fuel = 0;
   for (const auto& agent : team.agents) {
@@ -5525,38 +5810,12 @@ TypeRolloutResult run_type_rollout(
   }
   return {{static_cast<int>(team.distinct_types.size()), cumulative_daily,
            team.total_servings},
-          residual_fuel};
+          residual_fuel, fuel_pressure_day};
 }
 
-AgentTypes select_remote_refuel_agent_types(const MapConfig& config,
-                                            int refuelers) {
-  AgentTypes types(config.agents.size(), AgentKind::Patrol);
-  std::map<int, int> smooth;
-  std::vector<std::pair<int, int>> ranked;
-  for (std::size_t index = 0; index < config.agents.size(); ++index) {
-    int nearest = std::numeric_limits<int>::max() / 4;
-    for (const auto& spot : config.spots) {
-      nearest =
-          std::min(nearest,
-                   shortest_path(config, config.agents[index], spot.pos, smooth)
-                       .cost);
-    }
-    ranked.emplace_back(nearest, static_cast<int>(index));
-  }
-  std::sort(ranked.begin(), ranked.end(), std::greater<>());
-  for (int index = 0;
-       index < std::min<int>(refuelers, static_cast<int>(ranked.size()));
-       ++index) {
-    types[static_cast<std::size_t>(ranked[index].second)] = AgentKind::Refuel;
-  }
-  return types;
-}
-
-AgentTypes select_one_refuel_agent_types(const MapConfig& config) {
-  return select_remote_refuel_agent_types(config, 1);
-}
-
-AgentTypes select_lns_agent_types(const MapConfig& config) {
+AgentTypes select_lns_agent_types(const MapConfig& config,
+                                  const SearchLimits& limits) {
+  const auto selection_started = std::chrono::steady_clock::now();
   const std::size_t count = config.agents.size();
   constexpr int rollout_cycles = 7;
   // Keep the synthetic 1x/2x/4x stress horizons for robustness, but also
@@ -5610,9 +5869,10 @@ AgentTypes select_lns_agent_types(const MapConfig& config) {
     std::tuple<int, int, int> scheduled;
     int residual{};
     int patrols{};
+    int fuel_pressure_day{};
     unsigned mask{};
   };
-  const auto ranked = parallel_indexed(masks.size(), [&](std::size_t index) {
+  auto ranked = parallel_indexed(masks.size(), [&](std::size_t index) {
     const unsigned mask = masks[index];
     AgentTypes types(count, AgentKind::Patrol);
     for (std::size_t agent = 0; agent < count; ++agent) {
@@ -5628,6 +5888,7 @@ AgentTypes select_lns_agent_types(const MapConfig& config) {
         std::numeric_limits<int>::max(),
         std::numeric_limits<int>::max()};
     int residual = 0;
+    int fuel_pressure_day = static_cast<int>(config.day_steps.size());
     for (std::size_t rollout_index = 0;
          rollout_index < rollout_configs.size(); ++rollout_index) {
       const auto& rollout_config = rollout_configs[rollout_index];
@@ -5642,12 +5903,15 @@ AgentTypes select_lns_agent_types(const MapConfig& config) {
           std::get<2>(combined) += std::get<2>(outcome.score);
         } else {
           scheduled = std::min(scheduled, outcome.score);
+          fuel_pressure_day =
+              std::min(fuel_pressure_day, outcome.fuel_pressure_day);
         }
         residual += outcome.residual_fuel;
       }
     }
     return RankedTypes{std::move(types), worst, combined, scheduled, residual,
-                       static_cast<int>(count - std::popcount(mask)), mask};
+                       static_cast<int>(count - std::popcount(mask)),
+                       fuel_pressure_day, mask};
   });
   auto better = [](const RankedTypes& left, const RankedTypes& right) {
     if (left.worst != right.worst) return left.worst < right.worst;
@@ -5666,27 +5930,291 @@ AgentTypes select_lns_agent_types(const MapConfig& config) {
     return left.mask > right.mask;
   };
   const auto selected = std::max_element(ranked.begin(), ranked.end(), better);
-  const int selected_refuelers =
-      static_cast<int>(count) - selected->patrols;
-  if (selected_refuelers == 1 ||
-      (count <= 3 && selected_refuelers > 1)) {
-    return select_one_refuel_agent_types(config);
+  // The greedy rollout winner is only an emergency result for callers that do
+  // not provide a usable selection window or when every timed simulation
+  // fails. It is not the incumbent that challengers must beat.
+  const AgentTypes emergency_fallback = selected->types;
+  if (limits.time_limit_ms < 50 || ranked.size() < 2) {
+    return emergency_fallback;
   }
-  int total_stock = 0;
-  for (const auto& spot : config.spots) total_stock += spot.stocks;
-  const bool multi_refuel_pressure =
-      total_stock > 2 * config.fuel_limit ||
-      (config.spots.size() >= 15 && config.fuel_limit < 50) ||
-      (config.width * config.height > 500 &&
-       total_stock > config.fuel_limit);
-  if (minimum_refuelers <= 1 && selected_refuelers > 1 &&
-      !multi_refuel_pressure) {
-    return select_one_refuel_agent_types(config);
+
+  // The fixed rollout above is a cheap robust screen. Spend the optional
+  // agent-selection budget on rolling simulations for a small, role-diverse
+  // finalist set. Screening uses an adaptive prefix through the first fuel
+  // pressure/recovery transition; any winner is confirmed over the full match.
+  // Each simulated day commits fuel, position, traffic, and planner state
+  // before replanning with the production MLNS/optional LNS-DP decoder.
+  const auto deadline = selection_started +
+                        std::chrono::milliseconds(limits.time_limit_ms);
+  std::sort(ranked.begin(), ranked.end(), [&](const auto& left,
+                                               const auto& right) {
+    return better(right, left);
+  });
+  const std::size_t finalist_limit = std::min<std::size_t>(
+      ranked.size(), limits.time_limit_ms < 10'000 ? 2
+                     : limits.time_limit_ms < 30'000 ? 3
+                                                     : 4);
+  std::vector<std::size_t> finalists;
+  auto add_finalist = [&](std::size_t index) {
+    if (finalists.size() >= finalist_limit ||
+        std::find(finalists.begin(), finalists.end(), index) !=
+            finalists.end()) {
+      return;
+    }
+    finalists.push_back(index);
+  };
+  add_finalist(0);
+  for (int refuelers = minimum_refuelers; refuelers <= 3; ++refuelers) {
+    const auto found = std::find_if(
+        ranked.begin(), ranked.end(), [&](const RankedTypes& candidate) {
+          return static_cast<int>(count) - candidate.patrols == refuelers;
+        });
+    if (found != ranked.end()) {
+      add_finalist(static_cast<std::size_t>(found - ranked.begin()));
+    }
   }
-  if (config.players > 1 && count <= 6 &&
-      config.width * config.height <= 300 && selected_refuelers == 1) {
-    return select_one_refuel_agent_types(config);
+  for (std::size_t index = 0;
+       index < ranked.size() && finalists.size() < finalist_limit; ++index) {
+    add_finalist(index);
   }
-  return selected->types;
+  const int total_days = static_cast<int>(config.day_steps.size());
+  int screening_days = std::min(4, total_days);
+  for (std::size_t ranked_index : finalists) {
+    const int pressure_day = ranked[ranked_index].fuel_pressure_day;
+    if (pressure_day < total_days) {
+      // Include the first low-fuel/refuel day and one following recovery day.
+      // This keeps easy high-fuel screens short without hiding delayed value
+      // from a refuel role on maps where fuel pressure appears later.
+      screening_days =
+          std::max(screening_days, std::min(total_days, pressure_day + 2));
+    }
+  }
+
+  struct TimedRoleResult {
+    std::size_t ranked_index{};
+    std::array<int, 3> score{};
+    int ending_fuel{};
+  };
+  auto simulate_remaining_match = [&](std::size_t ranked_index,
+                                      SearchLimits role_limits,
+                                      auto candidate_deadline,
+                                      std::uint64_t selection_seed,
+                                      int day_limit)
+      -> std::optional<TimedRoleResult> {
+    const auto& types = ranked[ranked_index].types;
+    TeamState team;
+    team.id = "timed-role-rollout";
+    team.policy = "mlns";
+    for (std::size_t agent = 0; agent < count; ++agent) {
+      team.agents.push_back(
+          {types[agent], config.agents[agent], config.fuel_limit});
+    }
+    team.visited_today.resize(count);
+    std::vector<std::map<int, int>> traffic_history;
+    const int simulated_days = std::clamp(day_limit, 1, total_days);
+    for (int day_index = 0; day_index < simulated_days; ++day_index) {
+      const auto now = std::chrono::steady_clock::now();
+      const auto remaining =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              candidate_deadline - now)
+              .count();
+      const int days_left = simulated_days - day_index;
+      if (remaining < 10 || days_left <= 0) return std::nullopt;
+      // Search deadlines have small fixed teardown/serialization costs. Keep
+      // 20% of every per-day slice outside MLNS so one large map cannot consume
+      // the next finalist's allocation.
+      role_limits.time_limit_ms = std::max<int>(
+          5, static_cast<int>((remaining * 8) / (10 * days_left)));
+      // Compare every role mask with the same stochastic stream. Varying the
+      // seed by mask confounds role quality with trajectory luck and made
+      // short selection windows systematically unstable.
+      role_limits.random_seed = selection_seed;
+
+      team.stock.clear();
+      team.daily_types.clear();
+      for (auto& visited : team.visited_today) visited.clear();
+      for (const auto& spot : config.spots) team.stock[spot.pos] = spot.stocks;
+      const auto roads =
+          road_status_for_day(config, traffic_history, config.players);
+      DayInfo day;
+      day.day = day_index;
+      day.traffics = roads;
+      for (const auto& agent : team.agents) {
+        day.agents.push_back({agent.kind, agent.pos, agent.fuel});
+      }
+      for (int pos = 0; pos < config.width * config.height; ++pos) {
+        if (config.cells[pos] == Terrain::Road &&
+            !day.traffics.contains(pos)) {
+          day.traffics[pos] = 0;
+        }
+      }
+      auto planned = build_mlns_plan(
+          config, day, team.history, types, role_limits,
+          team.planner_state ? &*team.planner_state : nullptr, nullptr);
+      std::map<int, int> day_traffic;
+      if (simulate_team_day(config, team, planned.actions, day.traffics,
+                            day_traffic)) {
+        return std::nullopt;
+      }
+      team.planner_state =
+          planned.planner_state
+              ? std::optional<json::value>(json::value(*planned.planner_state))
+              : std::nullopt;
+      team.history.submitted_actions.push_back(planned.actions);
+      team.history.distinct_brands = team.distinct_types;
+      team.cumulative_daily_types += static_cast<int>(team.daily_types.size());
+      team.history.cumulative_daily_types = team.cumulative_daily_types;
+      team.history.total_servings = team.total_servings;
+      traffic_history.push_back(std::move(day_traffic));
+    }
+    int ending_fuel = 0;
+    for (const auto& agent : team.agents) {
+      if (agent.kind == AgentKind::Patrol) ending_fuel += agent.fuel;
+    }
+    if (std::chrono::steady_clock::now() >
+        candidate_deadline + std::chrono::milliseconds(25)) {
+      return std::nullopt;
+    }
+    return TimedRoleResult{
+        ranked_index,
+        {static_cast<int>(team.distinct_types.size()),
+         team.cumulative_daily_types, team.total_servings},
+        ending_fuel};
+  };
+  auto meaningfully_better = [](const std::array<int, 3>& candidate,
+                                const std::array<int, 3>& baseline) {
+    if (candidate <= baseline) return false;
+    if (candidate[0] != baseline[0] || candidate[1] != baseline[1]) {
+      return true;
+    }
+    const int minimum_serving_gain =
+        std::max(3, (baseline[2] + 19) / 20);
+    return candidate[2] - baseline[2] >= minimum_serving_gain;
+  };
+  auto timed_better = [&](const TimedRoleResult& left,
+                          const TimedRoleResult& right) {
+    if (left.score != right.score) return left.score > right.score;
+    const auto& left_screen = ranked[left.ranked_index];
+    const auto& right_screen = ranked[right.ranked_index];
+    if (left_screen.scheduled != right_screen.scheduled) {
+      return left_screen.scheduled > right_screen.scheduled;
+    }
+    if (left_screen.worst != right_screen.worst) {
+      return left_screen.worst > right_screen.worst;
+    }
+    if (left.ending_fuel != right.ending_fuel) {
+      return left.ending_fuel > right.ending_fuel;
+    }
+    if (left_screen.patrols != right_screen.patrols) {
+      return left_screen.patrols > right_screen.patrols;
+    }
+    return left_screen.mask < right_screen.mask;
+  };
+  std::vector<TimedRoleResult> screened;
+  reset_mlns_diagnostics();
+  const bool require_confirmation = limits.time_limit_ms >= 10'000;
+  const auto screening_deadline =
+      require_confirmation
+          ? selection_started +
+                std::chrono::milliseconds(
+                    limits.time_limit_ms >= 30'000
+                        ? limits.time_limit_ms * 9 / 20
+                        : limits.time_limit_ms * 3 / 5)
+          : deadline;
+  for (std::size_t order = 0; order < finalists.size(); ++order) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               screening_deadline - now)
+                               .count();
+    const auto candidates_left = finalists.size() - order;
+    if (remaining < 20 || candidates_left == 0) break;
+    const auto candidate_budget =
+        std::max<std::int64_t>(10, remaining / candidates_left);
+    const auto candidate_deadline =
+        now + std::chrono::milliseconds(candidate_budget);
+    SearchLimits role_limits = limits;
+    role_limits.min_iterations = 0;
+    role_limits.max_iterations = std::max(1'000'000, limits.max_iterations);
+    role_limits.stagnation_iterations = 0;
+    try {
+      auto candidate = simulate_remaining_match(
+          finalists[order], role_limits, candidate_deadline,
+          limits.random_seed, screening_days);
+      if (!candidate) continue;
+      screened.push_back(*candidate);
+    } catch (const std::exception&) {
+      // A finalist that cannot produce a valid full-match replay before its
+      // slice expires is simply ineligible; the deterministic rollout remains
+      // safe.
+    }
+  }
+  if (screened.empty()) {
+    reset_mlns_diagnostics();
+    return emergency_fallback;
+  }
+  std::sort(screened.begin(), screened.end(), timed_better);
+  TimedRoleResult timed_best = screened.front();
+  if (require_confirmation && screened.size() >= 2) {
+    const std::array<TimedRoleResult, 2> confirmation_targets{
+        screened[0], screened[1]};
+    const auto now = std::chrono::steady_clock::now();
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               deadline - now)
+                               .count();
+    if (remaining < 40) {
+      timed_best = screened.front();
+    } else {
+      const auto half = std::max<std::int64_t>(20, remaining / 2);
+      SearchLimits confirmation_limits = limits;
+      confirmation_limits.min_iterations = 0;
+      confirmation_limits.max_iterations =
+          std::max(1'000'000, limits.max_iterations);
+      confirmation_limits.stagnation_iterations = 0;
+      const std::uint64_t confirmation_seed =
+          limits.random_seed ^ 0xd1b54a32d192ed03ULL;
+      auto confirmed_first = simulate_remaining_match(
+          confirmation_targets[0].ranked_index, confirmation_limits,
+          now + std::chrono::milliseconds(half), confirmation_seed,
+          total_days);
+      const auto second_started = std::chrono::steady_clock::now();
+      const auto second_remaining =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              deadline - second_started)
+              .count();
+      auto confirmed_second =
+          second_remaining < 20
+              ? std::optional<TimedRoleResult>{}
+              : simulate_remaining_match(
+                    confirmation_targets[1].ranked_index, confirmation_limits,
+                    second_started +
+                        std::chrono::milliseconds(second_remaining),
+                    confirmation_seed, total_days);
+      if (confirmed_first && confirmed_second) {
+        if (meaningfully_better(confirmed_first->score,
+                                confirmed_second->score)) {
+          timed_best = *confirmed_first;
+        } else if (meaningfully_better(confirmed_second->score,
+                                       confirmed_first->score)) {
+          timed_best = *confirmed_second;
+        } else {
+          // A small serving-only disagreement is not reliable enough to
+          // distinguish committed roles. Use the robust smooth/jammed rollout
+          // order only as a tie-break between the two fully simulated masks.
+          timed_best = confirmation_targets[0].ranked_index <
+                               confirmation_targets[1].ranked_index
+                           ? confirmation_targets[0]
+                           : confirmation_targets[1];
+        }
+      } else if (confirmed_first) {
+        timed_best = *confirmed_first;
+      } else if (confirmed_second) {
+        timed_best = *confirmed_second;
+      } else {
+        timed_best = screened.front();
+      }
+    }
+  }
+  reset_mlns_diagnostics();
+  return ranked[timed_best.ranked_index].types;
 }
 }  // namespace hexudon

@@ -13,7 +13,7 @@ def test_mlns_defaults_are_deadline_governed() -> None:
 
 
 def test_mlns_uses_complete_safe_day_window() -> None:
-    assert solver_time_limit_ms("mlns", 58.0) == 58_000
+    assert solver_time_limit_ms("mlns", 58.0) == 55_100
     assert solver_time_limit_ms("alns", 58.0) == 49_300
 
 

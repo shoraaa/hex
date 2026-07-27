@@ -10,6 +10,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
+import os
 import re
 import shlex
 import threading
@@ -27,6 +29,7 @@ from .api import (
     STATEFUL_DEFAULTS,
     STATEFUL_POLICIES,
     _token_team_id,
+    agent_type_payload,
     discover_assigned_games,
     fetch_game_snapshot,
     load_token,
@@ -46,8 +49,229 @@ from .runner import (
 )
 
 
+# The C++ core caps each MLNS search's internal parallelism at this many worker
+# threads (configured_workers in src/core.cpp), so on larger machines a single
+# trajectory leaves cores idle. Racing one extra independent trajectory per
+# spare block of cores and keeping the best-scoring committed plan converts that
+# idle capacity into a higher, lower-variance score floor -- validated on the
+# online q10/q11 fixtures (Q10 servings 332->341, Q11 daily floor 276->282 at
+# 30s/day) with no regression. Best-of-K is realized by HEXUDON_MLNS_PORTFOLIO
+# in the core; here we only pick a sensible K from the host core count.
+_MLNS_WORKER_CAP = 8
+
+
+def _maybe_enable_mlns_portfolio(method: str) -> None:
+    """Race best-of-K MLNS trajectories when the host has spare cores.
+
+    No-op unless the method is MLNS, the operator has not already pinned
+    ``HEXUDON_MLNS_PORTFOLIO``, and there is room for at least two full-strength
+    trajectories (2 * worker cap cores). Sets the environment variable the C++
+    core reads; the solver subprocess inherits it.
+    """
+    if method != "mlns" or "HEXUDON_MLNS_PORTFOLIO" in os.environ:
+        return
+    cores = os.cpu_count() or 1
+    portfolio = max(1, min(8, cores // _MLNS_WORKER_CAP))
+    if portfolio > 1:
+        os.environ["HEXUDON_MLNS_PORTFOLIO"] = str(portfolio)
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _agent_selection_wait_seconds(
+    config: dict[str, Any],
+    day_index: int,
+    *,
+    now: float | None = None,
+) -> float:
+    """Return how long Day 1 must wait for agent selection to close.
+
+    The schema defines ``startsAt`` as the start of the match, with agent type
+    selection occurring before it. Some servers can briefly expose
+    ``in_progress`` before that wall-clock boundary, so status alone is not
+    sufficient to make a Day 1 submission safe.
+    """
+    if day_index != 0:
+        return 0.0
+    raw_starts_at = config.get("startsAt")
+    if isinstance(raw_starts_at, bool):
+        return 0.0
+    try:
+        starts_at = float(raw_starts_at)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(starts_at):
+        return 0.0
+    current_time = time.time() if now is None else float(now)
+    return max(0.0, starts_at - current_time)
+
+
+_AGENT_SELECTION_NOT_OPEN_RE = re.compile(
+    r"agent type selection has not opened yet\s*"
+    r"\(opens at ([0-9]+(?:\.[0-9]+)?), now ([0-9]+(?:\.[0-9]+)?)\)",
+    re.IGNORECASE,
+)
+
+
+def _agent_selection_opening(error: Exception | str) -> tuple[float, float] | None:
+    """Extract the server-authoritative type-selection opening timestamps."""
+    match = _AGENT_SELECTION_NOT_OPEN_RE.search(str(error))
+    if match is None:
+        return None
+    opens_at, server_now = (float(value) for value in match.groups())
+    if not math.isfinite(opens_at) or not math.isfinite(server_now):
+        return None
+    return opens_at, server_now
+
+
+def _agent_selection_open_wait_seconds(status: dict[str, Any]) -> float:
+    """Return the server-reported delay before role submissions are accepted."""
+    raw_wait = status.get("selection_opens_in")
+    if isinstance(raw_wait, bool):
+        return 0.0
+    try:
+        wait = float(raw_wait)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, wait) if math.isfinite(wait) else 0.0
+
+
+def _match_starts_at(config: dict[str, Any]) -> float | None:
+    """Return the server's stable identifier for one use of a game id."""
+    raw_starts_at = config.get("startsAt")
+    if isinstance(raw_starts_at, bool):
+        return None
+    try:
+        starts_at = float(raw_starts_at)
+    except (TypeError, ValueError):
+        return None
+    return starts_at if math.isfinite(starts_at) else None
+
+
+def _team_types_selected(
+    status: dict[str, Any], team_id: str | None
+) -> bool | None:
+    """Read the server-authoritative role-selection state for our team."""
+    if team_id is None:
+        return None
+    teams = status.get("teams")
+    if not isinstance(teams, dict):
+        return None
+    team = teams.get(str(team_id))
+    if not isinstance(team, dict):
+        return None
+    if team.get("missed_selection") is True:
+        return False
+    selected = team.get("types_selected")
+    return selected if isinstance(selected, bool) else None
+
+
+def _reset_match_journal(
+    journal: dict[str, Any], match_starts_at: float | None
+) -> None:
+    """Discard state belonging to an earlier use of the same game id."""
+    journal.clear()
+    journal.update(
+        {
+            "match_starts_at": match_starts_at,
+            "types": None,
+            "submitted_days": {},
+            "day_snapshots": {},
+            "distinct_brands": [],
+            "cumulative_daily_types": 0,
+            "total_servings": 0,
+            "competitive_day_baselines": {},
+            "planner_state": None,
+            "traffic_predictions": {},
+        }
+    )
+
+
+def _is_rate_limit_error(error: Exception | str) -> bool:
+    """Recognize a server throttle response that is safe to retry."""
+    return (
+        re.search(r"\b(?:GET|POST)\s+\S+\s+failed\s+\(429\)", str(error))
+        is not None
+    )
+
+
+def _is_retryable_submission_error(error: Exception | str) -> bool:
+    """Return whether repeating the same idempotent day plan is safe."""
+    message = str(error)
+    return _is_rate_limit_error(message) or re.search(
+        r"POST /\S+ failed \((?:ambiguous network error[^)]*|network|5\d\d)\)",
+        message,
+        re.IGNORECASE,
+    ) is not None
+
+
+def _submission_timeout(day: dict[str, Any], reserve_seconds: float) -> float:
+    """Bound one POST well inside the server's authoritative day deadline."""
+    timeout = min(2.0, max(0.25, float(reserve_seconds) / 3.0))
+    try:
+        remaining = float(day.get("endsAt")) - time.time()
+    except (TypeError, ValueError):
+        return timeout
+    if not math.isfinite(remaining):
+        return timeout
+    return max(0.1, min(timeout, remaining - 0.25))
+
+
+def _adaptive_submission_margin(
+    session: dict[str, Any], config: dict[str, Any], day_index: int
+) -> float:
+    """Choose a live submission reserve from recent observed POST latency."""
+    try:
+        duration = float(config["daySeconds"][day_index])
+    except (KeyError, IndexError, TypeError, ValueError):
+        duration = 45.0
+    if not math.isfinite(duration) or duration <= 0:
+        duration = 45.0
+    maximum = min(12.0, max(0.5, duration * 0.25))
+    minimum = min(3.0, maximum)
+    recent: list[float] = []
+    for sample in session.get("submission_latency_samples", [])[-6:]:
+        if not isinstance(sample, dict):
+            continue
+        try:
+            latency = float(sample.get("seconds"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(latency) or latency < 0:
+            continue
+        # A day-boundary rejection is a stronger congestion signal than its
+        # response time alone: make the next few submissions conservative.
+        if sample.get("late") is True:
+            latency = max(latency, 8.0)
+        recent.append(latency)
+    if not recent:
+        return min(5.0, maximum)
+    return min(maximum, max(minimum, 2.0 + 1.5 * max(recent)))
+
+
+def _advanced_day_from_submission_error(
+    error: Exception, expected_day: int
+) -> int | None:
+    """Recognize a harmless action POST that lost a day-boundary race."""
+    message = str(error)
+    if re.search(
+        r"POST /game/actions failed \(409\): game has ended\b",
+        message,
+    ):
+        return expected_day + 1
+    match = re.search(
+        r"POST /game/actions failed \(409\): day (-?\d+) "
+        r"is not the current day \((-?\d+)\)",
+        message,
+    )
+    if match is None:
+        return None
+    submitted_day, current_day = (int(value) for value in match.groups())
+    if submitted_day != expected_day or current_day <= expected_day:
+        return None
+    return current_day
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:
@@ -229,17 +453,39 @@ class CompetitionSessionManager:
                 continue
             session.setdefault("day_metrics", [])
             if session.get("state") in {
+                "starting",
                 "planning",
                 "awaiting_role_approval",
                 "awaiting_plan_approval",
                 "submitting",
+                "submitted",
                 "waiting_for_day",
+                "streaming",
             }:
                 session["state"] = "interrupted"
                 session["error"] = "dashboard restarted; resume explicitly"
+                session["recoverable"] = True
                 session["updated_at"] = _now()
                 _write_json(path, session)
+            elif (
+                session.get("state") in {"failed", "interrupted"}
+                and "recoverable" not in session
+            ):
+                # Sessions written by older dashboard versions did not carry
+                # this flag. Preserve their explicit recovery path after an
+                # upgrade; the UI still checks the live server day before
+                # offering the button.
+                session["recoverable"] = True
+                _write_json(path, session)
             self._sessions[str(session["id"])] = session
+
+    def _restart_after_thread(
+        self, session_id: str, predecessor: threading.Thread
+    ) -> None:
+        """Restart a failed controller once its previous thread has unwound."""
+        predecessor.join()
+        if not self._closed:
+            self._run(session_id)
 
     def _resume_result_sessions(self) -> None:
         """Safely resume read-only result polling after a dashboard restart."""
@@ -274,6 +520,97 @@ class CompetitionSessionManager:
             )
             return copy.deepcopy(rows[:20])
 
+    def saved_session_for_game(self, game_id: str) -> dict[str, Any] | None:
+        """Return the newest durable controller record for one game."""
+        with self._lock:
+            candidates = [
+                session
+                for session in self._sessions.values()
+                if game_id
+                in {
+                    str(session.get("requested_game_id", "")),
+                    str(session.get("game_id", "")),
+                }
+                and isinstance(session.get("snapshot", {}).get("config"), dict)
+            ]
+            if not candidates:
+                return None
+            latest = max(
+                candidates,
+                key=lambda session: str(
+                    session.get("updated_at") or session.get("created_at") or ""
+                ),
+            )
+            return copy.deepcopy(latest)
+
+    def saved_games(self) -> list[dict[str, Any]]:
+        """Build one retained match-card descriptor per persisted game."""
+        with self._lock:
+            sessions = sorted(
+                self._sessions.values(),
+                key=lambda session: str(
+                    session.get("updated_at") or session.get("created_at") or ""
+                ),
+                reverse=True,
+            )
+            games: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for session in sessions:
+                game_id = str(
+                    session.get("requested_game_id") or session.get("game_id") or ""
+                )
+                snapshot = session.get("snapshot", {})
+                config = snapshot.get("config", {})
+                if not game_id or game_id in seen or not isinstance(config, dict):
+                    continue
+                descriptor = copy.deepcopy(session.get("game") or {})
+                game_map = config.get("map", {})
+                descriptor.update(
+                    question_id=game_id,
+                    name=str(descriptor.get("name") or game_id),
+                    width=descriptor.get("width") or game_map.get("width"),
+                    height=descriptor.get("height") or game_map.get("height"),
+                    total_days=(
+                        descriptor.get("total_days")
+                        or len(config.get("daySteps", []))
+                    ),
+                    saved=True,
+                    archived=True,
+                    saved_session_id=str(session["id"]),
+                    saved_at=(
+                        session.get("updated_at") or session.get("created_at")
+                    ),
+                    session_state=str(session.get("state") or "unknown"),
+                )
+                games.append(descriptor)
+                seen.add(game_id)
+            return games
+
+    def saved_snapshot(self, game_id: str) -> dict[str, Any] | None:
+        """Return a read-only analysis snapshot when the online match expires."""
+        session = self.saved_session_for_game(game_id)
+        if session is None:
+            return None
+        snapshot = copy.deepcopy(session["snapshot"])
+        snapshot.update(
+            archived=True,
+            archived_at=session.get("updated_at") or session.get("created_at"),
+            archived_session_id=session["id"],
+            archived_result=copy.deepcopy(session.get("result")),
+        )
+        state = dict(snapshot.get("state") or {})
+        if session.get("state") == "finished":
+            state["status"] = "finished"
+        snapshot["state"] = state
+        return snapshot
+
+    def saved_journal(self, game_id: str) -> dict[str, Any] | None:
+        session = self.saved_session_for_game(game_id)
+        if session is None:
+            return None
+        _, journal = self._journal(str(session["game_id"]))
+        return copy.deepcopy(journal)
+
     def get_session(self, session_id: str) -> dict[str, Any] | None:
         with self._lock:
             value = self._sessions.get(session_id)
@@ -288,11 +625,11 @@ class CompetitionSessionManager:
                 if session.get("game_id") != game_id or session.get("state") in {
                     "finished",
                     "cancelled",
-                    "failed",
                 }:
                     continue
                 session.update(
                     state="cancelled",
+                    recoverable=False,
                     proposal=None,
                     approval=None,
                     error=None,
@@ -342,6 +679,7 @@ class CompetitionSessionManager:
         execution_mode: str = "manual",
         target_day: int | None = None,
         time_limit_seconds: float | None = None,
+        agent_selection_time_limit_seconds: float = 30.0,
     ) -> dict[str, Any]:
         if execution_mode not in {"manual", "auto", "curl"}:
             raise ValueError("execution_mode must be manual, auto, or curl")
@@ -353,6 +691,17 @@ class CompetitionSessionManager:
             if not 0.1 <= float(time_limit_seconds) <= 600:
                 raise ValueError("time_limit_seconds must be between 0.1 and 600")
             time_limit_seconds = float(time_limit_seconds)
+        if isinstance(agent_selection_time_limit_seconds, bool) or not isinstance(
+            agent_selection_time_limit_seconds, (int, float)
+        ):
+            raise ValueError("agent_selection_time_limit_seconds must be numeric")
+        if not 0.1 <= float(agent_selection_time_limit_seconds) <= 600:
+            raise ValueError(
+                "agent_selection_time_limit_seconds must be between 0.1 and 600"
+            )
+        agent_selection_time_limit_seconds = float(
+            agent_selection_time_limit_seconds
+        )
         if target_day is not None and (
             isinstance(target_day, bool) or not isinstance(target_day, int) or target_day < 0
         ):
@@ -427,7 +776,11 @@ class CompetitionSessionManager:
                 "execution_mode": execution_mode,
                 "target_day": target_day,
                 "time_limit_seconds": time_limit_seconds,
+                "agent_selection_time_limit_seconds": (
+                    agent_selection_time_limit_seconds
+                ),
                 "state": "starting",
+                "recoverable": False,
                 "snapshot": snapshot,
                 "proposal": None,
                 "last_submission": None,
@@ -487,7 +840,7 @@ class CompetitionSessionManager:
                 {"at": session["updated_at"], "status": "approval_received"}
             )
             _write_json(self._session_path(session_id), session)
-            self._events[session_id].set()
+            self._events.setdefault(session_id, threading.Event()).set()
             return copy.deepcopy(session)
 
     def submit_proposal(
@@ -718,22 +1071,48 @@ class CompetitionSessionManager:
                 session["paused"] = True
                 session["progress"] = {"status": "paused"}
             elif action == "resume":
+                resumable_states = {"interrupted", "paused", "failed"}
+                previous_state = session.get("state")
+                if previous_state not in resumable_states:
+                    raise ValueError(
+                        "resume is only available for an interrupted, paused, "
+                        "or failed session"
+                    )
+                if (
+                    session.get("state") != "paused"
+                    and session.get("recoverable") is not True
+                ):
+                    raise ValueError("session is not recoverable")
                 session["paused"] = False
-                session["progress"] = {"status": "resuming"}
-                if session.get("state") in {"interrupted", "paused"}:
-                    session["state"] = "starting"
-                    event = self._events.setdefault(session_id, threading.Event())
-                    thread = self._threads.get(session_id)
-                    if thread is None or not thread.is_alive():
-                        thread = threading.Thread(
-                            target=self._run,
-                            args=(session_id,),
-                            daemon=True,
-                            name=f"hexbench-competition-{session_id[:8]}",
-                        )
-                        self._threads[session_id] = thread
-                        thread.start()
-                    event.set()
+                session["state"] = "starting"
+                session["recoverable"] = False
+                session["proposal"] = None
+                session["approval"] = None
+                session["error"] = None
+                session["progress"] = {"status": "resuming_from_server"}
+                event = self._events.setdefault(session_id, threading.Event())
+                event.clear()
+                thread = self._threads.get(session_id)
+                if thread is None or not thread.is_alive():
+                    thread = threading.Thread(
+                        target=self._run,
+                        args=(session_id,),
+                        daemon=True,
+                        name=f"hexbench-competition-{session_id[:8]}",
+                    )
+                    self._threads[session_id] = thread
+                    thread.start()
+                elif previous_state != "paused":
+                    predecessor = thread
+                    thread = threading.Thread(
+                        target=self._restart_after_thread,
+                        args=(session_id, predecessor),
+                        daemon=True,
+                        name=f"hexbench-competition-{session_id[:8]}-resume",
+                    )
+                    self._threads[session_id] = thread
+                    thread.start()
+                event.set()
             elif action == "replan":
                 if session.get("state") != "awaiting_plan_approval":
                     raise ValueError("replan is only available for a proposed day plan")
@@ -745,7 +1124,7 @@ class CompetitionSessionManager:
                 {"at": session["updated_at"], "status": action}
             )
             _write_json(self._session_path(session_id), session)
-            self._events[session_id].set()
+            self._events.setdefault(session_id, threading.Event()).set()
             return copy.deepcopy(session)
 
     def _update(self, session_id: str, **values: Any) -> None:
@@ -804,6 +1183,36 @@ class CompetitionSessionManager:
                 metrics.append(metric)
                 metrics.sort(key=lambda item: int(item.get("day", -1)))
             metric.update(copy.deepcopy(values))
+            session["updated_at"] = _now()
+            _write_json(self._session_path(session_id), session)
+
+    def _record_submission_latency(
+        self,
+        session_id: str,
+        *,
+        day: int,
+        seconds: float,
+        accepted: bool,
+        late: bool = False,
+        error: str | None = None,
+    ) -> None:
+        """Persist bounded action-POST timings for adaptive deadline margins."""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return
+            samples = session.setdefault("submission_latency_samples", [])
+            sample = {
+                "day": day,
+                "seconds": round(max(0.0, float(seconds)), 6),
+                "accepted": bool(accepted),
+                "late": bool(late),
+                "at": _now(),
+            }
+            if error:
+                sample["error"] = str(error)
+            samples.append(sample)
+            session["submission_latency_samples"] = samples[-20:]
             session["updated_at"] = _now()
             _write_json(self._session_path(session_id), session)
 
@@ -937,6 +1346,7 @@ class CompetitionSessionManager:
                 journal = {}
         else:
             journal = {}
+        journal.setdefault("match_starts_at", None)
         journal.setdefault("distinct_brands", [])
         journal.setdefault("cumulative_daily_types", 0)
         journal.setdefault("total_servings", 0)
@@ -1463,8 +1873,17 @@ class CompetitionSessionManager:
         history = _history_for_planner(journal, day_index)
         is_practice = bool(session.get("game", {}).get("is_practice"))
         override = session.get("time_limit_seconds")
+        deadline_bound = not is_practice or competitive_practice
+        deadline_margin = (
+            _adaptive_submission_margin(session, config, day_index)
+            if deadline_bound
+            else 2.0
+        )
         base_budget = planning_budget(
-            config, day, is_practice=is_practice, deadline_margin=2.0
+            config,
+            day,
+            is_practice=not deadline_bound,
+            deadline_margin=deadline_margin,
         )
         if override is None:
             budget = base_budget
@@ -1482,6 +1901,7 @@ class CompetitionSessionManager:
             )
         )
         binary = find_binary(self.binary_path)
+        _maybe_enable_mlns_portfolio(session["method"])
         prediction_mode = (
             "gnn"
             if bool(session.get("hyperparameters", {}).get("use_traffic_gnn"))
@@ -1497,10 +1917,15 @@ class CompetitionSessionManager:
             "incumbent_count": 0,
             "best": None,
             "best_score": None,
+            "accepted_source": None,
             "pending": None,
             "last_submit": 0.0,
+            "last_submission_error": None,
+            "failed_submission_count": 0,
+            "day_closed": False,
+            "advanced_to_day": None,
         }
-        debounce = 0.25
+        incumbent_submission_interval = 0.25
         current_session = self.get_session(session_id) or {}
         previous_incumbents = current_session.get("incumbents", [])
         previous_metric_elapsed = max(
@@ -1533,18 +1958,113 @@ class CompetitionSessionManager:
         )
 
         def submit(
-            actions: list[list[int]], score: Any, incumbent_sequence: int | None = None
-        ) -> None:
-            response = client.post(
-                endpoint,
-                {"game_id": api_game_id, "day": day_index, "actions": actions},
+            actions: list[list[int]],
+            score: Any,
+            incumbent_sequence: int | None = None,
+            source: str = "incumbent",
+        ) -> bool:
+            if stream_state["day_closed"]:
+                return False
+            response: dict[str, Any] | None = None
+            for attempt in range(2):
+                post_started = time.monotonic()
+                post_timeout = _submission_timeout(day, deadline_margin)
+                try:
+                    response = client.post(
+                        endpoint,
+                        {
+                            "game_id": api_game_id,
+                            "day": day_index,
+                            "actions": actions,
+                        },
+                        timeout=post_timeout,
+                    )
+                    break
+                except RuntimeError as error:
+                    post_elapsed = time.monotonic() - post_started
+                    advanced_to_day = _advanced_day_from_submission_error(
+                        error, day_index
+                    )
+                    retryable = _is_retryable_submission_error(error)
+                    self._record_submission_latency(
+                        session_id,
+                        day=day_index,
+                        seconds=post_elapsed,
+                        accepted=False,
+                        late=advanced_to_day is not None or retryable,
+                        error=str(error),
+                    )
+                    stream_state["failed_submission_count"] += 1
+                    stream_state["last_submission_error"] = str(error)
+                    self._update_day_metric(
+                        session_id,
+                        day_index,
+                        failed_submission_count=stream_state[
+                            "failed_submission_count"
+                        ],
+                        last_submission_error=str(error),
+                    )
+                    if advanced_to_day is not None:
+                        # The previously accepted submission (or the server's
+                        # default wait) stands. Stop the solver immediately so
+                        # the controller can reconnect to the next day.
+                        stream_state["day_closed"] = True
+                        stream_state["advanced_to_day"] = advanced_to_day
+                        stream_state["pending"] = None
+                        self._update(
+                            session_id,
+                            state="waiting_for_day",
+                            error=None,
+                            progress={
+                                "status": "day_advanced",
+                                "day": day_index,
+                                "server_day": advanced_to_day,
+                                "submission_count": stream_state["count"],
+                                "incumbent_count": stream_state[
+                                    "incumbent_count"
+                                ],
+                                "last_submission_error": str(error),
+                            },
+                        )
+                        return False
+                    try:
+                        enough_time = (
+                            float(day.get("endsAt")) - time.time()
+                            > post_timeout + 0.5
+                        )
+                    except (TypeError, ValueError):
+                        enough_time = True
+                    if retryable and attempt == 0 and enough_time:
+                        continue
+                    stream_state["pending"] = (
+                        actions,
+                        score,
+                        incumbent_sequence,
+                        source,
+                    )
+                    return False
+            if response is None:
+                return False
+            post_elapsed = time.monotonic() - post_started
+            self._record_submission_latency(
+                session_id,
+                day=day_index,
+                seconds=post_elapsed,
+                accepted=True,
             )
             stream_state["count"] += 1
             stream_state["last_submit"] = time.monotonic()
             stream_state["best"] = actions
             stream_state["best_score"] = score
+            stream_state["accepted_source"] = source
             stream_state["pending"] = None
             journal["submitted_days"][key] = actions
+            journal.setdefault("submitted_metadata", {})[key] = {
+                "score": copy.deepcopy(score),
+                "source": source,
+                "incumbent_sequence": incumbent_sequence,
+                "accepted_at": _now(),
+            }
             _write_json(state_path, journal)
             submitted_at = _now()
             self._mark_incumbent_submitted(
@@ -1553,6 +2073,12 @@ class CompetitionSessionManager:
                 submitted_at=submitted_at,
                 submission_count=stream_state["count"],
             )
+            self._update_day_metric(
+                session_id,
+                day_index,
+                accepted_score=copy.deepcopy(score),
+                accepted_source=source,
+            )
             self._update(
                 session_id,
                 state="streaming",
@@ -1560,12 +2086,15 @@ class CompetitionSessionManager:
                     "day": day_index,
                     "endpoint": endpoint,
                     "response": response,
+                    "score": copy.deepcopy(score),
+                    "source": source,
                     "submitted_at": submitted_at,
                 },
                 progress={
                     "status": "streaming",
                     "day": day_index,
                     "best_score": score,
+                    "accepted_source": source,
                     "submission_count": stream_state["count"],
                     "incumbent_count": stream_state["incumbent_count"],
                     "budget_seconds": budget,
@@ -1573,8 +2102,11 @@ class CompetitionSessionManager:
                     "elapsed_offset_seconds": elapsed_offset,
                 },
             )
+            return True
 
         def on_improve(record: dict[str, Any]) -> None:
+            if stream_state["day_closed"]:
+                return
             actions = record.get("actions")
             score = record.get("score")
             internal_rank = record.get("internal_rank")
@@ -1594,14 +2126,26 @@ class CompetitionSessionManager:
                     elapsed_offset + time.monotonic() - search_started
                 ),
             )
-            if time.monotonic() - stream_state["last_submit"] >= debounce:
-                submit(actions, score, incumbent_sequence)
+            if (
+                time.monotonic() - stream_state["last_submit"]
+                >= incumbent_submission_interval
+            ):
+                if not submit(actions, score, incumbent_sequence):
+                    stream_state["pending"] = (
+                        actions,
+                        score,
+                        incumbent_sequence,
+                        "incumbent",
+                    )
             else:
                 # Coalesce a burst of rapid improvements; the final flush below
                 # guarantees the best is submitted before the day advances.
-                stream_state["pending"] = (actions, score, incumbent_sequence)
-                stream_state["best"] = actions
-                stream_state["best_score"] = score
+                stream_state["pending"] = (
+                    actions,
+                    score,
+                    incumbent_sequence,
+                    "incumbent",
+                )
 
         def should_stop() -> bool:
             current = self.get_session(session_id)
@@ -1609,6 +2153,7 @@ class CompetitionSessionManager:
                 current is None
                 or current.get("state") in {"cancelled", "failed"}
                 or bool(current.get("paused"))
+                or bool(stream_state["day_closed"])
             )
 
         self._update(
@@ -1626,13 +2171,36 @@ class CompetitionSessionManager:
                 "elapsed_offset_seconds": elapsed_offset,
             },
         )
+        solver_budget = max(
+            0.05,
+            budget - (time.monotonic() - search_started),
+        )
+        if deadline_bound:
+            current_session = self.get_session(session_id) or session
+            deadline_margin = _adaptive_submission_margin(
+                current_session, config, day_index
+            )
+            solver_budget = min(
+                solver_budget,
+                planning_budget(
+                    config,
+                    day,
+                    is_practice=False,
+                    deadline_margin=deadline_margin,
+                ),
+            )
+            self._update_day_metric(
+                session_id,
+                day_index,
+                submission_margin_seconds=deadline_margin,
+            )
         payload = {
             "config": config,
             "day_info": day,
             "history": history,
             "types": types,
             "search": {
-                "timeLimitMs": max(50, int(budget * 1000)),
+                "timeLimitMs": max(50, int(solver_budget * 1000)),
                 "minIterations": 1,
                 "maxIterations": 10_000_000,
                 "stagnationIterations": 0,
@@ -1667,19 +2235,25 @@ class CompetitionSessionManager:
             prediction_mode = "gnn"
         final_record: dict[str, Any] | None = None
         try:
-            final_record = stream_core(
-                session["method"],
-                payload,
-                binary=binary,
-                on_improve=on_improve,
-                timeout=budget + 15,
-                should_stop=should_stop,
-            )
+            if not stream_state["day_closed"]:
+                final_record = stream_core(
+                    session["method"],
+                    payload,
+                    binary=binary,
+                    on_improve=on_improve,
+                    timeout=solver_budget + 2.0,
+                    should_stop=should_stop,
+                )
         except Exception as error:  # A safe wait plan keeps the day valid.
+            self._update_day_metric(
+                session_id,
+                day_index,
+                planner_error=str(error),
+            )
             if stream_state["best"] is None:
                 fallback = [[-int(config["daySteps"][day_index])] for _ in types]
                 try:
-                    submit(fallback, [0, 0, 0])
+                    submit(fallback, [0, 0, 0], source="wait_fallback")
                 except Exception:
                     self._update_day_metric(
                         session_id,
@@ -1693,19 +2267,28 @@ class CompetitionSessionManager:
                     self._update(
                         session_id,
                         state="failed",
+                        recoverable=True,
                         error=str(error),
-                        progress={"status": "failed"},
+                        progress={"status": "failed", "day": day_index},
                     )
                     return
         # Ensure the best plan is the last valid submission for this day.
-        if stream_state["pending"] is not None:
+        if not stream_state["day_closed"] and stream_state["pending"] is not None:
             submit(*stream_state["pending"])
-        if isinstance(final_record, dict) and final_record.get("kind") == "final":
+        if (
+            not stream_state["day_closed"]
+            and isinstance(final_record, dict)
+            and final_record.get("kind") == "final"
+        ):
             final_actions = final_record.get("actions")
             if isinstance(final_actions, list):
                 validate_action_shape(final_actions, len(types))
                 if journal["submitted_days"].get(key) != final_actions:
-                    submit(final_actions, final_record.get("score"))
+                    submit(
+                        final_actions,
+                        final_record.get("score"),
+                        source="final_incumbent",
+                    )
             if (
                 session["method"] in STATEFUL_POLICIES
                 and journal["submitted_days"].get(key) == final_actions
@@ -1742,11 +2325,12 @@ class CompetitionSessionManager:
                 timer_running=False,
             )
             return
-        if stream_state["best"] is None:
+        if stream_state["best"] is None and not stream_state["day_closed"]:
             fallback = [[-int(config["daySteps"][day_index])] for _ in types]
-            submit(fallback, [0, 0, 0])
+            submit(fallback, [0, 0, 0], source="wait_fallback")
 
         final_actions = journal["submitted_days"].get(key)
+        submission_status = "accepted" if final_actions is not None else "missed"
         day_result = None
         if final_actions is not None:
             trace = trace_action_plan(
@@ -1819,7 +2403,19 @@ class CompetitionSessionManager:
             timer_started_at=None,
             budget_seconds=budget,
             timer_running=False,
+            submission_status=submission_status,
+            accepted_source=stream_state["accepted_source"],
+            accepted_score=copy.deepcopy(stream_state["best_score"]),
+            failed_submission_count=stream_state["failed_submission_count"],
+            **(
+                {"last_submission_error": stream_state["last_submission_error"]}
+                if stream_state["last_submission_error"]
+                else {}
+            ),
             **({"result": day_result} if day_result is not None else {}),
+        )
+        final_progress_status = (
+            "submitted" if final_actions is not None else "day_advanced"
         )
         self._update(
             session_id,
@@ -1828,9 +2424,10 @@ class CompetitionSessionManager:
             proposal=None,
             approval=None,
             progress={
-                "status": "submitted",
+                "status": final_progress_status,
                 "day": day_index,
                 "best_score": stream_state["best_score"],
+                "accepted_source": stream_state["accepted_source"],
                 "submission_count": stream_state["count"],
                 "incumbent_count": stream_state["incumbent_count"],
                 "budget_seconds": budget,
@@ -2129,6 +2726,7 @@ class CompetitionSessionManager:
                             break
                     self._wait(session_id, 1.0)
             competitive_selection_initialized = False
+            rate_limit_backoff = 0.0
             while not self._closed:
                 current = self.get_session(session_id)
                 if current is None or current.get("state") in {"cancelled", "finished", "failed"}:
@@ -2139,26 +2737,45 @@ class CompetitionSessionManager:
                     continue
                 competitive_state: dict[str, Any] | None = None
                 day: dict[str, Any] | None = None
-                if competitive_practice:
-                    competitive_state = client.get(
-                        "/game/competitive/state", api_game_id
+                try:
+                    if competitive_practice:
+                        competitive_state = client.get(
+                            "/game/competitive/state", api_game_id
+                        )
+                        status, day = normalize_competitive_state(
+                            competitive_state, config
+                        )
+                    else:
+                        status = client.get("/game/state", resolved_id)
+                        previous_snapshot = current.get("snapshot", {})
+                        previous_day = previous_snapshot.get("day")
+                        previous_state = previous_snapshot.get("state", {})
+                        if (
+                            isinstance(previous_day, dict)
+                            and isinstance(previous_state, dict)
+                            and int(previous_day.get("day", -1))
+                            == int(status.get("day", -2))
+                            == int(previous_state.get("day", -3))
+                        ):
+                            day = previous_day
+                except RuntimeError as error:
+                    if not _is_rate_limit_error(error):
+                        raise
+                    rate_limit_backoff = min(
+                        30.0, max(2.0, rate_limit_backoff * 2.0)
                     )
-                    status, day = normalize_competitive_state(
-                        competitive_state, config
+                    self._update(
+                        session_id,
+                        state="waiting_for_day",
+                        error=None,
+                        progress={
+                            "status": "waiting_for_server_rate_limit",
+                            "retry_in_seconds": rate_limit_backoff,
+                        },
                     )
-                else:
-                    status = client.get("/game/state", resolved_id)
-                    previous_snapshot = current.get("snapshot", {})
-                    previous_day = previous_snapshot.get("day")
-                    previous_state = previous_snapshot.get("state", {})
-                    if (
-                        isinstance(previous_day, dict)
-                        and isinstance(previous_state, dict)
-                        and int(previous_day.get("day", -1))
-                        == int(status.get("day", -2))
-                        == int(previous_state.get("day", -3))
-                    ):
-                        day = previous_day
+                    self._wait(session_id, rate_limit_backoff)
+                    continue
+                rate_limit_backoff = 0.0
                 current_snapshot = {
                     "requested_game_id": current.get("requested_game_id"),
                     "game_id": resolved_id,
@@ -2225,7 +2842,19 @@ class CompetitionSessionManager:
                     )
                     try:
                         result = client.get(endpoint, resolved_id)
-                    except RuntimeError:
+                    except RuntimeError as error:
+                        if _is_rate_limit_error(error):
+                            self._update(
+                                session_id,
+                                state="waiting_for_result",
+                                error=None,
+                                progress={
+                                    "status": "waiting_for_server_rate_limit",
+                                    "retry_in_seconds": 2.0,
+                                },
+                            )
+                            self._wait(session_id, 2.0)
+                            continue
                         if terminal_status:
                             raise
                         self._update(
@@ -2233,7 +2862,7 @@ class CompetitionSessionManager:
                             state="waiting_for_result",
                             progress={"status": "waiting_for_result"},
                         )
-                        self._wait(session_id, self.poll_interval)
+                        self._wait(session_id, max(1.0, self.poll_interval))
                         continue
                     self._update(
                         session_id,
@@ -2263,47 +2892,181 @@ class CompetitionSessionManager:
                                 "planner_state": None,
                             }
                             _write_json(state_path, journal)
-                    if journal.get("types"):
+                    match_starts_at = _match_starts_at(config)
+                    saved_match_starts_at = journal.get("match_starts_at")
+                    server_types_selected = _team_types_selected(
+                        status, own_team_id
+                    )
+                    same_match = (
+                        match_starts_at is not None
+                        and saved_match_starts_at == match_starts_at
+                    )
+                    if not competitive_practice and not same_match:
+                        # Competition ids can be recycled. A journal keyed only
+                        # by that id may therefore contain roles and days from a
+                        # previous match. The live config's startsAt identifies
+                        # the current use of the id.
+                        _reset_match_journal(journal, match_starts_at)
+                        _write_json(state_path, journal)
+                    elif (
+                        server_types_selected is False and journal.get("types")
+                    ):
+                        # Server truth wins over a local success marker. This
+                        # also repairs legacy journals without a match marker.
+                        _reset_match_journal(journal, match_starts_at)
+                        _write_json(state_path, journal)
+                    if server_types_selected is True or (
+                        journal.get("types") and same_match
+                    ):
                         # Roles are chosen once per match and already submitted;
                         # wait for the first day to open.
+                        journal["match_starts_at"] = match_starts_at
+                        _write_json(state_path, journal)
+                        match_open_wait = _agent_selection_wait_seconds(config, 0)
                         self._update(
                             session_id,
                             state="waiting_for_day",
-                            progress={"status": "roles_submitted"},
+                            progress={
+                                "status": "roles_submitted",
+                                "remaining_seconds": match_open_wait,
+                            },
                         )
-                        self._wait(session_id, self.poll_interval)
+                        self._wait(
+                            session_id,
+                            match_open_wait
+                            if match_open_wait > 0
+                            else max(1.0, self.poll_interval),
+                        )
                         continue
-                    type_payload = (
-                        {
-                            "config": config,
-                            "hyperparameters": current.get("hyperparameters", {}),
-                        }
-                        if current["method"] in {"simple_lns", "lns_dp"}
-                        else config
+                    reported_open_wait = _agent_selection_open_wait_seconds(status)
+                    if reported_open_wait > 0:
+                        retry_at = time.time() + reported_open_wait
+                        self._update(
+                            session_id,
+                            state="waiting_for_day",
+                            agent_selection_retry_at=retry_at,
+                            error=None,
+                            progress={
+                                "status": "waiting_for_agent_selection_open",
+                                "opens_at": retry_at,
+                                "remaining_seconds": reported_open_wait,
+                            },
+                        )
+                        self._wait(session_id, reported_open_wait)
+                        continue
+                    raw_retry_at = current.get("agent_selection_retry_at")
+                    try:
+                        retry_at = float(raw_retry_at)
+                    except (TypeError, ValueError):
+                        retry_at = 0.0
+                    selection_open_wait = max(0.0, retry_at - time.time())
+                    if selection_open_wait > 0:
+                        self._update(
+                            session_id,
+                            state="waiting_for_day",
+                            progress={
+                                "status": "waiting_for_agent_selection_open",
+                                "opens_at": retry_at,
+                                "remaining_seconds": selection_open_wait,
+                            },
+                        )
+                        # This wait remains interruptible through the session
+                        # event, while avoiding rapid rejected POST retries.
+                        self._wait(session_id, selection_open_wait)
+                        continue
+                    type_payload, type_budget = agent_type_payload(
+                        current["method"],
+                        config,
+                        current.get("snapshot", {}).get("board", {}),
+                        current.get("hyperparameters", {}),
+                        deadline_margin=2.0,
+                        selection_time_limit_seconds=current.get(
+                            "agent_selection_time_limit_seconds", 30.0
+                        ),
                     )
                     types = run_core(
                         "types",
                         current["method"],
                         type_payload,
                         binary=find_binary(self.binary_path),
+                        timeout=max(60.0, type_budget + 2.0),
                     )
                     validate_agent_types(types, len(config["agents"]))
-                    client.post(
-                        "/game/agent-types",
-                        {"game_id": api_game_id, "types": types},
-                    )
+                    try:
+                        client.post(
+                            "/game/agent-types",
+                            {"game_id": api_game_id, "types": types},
+                        )
+                    except RuntimeError as error:
+                        opening = _agent_selection_opening(error)
+                        if opening is None:
+                            raise
+                        opens_at, server_now = opening
+                        # Convert the server-reported remaining interval onto
+                        # our local monotonic wall clock. This tolerates small
+                        # server/client clock skew and safely queues Start.
+                        retry_at = time.time() + max(0.0, opens_at - server_now)
+                        self._update(
+                            session_id,
+                            state="waiting_for_day",
+                            agent_selection_retry_at=retry_at,
+                            error=None,
+                            progress={
+                                "status": "waiting_for_agent_selection_open",
+                                "opens_at": opens_at,
+                                "remaining_seconds": max(
+                                    0.0, opens_at - server_now
+                                ),
+                            },
+                        )
+                        self._wait(
+                            session_id,
+                            max(0.0, opens_at - server_now),
+                        )
+                        continue
                     journal["types"] = types
+                    journal["match_starts_at"] = match_starts_at
                     _write_json(state_path, journal)
+                    match_open_wait = _agent_selection_wait_seconds(config, 0)
                     self._update(
                         session_id,
                         state="waiting_for_day",
-                        progress={"status": "roles_submitted"},
+                        agent_selection_retry_at=None,
+                        progress={
+                            "status": "roles_submitted",
+                            "remaining_seconds": match_open_wait,
+                        },
                     )
-                    self._wait(session_id, self.poll_interval)
+                    self._wait(
+                        session_id,
+                        match_open_wait
+                        if match_open_wait > 0
+                        else max(1.0, self.poll_interval),
+                    )
                     continue
                 if status.get("status") != "in_progress":
                     self._update(session_id, state="waiting_for_day", progress={"status": status.get("status", "waiting")})
-                    self._wait(session_id, self.poll_interval)
+                    self._wait(session_id, max(1.0, self.poll_interval))
+                    continue
+                selection_wait = _agent_selection_wait_seconds(config, day_index)
+                if selection_wait > 0:
+                    # Do not trust an early in_progress transition for Day 1:
+                    # agent selection occurs before the match, and the action
+                    # endpoint remains closed until startsAt.
+                    self._update(
+                        session_id,
+                        state="waiting_for_day",
+                        progress={
+                            "status": "waiting_for_agent_selection",
+                            "day": day_index,
+                            "starts_at": float(config["startsAt"]),
+                            "remaining_seconds": selection_wait,
+                        },
+                    )
+                    self._wait(
+                        session_id,
+                        selection_wait,
+                    )
                     continue
                 if day_index >= len(config.get("daySteps", [])):
                     self._update(
@@ -2311,13 +3074,13 @@ class CompetitionSessionManager:
                         state="waiting_for_result",
                         progress={"status": "waiting_for_result"},
                     )
-                    self._wait(session_id, self.poll_interval)
+                    self._wait(session_id, max(1.0, self.poll_interval))
                     continue
                 if current.get("last_streamed_day") == day_index:
                     # This day's search budget is already spent. The last valid
                     # submission stands; wait for the server to open the next day.
                     self._update(session_id, state="waiting_for_day", progress={"status": "submitted", "day": day_index})
-                    self._wait(session_id, self.poll_interval)
+                    self._wait(session_id, max(1.0, self.poll_interval))
                     continue
                 if day is None:
                     day = client.get("/game/day", resolved_id)
@@ -2337,7 +3100,18 @@ class CompetitionSessionManager:
                 )
                 self._wait(session_id, self.poll_interval)
         except Exception as error:
-            self._update(session_id, state="failed", error=str(error), progress={"status": "failed"})
+            current = self.get_session(session_id) or {}
+            current_progress = current.get("progress", {})
+            failed_progress = {"status": "failed"}
+            if isinstance(current_progress.get("day"), int):
+                failed_progress["day"] = current_progress["day"]
+            self._update(
+                session_id,
+                state="failed",
+                recoverable=True,
+                error=str(error),
+                progress=failed_progress,
+            )
         finally:
             if client is not None:
                 client.close()

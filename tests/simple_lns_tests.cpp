@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <iostream>
+#include <vector>
 
 namespace {
 
@@ -88,10 +89,61 @@ void test_simple_lns_can_collect_multiple_stock_copies() {
   assert(trace.at("score").as_object().at("servings").as_int64() == 5);
 }
 
+void test_real_match_opponents_may_hide_fuel() {
+  const auto payload = boost::json::parse(R"json({
+    "day": 0,
+    "agents": [{"kind": 0, "pos": 4, "fuel": 12}],
+    "others": [{
+      "id": 6,
+      "agents": [{"kind": 1, "pos": 9}, {"kind": 0, "pos": 10}]
+    }],
+    "traffics": [{"pos": 2, "status": 0}]
+  })json");
+
+  const auto day = hexudon::parse_day_info(payload);
+  assert(day.agents.size() == 1);
+  assert(day.agents[0].fuel == 12);
+  assert(day.others.size() == 1);
+  assert(day.others[0].id == "6");
+  assert(day.others[0].agents.size() == 2);
+  assert(day.others[0].agents[0].fuel == 0);
+  assert(day.others[0].agents[1].fuel == 0);
+}
+
+void test_mlns_streams_its_valid_cold_incumbent() {
+  const auto config = intercept_config();
+  const hexudon::AgentTypes types = {hexudon::AgentKind::Patrol,
+                                     hexudon::AgentKind::Refuel};
+  hexudon::DayInfo day;
+  day.day = 0;
+  day.agents = {{types[0], 0, 2}, {types[1], 2, 0}};
+  hexudon::SearchLimits limits;
+  limits.time_limit_ms = 50;
+  limits.min_iterations = 0;
+  limits.max_iterations = 0;
+  limits.stagnation_iterations = 0;
+
+  std::vector<hexudon::ActionPlan> incumbents;
+  const hexudon::ImprovementSink sink =
+      [&](const hexudon::ActionPlan& actions, const hexudon::Score&,
+          const hexudon::IncumbentRank&) { incumbents.push_back(actions); };
+  const auto planned = hexudon::plan_day_with_state(
+      "mlns", config, day, {}, types, limits, nullptr, &sink);
+
+  assert(!incumbents.empty());
+  assert(!hexudon::validate_action_plan(config, day, incumbents.front()));
+  for (std::size_t index = 1; index < incumbents.size(); ++index) {
+    assert(incumbents[index] != incumbents[index - 1]);
+  }
+  assert(!hexudon::validate_action_plan(config, day, planned.actions));
+}
+
 }  // namespace
 
 int main() {
   test_simple_lns_intercepts_and_serializes_suffix();
   test_simple_lns_can_collect_multiple_stock_copies();
+  test_real_match_opponents_may_hide_fuel();
+  test_mlns_streams_its_valid_cold_incumbent();
   std::cout << "simple_lns tests passed\n";
 }

@@ -350,6 +350,17 @@ int main(int argc, char** argv) {
       if (planned.planner_state) {
         last_line["kind"] = "final";
         last_line["actions"] = hexudon::to_json(best);
+        if (auto scored =
+                hexudon::score_action_plan(config, day, history, best)) {
+          last_line["score"] =
+              boost::json::array{scored->distinct_types,
+                                 scored->cumulative_daily_types,
+                                 scored->total_servings};
+        }
+        if (planned.rank) {
+          last_line["internal_rank"] =
+              incumbent_rank_to_json(*planned.rank);
+        }
         last_line["planner_state"] = *planned.planner_state;
         std::cout << boost::json::serialize(last_line) << '\n';
         std::cout.flush();
