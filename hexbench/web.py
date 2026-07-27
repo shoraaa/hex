@@ -655,6 +655,7 @@ class DashboardApp:
         execution_mode: str = "manual",
         target_day: int | None = None,
         time_limit_seconds: float | None = None,
+        agent_selection_time_limit_seconds: float = 30.0,
     ) -> dict[str, Any]:
         return self._competition.start_session(
             game_id,
@@ -663,6 +664,9 @@ class DashboardApp:
             execution_mode=execution_mode,
             target_day=target_day,
             time_limit_seconds=time_limit_seconds,
+            agent_selection_time_limit_seconds=(
+                agent_selection_time_limit_seconds
+            ),
         )
 
     def get_competition(self, session_id: str) -> dict[str, Any] | None:
@@ -1287,6 +1291,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 execution_mode = payload.get("execution_mode", "manual")
                 target_day = payload.get("target_day")
                 time_limit_seconds = payload.get("time_limit_seconds")
+                agent_selection_time_limit_seconds = payload.get(
+                    "agent_selection_time_limit_seconds", 30.0
+                )
                 if not isinstance(game_id, str) or not isinstance(method, str):
                     raise ValueError("game_id and method are required")
                 if hyperparameters is not None and not isinstance(hyperparameters, dict):
@@ -1298,6 +1305,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     or not isinstance(time_limit_seconds, (int, float))
                 ):
                     raise ValueError("time_limit_seconds must be numeric")
+                if isinstance(agent_selection_time_limit_seconds, bool) or not isinstance(
+                    agent_selection_time_limit_seconds, (int, float)
+                ):
+                    raise ValueError(
+                        "agent_selection_time_limit_seconds must be numeric"
+                    )
                 session = self.app.start_competition(
                     game_id,
                     method,
@@ -1305,6 +1318,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     execution_mode=execution_mode,
                     target_day=target_day,
                     time_limit_seconds=time_limit_seconds,
+                    agent_selection_time_limit_seconds=(
+                        agent_selection_time_limit_seconds
+                    ),
                 )
                 self._json(HTTPStatus.ACCEPTED, session)
                 return

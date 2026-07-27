@@ -521,10 +521,13 @@ def agent_selection_budget(
     config: dict[str, Any],
     *,
     deadline_margin: float,
+    selection_time_limit_seconds: float | None = None,
     now: float | None = None,
 ) -> float:
     """Return safe compute time remaining before agent selection closes."""
     candidates: list[float] = []
+    if selection_time_limit_seconds is not None:
+        candidates.append(float(selection_time_limit_seconds))
     raw_limit = board.get(
         "agent_selection_time_limit",
         config.get("agent_selection_time_limit"),
@@ -560,12 +563,16 @@ def agent_type_payload(
     hyperparameters: dict[str, int | float | bool],
     *,
     deadline_margin: float,
+    selection_time_limit_seconds: float | None = None,
 ) -> tuple[dict[str, Any] | list[Any], float]:
     """Build a role-selection request and its subprocess watchdog budget."""
     if method not in {"mlns", "lns_dp", "simple_lns"}:
         return config, 0.0
     budget = agent_selection_budget(
-        board, config, deadline_margin=deadline_margin
+        board,
+        config,
+        deadline_margin=deadline_margin,
+        selection_time_limit_seconds=selection_time_limit_seconds,
     )
     selection_hyperparameters = {
         key: value

@@ -679,6 +679,7 @@ class CompetitionSessionManager:
         execution_mode: str = "manual",
         target_day: int | None = None,
         time_limit_seconds: float | None = None,
+        agent_selection_time_limit_seconds: float = 30.0,
     ) -> dict[str, Any]:
         if execution_mode not in {"manual", "auto", "curl"}:
             raise ValueError("execution_mode must be manual, auto, or curl")
@@ -690,6 +691,17 @@ class CompetitionSessionManager:
             if not 0.1 <= float(time_limit_seconds) <= 600:
                 raise ValueError("time_limit_seconds must be between 0.1 and 600")
             time_limit_seconds = float(time_limit_seconds)
+        if isinstance(agent_selection_time_limit_seconds, bool) or not isinstance(
+            agent_selection_time_limit_seconds, (int, float)
+        ):
+            raise ValueError("agent_selection_time_limit_seconds must be numeric")
+        if not 0.1 <= float(agent_selection_time_limit_seconds) <= 600:
+            raise ValueError(
+                "agent_selection_time_limit_seconds must be between 0.1 and 600"
+            )
+        agent_selection_time_limit_seconds = float(
+            agent_selection_time_limit_seconds
+        )
         if target_day is not None and (
             isinstance(target_day, bool) or not isinstance(target_day, int) or target_day < 0
         ):
@@ -764,6 +776,9 @@ class CompetitionSessionManager:
                 "execution_mode": execution_mode,
                 "target_day": target_day,
                 "time_limit_seconds": time_limit_seconds,
+                "agent_selection_time_limit_seconds": (
+                    agent_selection_time_limit_seconds
+                ),
                 "state": "starting",
                 "recoverable": False,
                 "snapshot": snapshot,
@@ -2965,6 +2980,9 @@ class CompetitionSessionManager:
                         current.get("snapshot", {}).get("board", {}),
                         current.get("hyperparameters", {}),
                         deadline_margin=2.0,
+                        selection_time_limit_seconds=current.get(
+                            "agent_selection_time_limit_seconds", 30.0
+                        ),
                     )
                     types = run_core(
                         "types",

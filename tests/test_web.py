@@ -327,6 +327,33 @@ def test_agent_selection_budget_uses_remaining_window_and_margin() -> None:
     ) == 28.0
 
 
+def test_agent_selection_budget_uses_explicit_practice_limit() -> None:
+    assert api.agent_selection_budget(
+        {},
+        {},
+        deadline_margin=2.0,
+        selection_time_limit_seconds=30.0,
+    ) == 28.0
+
+    payload, budget = api.agent_type_payload(
+        "mlns",
+        {},
+        {},
+        {"use_lns_dp_proposals": True},
+        deadline_margin=2.0,
+        selection_time_limit_seconds=30.0,
+    )
+    assert budget == 28.0
+    assert payload["search"]["timeLimitMs"] == 25_200
+
+    assert api.agent_selection_budget(
+        {"agent_selection_time_limit": 10.0},
+        {},
+        deadline_margin=2.0,
+        selection_time_limit_seconds=30.0,
+    ) == 8.0
+
+
 def test_mlns_agent_type_payload_spends_selection_budget(monkeypatch) -> None:
     monkeypatch.setattr(api.time, "time", lambda: 990.0)
     payload, budget = api.agent_type_payload(
@@ -1320,6 +1347,9 @@ def test_play_ui_exposes_streaming_console_and_original_game_features() -> None:
     assert "start-search" in script
     assert "time-limit" in script
     assert "time_limit_seconds" in script
+    assert 'agentSelectionTimeLimit:"30"' in script
+    assert "agent-selection-time-limit" in script
+    assert "agent_selection_time_limit_seconds" in script
     assert "autoSubmitInfo" in script
     assert "convergenceMarkup" in script
     assert "incumbents" in script
