@@ -659,6 +659,15 @@ def test_explicit_auto_rearm_starts_recycled_official_match() -> None:
     ]
 
 
+def test_mlns_web_controller_uses_all_full_worker_blocks(monkeypatch) -> None:
+    monkeypatch.delenv("HEXUDON_MLNS_PORTFOLIO", raising=False)
+    monkeypatch.setattr(competition.os, "cpu_count", lambda: 16)
+
+    competition._maybe_enable_mlns_portfolio("mlns")
+
+    assert competition.os.environ["HEXUDON_MLNS_PORTFOLIO"] == "2"
+
+
 def test_auto_rearm_waits_for_agent_selection() -> None:
     class FakeClient:
         def get(self, path: str, _game_id: str) -> dict:
@@ -1642,6 +1651,9 @@ def test_play_ui_exposes_streaming_console_and_original_game_features() -> None:
     assert 'agentSelectionTimeLimit:"30"' in script
     assert "agent-selection-time-limit" in script
     assert "agent_selection_time_limit_seconds" in script
+    assert "autoRearm:true" in script
+    assert 'id="auto-rearm"' in script
+    assert "body.auto_rearm=state.autoRearm" in script
     assert "autoSubmitInfo" in script
     assert "convergenceMarkup" in script
     assert "incumbents" in script
