@@ -11,6 +11,7 @@ def test_mlns_defaults_are_deadline_governed() -> None:
     assert normalized == MLNS_TUNED_DEFAULTS
     assert normalized["stagnation_iterations"] == 0
     assert normalized["lookahead_days"] == 3
+    assert normalized["commit_tolerance"] == 0
 
 
 def test_mlns_uses_complete_safe_day_window() -> None:
@@ -32,6 +33,25 @@ def test_mlns_accepts_bounded_lookahead() -> None:
     )["mlns"]
 
     assert normalized["lookahead_days"] == 2
+
+
+def test_mlns_accepts_commit_tolerance_override() -> None:
+    normalized = normalize_hyperparameters(
+        ["mlns"], {"mlns": {"commit_tolerance": 8}}
+    )["mlns"]
+
+    assert normalized["commit_tolerance"] == 8
+
+
+def test_mlns_rejects_negative_commit_tolerance() -> None:
+    try:
+        normalize_hyperparameters(
+            ["mlns"], {"mlns": {"commit_tolerance": -1}}
+        )
+    except ValueError as error:
+        assert "must be at least 0" in str(error)
+    else:
+        raise AssertionError("negative commit tolerance was accepted")
 
 
 def test_mlns_uses_bundled_pretrained_gnn_by_default(monkeypatch) -> None:
