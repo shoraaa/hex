@@ -1497,14 +1497,16 @@ def test_dashboard_parameter_ui_has_prefills_sliders_and_preview() -> None:
     assert "agent_selection_incumbents" in script
 
 
-def test_mlns_gnn_checkbox_is_exposed_only_for_mlns() -> None:
+def test_mlns_planner_controls_are_exposed_only_for_mlns() -> None:
     mlns_fields = {field["key"] for field in api.POLICY_HYPERPARAMETERS["mlns"]}
     alns_fields = {field["key"] for field in api.POLICY_HYPERPARAMETERS["alns"]}
     script = (web.STATIC_ROOT / "app.js").read_text()
 
+    assert "commit_tolerance" in mlns_fields
+    assert "commit_tolerance" not in alns_fields
     assert "use_traffic_gnn" in mlns_fields
     assert "use_traffic_gnn" not in alns_fields
-    assert '["use_lns_dp_proposals","use_traffic_gnn"]' in script
+    assert '["commit_tolerance","use_lns_dp_proposals","use_traffic_gnn"]' in script
 
 
 def test_competition_refresh_clears_historical_session_ui_and_stale_polls() -> None:

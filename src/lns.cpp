@@ -4262,12 +4262,15 @@ bool mlns_reward_better(const MlnsRank& left, const MlnsRank& right) {
 // already contains the realized current day at full weight plus the discounted
 // suffix, so inside a small current-day gap it directly answers "does the better
 // continuation outweigh the current-day deficit?". Outside the band the realized
-// advantage is protected from the biased forecast. The zero-slack default
+// advantage is protected from the biased forecast. A request-level zero
 // protects every realized serving once current distinct/daily coverage ties;
 // future simulation remains available to break exact current-day ties.
-// Override with HEXUDON_MLNS_COMMIT_TOLERANCE.
+// HEXUDON_MLNS_COMMIT_TOLERANCE remains a fallback for legacy payloads.
 constexpr int kMlnsCommitToleranceDefault = 0;
-int mlns_commit_tolerance() {
+int mlns_commit_tolerance(const SearchLimits& limits) {
+  if (limits.mlns_commit_tolerance >= 0) {
+    return limits.mlns_commit_tolerance;
+  }
   static const int value = [] {
     const char* raw = std::getenv("HEXUDON_MLNS_COMMIT_TOLERANCE");
     if (raw == nullptr) return kMlnsCommitToleranceDefault;
@@ -4298,7 +4301,8 @@ bool mlns_commit_prefers_fuel() {
 // the returned incumbent `best` (never inside a std::sort), so the bounded
 // current-day tolerance need not be transitive. Distinct/daily coverage remains
 // fully protected: the primary objectives are compared before servings.
-bool mlns_commit_better(const MlnsRank& left, const MlnsRank& right) {
+bool mlns_commit_better(const MlnsRank& left, const MlnsRank& right,
+                        int tolerance) {
   if (std::get<0>(left.projected) != std::get<0>(right.projected)) {
     return std::get<0>(left.projected) > std::get<0>(right.projected);
   }
@@ -4308,7 +4312,6 @@ bool mlns_commit_better(const MlnsRank& left, const MlnsRank& right) {
   // Do not let a noisy suffix forecast erase a better realized current-day
   // serving result. An explicit nonzero override can reopen bounded slack;
   // the production default reaches continuation tie-breaking only on a tie.
-  const int tolerance = mlns_commit_tolerance();
   const long long serving_gap =
       static_cast<long long>(left.current_servings) -
       static_cast<long long>(right.current_servings);
@@ -5128,6 +5131,7 @@ PlannerResult build_mlns_plan(
                                ? limits.predicted_traffic
                                : std::vector<std::map<int, int>>{};
   const bool timed = limits.time_limit_ms >= 0;
+  const int commit_tolerance = mlns_commit_tolerance(limits);
   // A small explicit iteration cap is a reproducible search mode, not an
   // anytime request. Keep its richer whole-match neighborhoods while still
   // enforcing the wall deadline as a safety backstop.
@@ -5303,7 +5307,8 @@ PlannerResult build_mlns_plan(
       if (candidate_coverage > best_coverage ||
           (candidate_coverage == best_coverage &&
            (staging_improves ||
-            mlns_commit_better(candidate->rank, best.rank)))) {
+            mlns_commit_better(candidate->rank, best.rank,
+                               commit_tolerance)))) {
         best = std::move(*candidate);
         emit();
       }
@@ -5515,7 +5520,7 @@ PlannerResult build_mlns_plan(
     const auto best_coverage =
         std::tuple{std::get<0>(best_current), std::get<1>(best_current)};
     if (candidate_coverage >= best_coverage &&
-        mlns_commit_better(candidate->rank, best.rank)) {
+        mlns_commit_better(candidate->rank, best.rank, commit_tolerance)) {
       best = std::move(*candidate);
       emit();
     }
@@ -5921,7 +5926,8 @@ PlannerResult build_mlns_plan(
             beam_alns_iterations,
             /*use_elite_pool=*/anytime_search, simulation_days,
             anytime_search ? evaluation_deadline : std::nullopt);
-        beam_seed && mlns_commit_better(beam_seed->rank, best.rank) &&
+        beam_seed &&
+        mlns_commit_better(beam_seed->rank, best.rank, commit_tolerance) &&
         (!anytime_search || mlns_reward_better(beam_seed->rank, best.rank))) {
       best = std::move(*beam_seed);
     }
@@ -5962,7 +5968,7 @@ PlannerResult build_mlns_plan(
         const bool trusted_warm =
             config.players == 1 || warm_coverage >= fresh_coverage;
         if (trusted_warm &&
-            mlns_commit_better(warm->rank, best.rank)) {
+            mlns_commit_better(warm->rank, best.rank, commit_tolerance)) {
           best = std::move(*warm);
         }
       }
@@ -6210,7 +6216,7 @@ PlannerResult build_mlns_plan(
         pivot > 0 ? mlns_rank_better(candidate->rank, best.rank)
                   : candidate_current > best_current;
     if (trusted_best && preserves_protected_current &&
-        mlns_commit_better(candidate->rank, best.rank) &&
+        mlns_commit_better(candidate->rank, best.rank, commit_tolerance) &&
         (neighborhood_mode != NeighborhoodMode::Refined ||
          refined_best_gain)) {
       best = *candidate;

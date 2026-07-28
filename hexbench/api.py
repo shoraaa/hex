@@ -27,6 +27,7 @@ MLNS_TUNED_DEFAULTS: dict[str, int] = {
     "stagnation_iterations": 0,
     "future_discount_percent": 90,
     "lookahead_days": 3,
+    "commit_tolerance": 0,
 }
 SIMPLE_LNS_TUNED_DEFAULTS: dict[str, int] = {
     "min_iterations": 32,
@@ -105,6 +106,7 @@ MLNS_HYPERPARAMETERS = (
     {"key": "stagnation_iterations", "label": "MLNS stagnation threshold", "type": "integer", "min": 0, "step": 1, "ui_max": 100_000, "recommended": 0, "help": "Zero lets the wall-clock deadline govern; a positive value explicitly permits early stopping."},
     {"key": "future_discount_percent", "label": "Future-day discount", "unit": "%/horizon", "type": "integer", "min": 1, "max": 100, "step": 1, "recommended": 90, "help": "Weights today, tomorrow, and later days by 1, p, p², ... while preserving the official lexicographic objective order."},
     {"key": "lookahead_days", "label": "MLNS lookahead days", "unit": "days", "type": "integer", "min": 0, "max": 30, "step": 1, "recommended": 3, "help": "Simulate only this many revealed days when ranking MLNS plans; 0 restores the full suffix."},
+    {"key": "commit_tolerance", "label": "Current-serving tolerance", "unit": "servings", "type": "integer", "min": 0, "max": 10_000, "step": 1, "ui_max": 100, "recommended": 0, "help": "Maximum current-day serving deficit that a better MLNS continuation may accept after current distinct and daily coverage tie. Zero always protects today's realized servings."},
     LNS_DP_PROPOSAL_HYPERPARAMETER,
     TRAFFIC_GNN_HYPERPARAMETER,
 )

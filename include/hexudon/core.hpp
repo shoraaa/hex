@@ -199,6 +199,10 @@ struct SearchLimits {
   // Optional MLNS rolling horizon. Zero preserves the complete suffix;
   // positive values simulate only that many days from the revealed day.
   int mlns_lookahead_days{};
+  // Maximum realized current-day serving deficit that a better continuation
+  // may accept after distinct and daily coverage tie. Negative means no
+  // request-level override, preserving the legacy environment fallback.
+  int mlns_commit_tolerance{-1};
   // Replace MLNS's symmetric self-traffic suffix forecast with maps supplied
   // by the optional traffic-GNN predictor. The current revealed day remains
   // authoritative; entries are used only for future suffix days.

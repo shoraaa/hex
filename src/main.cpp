@@ -130,6 +130,7 @@ hexudon::SearchLimits parse_search_limits(const boost::json::object& object,
     assign(search, "palnsRestarts", limits.palns_restarts);
     assign(search, "futureDiscountPercent", limits.future_discount_percent);
     assign(search, "mlnsLookaheadDays", limits.mlns_lookahead_days);
+    assign(search, "mlnsCommitTolerance", limits.mlns_commit_tolerance);
     assign(search, "acoAnts", limits.aco_ants);
     assign(search, "acoIterations", limits.aco_iterations);
     assign_double(search, "acoEvaporation", limits.aco_evaporation);
@@ -173,6 +174,7 @@ hexudon::SearchLimits parse_search_limits(const boost::json::object& object,
     assign(hyperparameters, "future_discount_percent",
            limits.future_discount_percent);
     assign(hyperparameters, "lookahead_days", limits.mlns_lookahead_days);
+    assign(hyperparameters, "commit_tolerance", limits.mlns_commit_tolerance);
     assign(hyperparameters, "aco_ants", limits.aco_ants);
     assign(hyperparameters, "aco_iterations", limits.aco_iterations);
     assign_double(hyperparameters, "aco_evaporation", limits.aco_evaporation);
@@ -253,6 +255,7 @@ hexudon::SearchLimits parse_search_limits(const boost::json::object& object,
       limits.future_discount_percent < 1 ||
       limits.future_discount_percent > 100 ||
       limits.mlns_lookahead_days < 0 ||
+      limits.mlns_commit_tolerance < -1 ||
       limits.continuation_time_percent < 0 ||
       limits.continuation_time_percent > 100 ||
       limits.exact_time_percent < 0 || limits.exact_time_percent > 100 ||
