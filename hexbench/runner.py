@@ -211,6 +211,70 @@ def stream_core(
     return last
 
 
+def stream_types_core(
+    policy: str,
+    payload: dict[str, Any],
+    *,
+    binary: Path,
+    on_improve: Callable[[dict[str, Any]], None],
+    timeout: float = 60,
+    should_stop: Callable[[], bool] | None = None,
+    core_threads: int | None = None,
+) -> dict[str, Any] | None:
+    """Run the anytime agent-type selector and consume its NDJSON incumbents."""
+    environment = None
+    if core_threads is not None:
+        environment = dict(os.environ)
+        environment["HEXUDON_THREADS"] = str(max(1, core_threads))
+    process = subprocess.Popen(
+        [str(binary), "select", policy],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=environment,
+    )
+    timed_out = threading.Event()
+
+    def _kill() -> None:
+        timed_out.set()
+        process.kill()
+
+    watchdog = threading.Timer(max(0.1, timeout), _kill)
+    watchdog.start()
+    last: dict[str, Any] | None = None
+    stopped = False
+    try:
+        assert process.stdin is not None and process.stdout is not None
+        process.stdin.write(json.dumps(payload))
+        process.stdin.close()
+        for raw_line in process.stdout:
+            line = raw_line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            last = record
+            if record.get("kind") != "final":
+                on_improve(record)
+            if should_stop is not None and should_stop():
+                stopped = True
+                process.kill()
+                break
+        process.wait()
+    except BaseException:
+        process.kill()
+        process.wait()
+        raise
+    finally:
+        watchdog.cancel()
+    if timed_out.is_set() or stopped:
+        return last
+    if process.returncode:
+        stderr = (process.stderr.read() if process.stderr else "").strip()
+        raise RuntimeError(stderr or "hexudon core select failed")
+    return last
+
+
 def structural_optimum(scenario: dict[str, Any]) -> dict[str, int]:
     config = scenario["config"]
     days = len(config["daySteps"])

@@ -173,6 +173,19 @@ struct AlnsAnytimeBudget {
   int exact_ms{};
 };
 
+enum class RoleConfirmationChoice { First, Second };
+
+struct RoleConfirmationEvidence {
+  int screened_distinct{};
+  int confirmed_distinct{};
+  int patrols{};
+};
+
+RoleConfirmationChoice choose_role_confirmation(
+    const RoleConfirmationEvidence& first,
+    const RoleConfirmationEvidence& second,
+    bool confirmation_prefers_second, bool aggregate_prefers_second);
+
 AlnsAnytimeBudget alns_anytime_budget(int total_ms, bool final_day,
                                       bool allow_continuation,
                                       bool exact_enabled,
@@ -244,7 +257,8 @@ unsigned alns_features_for_policy(const std::string& policy);
 int lns_path_time(const AcoGraph& graph, int from, int to);
 
 AgentTypes select_lns_agent_types(const MapConfig& config,
-                                  const SearchLimits& limits);
+                                  const SearchLimits& limits,
+                                  const AgentTypeImprovementSink* on_improve = nullptr);
 
 std::vector<LnsDpProposal> build_lns_dp_route_proposals(
     const MapConfig& config, const DayInfo& day,
@@ -320,7 +334,8 @@ PlannerResult build_simple_lns_plan(
 // share the legacy LNS skeleton/decoder; only the authoritative simulator and
 // map primitives are common.
 AgentTypes select_lns_dp_agent_types(const MapConfig& config,
-                                     const SearchLimits& limits = {});
+                                     const SearchLimits& limits = {},
+                                     const AgentTypeImprovementSink* on_improve = nullptr);
 PlannerResult build_lns_dp_plan(
     const MapConfig& config, const DayInfo& day,
     const PolicyHistory& history, const AgentTypes& types,

@@ -2455,12 +2455,13 @@ std::vector<RoadScenario> build_scenarios(const MapConfig &config,
 } // namespace
 
 AgentTypes select_lns_dp_agent_types(const MapConfig &config,
-                                     const SearchLimits &limits) {
+                                     const SearchLimits &limits,
+                                     const AgentTypeImprovementSink *on_improve) {
   // Agent roles are fixed before the match, outside the per-day route
   // genotype.  Reuse the production multi-horizon rollout selector here so a
   // two-request myopic screen cannot discard every refuel mask on a low-fuel
   // map.  LNS-DP remains independent at the solution/decoder layer.
-  return select_lns_agent_types(config, limits);
+  return select_lns_agent_types(config, limits, on_improve);
 }
 
 PlannerResult build_lns_dp_plan(const MapConfig &config, const DayInfo &day,

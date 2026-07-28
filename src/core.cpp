@@ -1466,7 +1466,8 @@ std::tuple<int, int, int> alns_official_value(const CandidateValue& value) {
 
 AgentTypes select_agent_types_online(const std::string& policy,
                                      const MapConfig& config,
-                                     const SearchLimits& limits) {
+                                     const SearchLimits& limits,
+                                     const AgentTypeImprovementSink* on_improve) {
   AgentTypes types(config.agents.size(), AgentKind::Patrol);
   if (policy == "wait") return types;
   if (policy == "hotspot") {
@@ -1480,13 +1481,13 @@ AgentTypes select_agent_types_online(const std::string& policy,
     return select_simple_lns_agent_types(config, limits);
   }
   if (policy == "lns_dp") {
-    return select_lns_dp_agent_types(config, limits);
+    return select_lns_dp_agent_types(config, limits, on_improve);
   }
   if (policy == "lns" || policy == "alns" || policy == "palns" ||
       policy == "mlns" ||
       policy == "stop_bp" ||
       policy == "bp") {
-    return select_lns_agent_types(config, limits);
+    return select_lns_agent_types(config, limits, on_improve);
   }
   const int refuel_count = std::max(1, static_cast<int>(types.size()) / 4);
   std::vector<std::pair<int, int>> candidates;
@@ -1512,12 +1513,13 @@ AgentTypes select_agent_types_online(const std::string& policy,
 
 AgentTypes select_agent_types(const std::string& policy,
                               const MapConfig& config,
-                              const SearchLimits& limits) {
+                              const SearchLimits& limits,
+                              const AgentTypeImprovementSink* on_improve) {
   // The complete daySteps/daySeconds schedule is part of the initial map
   // configuration. Keep it available for the one-time role decision: fuel
   // pressure and useful refueling assignments depend on the actual match
   // horizons, not a synthetic placeholder schedule.
-  return select_agent_types_online(policy, config, limits);
+  return select_agent_types_online(policy, config, limits, on_improve);
 }
 
 // Number of independent MLNS trajectories to race per day (best-of-K portfolio).

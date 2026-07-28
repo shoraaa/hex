@@ -46,6 +46,7 @@ from .runner import (
     prepare_traffic_prediction_payload,
     run_core,
     stream_core,
+    stream_types_core,
 )
 
 
@@ -436,6 +437,13 @@ class CompetitionSessionManager:
         self._closed = False
         self._load_sessions()
         self._resume_result_sessions()
+        self._rearm_stop = threading.Event()
+        self._rearm_thread = threading.Thread(
+            target=self._watch_recycled_matches,
+            daemon=True,
+            name="hexbench-competition-rearm",
+        )
+        self._rearm_thread.start()
 
     def _session_path(self, session_id: str) -> Path:
         return self.report_dir / "sessions" / session_id / "session.json"
@@ -504,9 +512,89 @@ class CompetitionSessionManager:
 
     def close(self) -> None:
         self._closed = True
+        self._rearm_stop.set()
         with self._lock:
             for event in self._events.values():
                 event.set()
+
+    def _rearm_templates(self) -> list[dict[str, Any]]:
+        """Return the newest explicitly armed session for each official game."""
+        with self._lock:
+            latest: dict[str, dict[str, Any]] = {}
+            for session in self._sessions.values():
+                game = session.get("game", {})
+                game_id = str(session.get("requested_game_id") or "")
+                if (
+                    not session.get("auto_rearm")
+                    or session.get("execution_mode") != "auto"
+                    or game.get("is_practice")
+                    or not game_id
+                ):
+                    continue
+                previous = latest.get(game_id)
+                if previous is None or str(
+                    session.get("created_at") or ""
+                ) > str(previous.get("created_at") or ""):
+                    latest[game_id] = session
+            return copy.deepcopy(list(latest.values()))
+
+    def _has_match_session(self, game_id: str, starts_at: float) -> bool:
+        with self._lock:
+            for session in self._sessions.values():
+                if str(session.get("requested_game_id") or "") != game_id:
+                    continue
+                config = session.get("snapshot", {}).get("config", {})
+                if _match_starts_at(config) == starts_at:
+                    return True
+        return False
+
+    def _rearm_recycled_matches_once(self, client: GameClient) -> None:
+        for template in self._rearm_templates():
+            game_id = str(template["requested_game_id"])
+            try:
+                config = client.get("/game/config", game_id)
+                starts_at = _match_starts_at(config)
+                previous_starts_at = _match_starts_at(
+                    template.get("snapshot", {}).get("config", {})
+                )
+                if (
+                    starts_at is None
+                    or starts_at == previous_starts_at
+                    or self._has_match_session(game_id, starts_at)
+                ):
+                    continue
+                status = client.get("/game/state", game_id)
+                if status.get("status") != "selecting_agents":
+                    continue
+                self.start_session(
+                    game_id,
+                    str(template["method"]),
+                    template.get("hyperparameters"),
+                    execution_mode="auto",
+                    time_limit_seconds=template.get("time_limit_seconds"),
+                    agent_selection_time_limit_seconds=float(
+                        template.get("agent_selection_time_limit_seconds")
+                        or 30.0
+                    ),
+                    auto_rearm=True,
+                )
+            except (RuntimeError, ValueError, OSError):
+                # Selection remains open for a bounded server window. Polling
+                # retries transient discovery/rate-limit failures without
+                # mutating the completed template session.
+                continue
+
+    def _watch_recycled_matches(self) -> None:
+        client: GameClient | None = None
+        try:
+            client = GameClient(load_token(self.env_path), self.base_url)
+            while not self._rearm_stop.wait(max(1.0, self.poll_interval * 10)):
+                self._rearm_recycled_matches_once(client)
+        except (RuntimeError, ValueError, OSError):
+            return
+        finally:
+            if client is not None:
+                client.close()
 
     def list_games(self) -> list[dict[str, Any]]:
         return discover_assigned_games(load_token(self.env_path), self.base_url)
@@ -680,6 +768,7 @@ class CompetitionSessionManager:
         target_day: int | None = None,
         time_limit_seconds: float | None = None,
         agent_selection_time_limit_seconds: float = 30.0,
+        auto_rearm: bool = False,
     ) -> dict[str, Any]:
         if execution_mode not in {"manual", "auto", "curl"}:
             raise ValueError("execution_mode must be manual, auto, or curl")
@@ -779,6 +868,7 @@ class CompetitionSessionManager:
                 "agent_selection_time_limit_seconds": (
                     agent_selection_time_limit_seconds
                 ),
+                "auto_rearm": bool(auto_rearm),
                 "state": "starting",
                 "recoverable": False,
                 "snapshot": snapshot,
@@ -786,6 +876,8 @@ class CompetitionSessionManager:
                 "last_submission": None,
                 "incumbents": [],
                 "day_metrics": [],
+                "agent_selection_incumbents": [],
+                "agent_selection_metric": None,
                 "created_at": _now(),
                 "updated_at": _now(),
                 "progress": {"status": "starting"},
@@ -1067,6 +1159,7 @@ class CompetitionSessionManager:
                 raise ValueError("session not found")
             if action == "cancel":
                 session["state"] = "cancelled"
+                session["auto_rearm"] = False
             elif action == "pause":
                 session["paused"] = True
                 session["progress"] = {"status": "paused"}
@@ -1245,6 +1338,95 @@ class CompetitionSessionManager:
             prediction_available=accuracy is not None,
             **(accuracy or {}),
         )
+
+    def _update_agent_selection_metric(
+        self, session_id: str, **values: Any
+    ) -> None:
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return
+            metric = session.get("agent_selection_metric")
+            if not isinstance(metric, dict):
+                metric = {}
+                session["agent_selection_metric"] = metric
+            metric.update(copy.deepcopy(values))
+            session["updated_at"] = _now()
+            _write_json(self._session_path(session_id), session)
+
+    def _record_agent_selection_incumbent(
+        self,
+        session_id: str,
+        *,
+        types: list[int],
+        score: Any,
+        phase: str,
+        elapsed_seconds: float,
+    ) -> int | None:
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None or session.get("state") in {"cancelled", "failed"}:
+                return None
+            rows = session.setdefault("agent_selection_incumbents", [])
+            found_at = _now()
+            if rows and rows[-1].get("submission_status") == "pending":
+                rows[-1].update(
+                    submission_status="superseded", superseded_at=found_at
+                )
+            sequence = len(rows) + 1
+            rows.append(
+                {
+                    "sequence": sequence,
+                    "types": copy.deepcopy(types),
+                    "score": copy.deepcopy(score),
+                    "phase": phase,
+                    "found_at": found_at,
+                    "elapsed_seconds": round(max(0.0, elapsed_seconds), 6),
+                    "submitted": False,
+                    "submission_status": "pending",
+                }
+            )
+            metric = session.get("agent_selection_metric")
+            if not isinstance(metric, dict):
+                metric = {}
+                session["agent_selection_metric"] = metric
+            metric.update(
+                incumbent_count=sequence,
+                best_score=copy.deepcopy(score),
+                best_types=copy.deepcopy(types),
+                phase=phase,
+            )
+            session["updated_at"] = found_at
+            _write_json(self._session_path(session_id), session)
+            return sequence
+
+    def _mark_agent_selection_incumbent_submitted(
+        self, session_id: str, sequence: int | None, submission_count: int
+    ) -> None:
+        if sequence is None:
+            return
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return
+            row = next(
+                (
+                    item
+                    for item in session.get("agent_selection_incumbents", [])
+                    if int(item.get("sequence", -1)) == sequence
+                ),
+                None,
+            )
+            if row is None:
+                return
+            row.update(
+                submitted=True,
+                submission_status="submitted",
+                submitted_at=_now(),
+                submission_count=submission_count,
+            )
+            session["updated_at"] = _now()
+            _write_json(self._session_path(session_id), session)
 
     def _record_incumbent(
         self,
@@ -1465,25 +1647,6 @@ class CompetitionSessionManager:
             }
             for agent in frame.get("agents", [])
         ]
-        timed_max = int(
-            params.get(
-                "max_iterations",
-                MLNS_ANYTIME_ITERATION_CEILING
-                if session["method"] in {"lns", "alns", "mlns", "simple_lns", "lns_dp"}
-                else 2048,
-            )
-        )
-        timed_min = int(
-            params.get(
-                "min_iterations",
-                STATEFUL_DEFAULTS[session["method"]]["min_iterations"]
-                if session["method"] in STATEFUL_POLICIES
-                else 32,
-            )
-        )
-        if session["method"] == "lns_dp" and timed_max == 16:
-            timed_max = MLNS_ANYTIME_ITERATION_CEILING
-            timed_min = 0
         return {
             "day": target_day,
             "steps": int(replay_day.get("steps", config["daySteps"][target_day])),
@@ -1848,6 +2011,264 @@ class CompetitionSessionManager:
         proposal["fingerprint"] = _fingerprint(proposal)
         return proposal
 
+    def _stream_agent_selection(
+        self,
+        session_id: str,
+        client: GameClient,
+        session: dict[str, Any],
+        config: dict[str, Any],
+        payload: dict[str, Any] | list[Any],
+        budget: float,
+        api_game_id: str,
+        journal: dict[str, Any],
+        state_path: Path,
+    ) -> dict[str, Any]:
+        """Stream and submit improving role assignments until the budget ends."""
+        if not isinstance(payload, dict) or "config" not in payload:
+            started = time.monotonic()
+            timer_started_at = _now()
+            self._update_agent_selection_metric(
+                session_id,
+                elapsed_seconds=0.0,
+                budget_seconds=budget,
+                timer_started_at=timer_started_at,
+                timer_running=True,
+                status="searching",
+                submission_count=0,
+                incumbent_count=0,
+                failed_submission_count=0,
+            )
+            types = run_core(
+                "types",
+                session["method"],
+                payload,
+                binary=find_binary(self.binary_path),
+                timeout=max(60.0, budget + 2.0),
+            )
+            validate_agent_types(types, len(config["agents"]))
+            sequence = self._record_agent_selection_incumbent(
+                session_id,
+                types=[int(value) for value in types],
+                score=None,
+                phase="final",
+                elapsed_seconds=time.monotonic() - started,
+            )
+            try:
+                client.post(
+                    "/game/agent-types",
+                    {"game_id": api_game_id, "types": types},
+                )
+            except RuntimeError as error:
+                opening = _agent_selection_opening(error)
+                if opening is None:
+                    raise
+                self._update_agent_selection_metric(
+                    session_id,
+                    elapsed_seconds=time.monotonic() - started,
+                    timer_started_at=None,
+                    timer_running=False,
+                    status="waiting_for_open",
+                    failed_submission_count=1,
+                    last_submission_error=str(error),
+                )
+                return {
+                    "types": None,
+                    "submission_count": 0,
+                    "opening": opening,
+                    "last_error": str(error),
+                }
+            self._mark_agent_selection_incumbent_submitted(session_id, sequence, 1)
+            elapsed = time.monotonic() - started
+            self._update_agent_selection_metric(
+                session_id,
+                elapsed_seconds=elapsed,
+                timer_started_at=None,
+                timer_running=False,
+                status="accepted",
+                submission_count=1,
+                accepted_types=copy.deepcopy(types),
+                result={
+                    "patrol_agents": sum(int(value) == 0 for value in types),
+                    "refuel_agents": sum(int(value) == 1 for value in types),
+                    "types": copy.deepcopy(types),
+                },
+            )
+            return {"types": types, "submission_count": 1, "opening": None}
+
+        started = time.monotonic()
+        timer_started_at = _now()
+        selection_state: dict[str, Any] = {
+            "submission_count": 0,
+            "incumbent_count": 0,
+            "last_submit": 0.0,
+            "accepted_types": None,
+            "pending": None,
+            "opening": None,
+            "last_error": None,
+        }
+        self._update_agent_selection_metric(
+            session_id,
+            elapsed_seconds=0.0,
+            budget_seconds=budget,
+            timer_started_at=timer_started_at,
+            timer_running=True,
+            status="searching",
+            submission_count=0,
+            incumbent_count=0,
+            failed_submission_count=0,
+        )
+        self._update(
+            session_id,
+            state="streaming_agent_selection",
+            progress={
+                "status": "streaming_agent_selection",
+                "budget_seconds": budget,
+                "timer_started_at": timer_started_at,
+                "submission_count": 0,
+                "incumbent_count": 0,
+            },
+        )
+
+        def submit(types: list[int], sequence: int | None) -> bool:
+            try:
+                client.post(
+                    "/game/agent-types",
+                    {"game_id": api_game_id, "types": types},
+                )
+            except RuntimeError as error:
+                opening = _agent_selection_opening(error)
+                if opening is not None:
+                    selection_state["opening"] = opening
+                selection_state["last_error"] = str(error)
+                metric = (self.get_session(session_id) or {}).get(
+                    "agent_selection_metric", {}
+                )
+                self._update_agent_selection_metric(
+                    session_id,
+                    failed_submission_count=int(
+                        metric.get("failed_submission_count", 0)
+                    )
+                    + 1,
+                    last_submission_error=str(error),
+                )
+                selection_state["pending"] = (types, sequence)
+                return False
+            selection_state["submission_count"] += 1
+            selection_state["last_submit"] = time.monotonic()
+            selection_state["accepted_types"] = copy.deepcopy(types)
+            selection_state["pending"] = None
+            journal["types"] = copy.deepcopy(types)
+            _write_json(state_path, journal)
+            self._mark_agent_selection_incumbent_submitted(
+                session_id, sequence, selection_state["submission_count"]
+            )
+            self._update_agent_selection_metric(
+                session_id,
+                status="submitted",
+                submission_count=selection_state["submission_count"],
+                accepted_types=copy.deepcopy(types),
+            )
+            return True
+
+        def on_improve(record: dict[str, Any]) -> None:
+            types = record.get("types")
+            if not isinstance(types, list):
+                return
+            validate_agent_types(types, len(config["agents"]))
+            if selection_state["opening"] is not None:
+                return
+            selection_state["incumbent_count"] += 1
+            sequence = self._record_agent_selection_incumbent(
+                session_id,
+                types=[int(value) for value in types],
+                score=record.get("score"),
+                phase=str(record.get("phase", "search")),
+                elapsed_seconds=time.monotonic() - started,
+            )
+            if selection_state["accepted_types"] == types:
+                # The same committed role mask can receive a better timed or
+                # confirmed estimate. Record that refinement as accepted
+                # without sending a redundant role-selection POST.
+                self._mark_agent_selection_incumbent_submitted(
+                    session_id, sequence, selection_state["submission_count"]
+                )
+                return
+            if time.monotonic() - selection_state["last_submit"] >= 0.25:
+                submit(types, sequence)
+            else:
+                selection_state["pending"] = (types, sequence)
+
+        def should_stop() -> bool:
+            current = self.get_session(session_id)
+            return (
+                current is None
+                or current.get("state") in {"cancelled", "failed"}
+                or selection_state["opening"] is not None
+            )
+
+        final = stream_types_core(
+            session["method"],
+            payload,
+            binary=find_binary(self.binary_path),
+            on_improve=on_improve,
+            timeout=max(60.0, budget + 2.0),
+            should_stop=should_stop,
+        )
+        if selection_state["opening"] is None:
+            if isinstance(final, dict):
+                self._update_agent_selection_metric(
+                    session_id,
+                    phase=str(final.get("phase", "final")),
+                    best_score=copy.deepcopy(final.get("score")),
+                    best_types=copy.deepcopy(final.get("types")),
+                )
+            if selection_state["pending"] is not None:
+                submit(*selection_state["pending"])
+            if isinstance(final, dict) and isinstance(final.get("types"), list):
+                final_types = [int(value) for value in final["types"]]
+                validate_agent_types(final_types, len(config["agents"]))
+                if selection_state["accepted_types"] != final_types:
+                    sequence = self._record_agent_selection_incumbent(
+                        session_id,
+                        types=final_types,
+                        score=final.get("score"),
+                        phase=str(final.get("phase", "final")),
+                        elapsed_seconds=time.monotonic() - started,
+                    )
+                    submit(final_types, sequence)
+
+        elapsed = time.monotonic() - started
+        accepted_types = selection_state["accepted_types"]
+        self._update_agent_selection_metric(
+            session_id,
+            elapsed_seconds=elapsed,
+            timer_started_at=None,
+            timer_running=False,
+            status=(
+                "waiting_for_open"
+                if selection_state["opening"] is not None
+                else "accepted"
+                if accepted_types is not None
+                else "missed"
+            ),
+            submission_count=selection_state["submission_count"],
+            result=(
+                {
+                    "patrol_agents": sum(int(value) == 0 for value in accepted_types),
+                    "refuel_agents": sum(int(value) == 1 for value in accepted_types),
+                    "types": copy.deepcopy(accepted_types),
+                }
+                if accepted_types is not None
+                else None
+            ),
+        )
+        return {
+            "types": accepted_types,
+            "submission_count": selection_state["submission_count"],
+            "opening": selection_state["opening"],
+            "last_error": selection_state["last_error"],
+        }
+
     def _stream_day(
         self,
         session_id: str,
@@ -1986,6 +2407,21 @@ class CompetitionSessionManager:
                         error, day_index
                     )
                     retryable = _is_retryable_submission_error(error)
+                    if endpoint == "/game/practice/actions" and retryable:
+                        # A resettable-practice submission can be committed by
+                        # the server even when its HTTP response is lost.  The
+                        # accepted-action endpoint is authoritative, so recover
+                        # that success before retrying or marking the day missed.
+                        accepted = self._accepted_action(
+                            client, api_game_id, day_index
+                        )
+                        if accepted is not None and accepted.get("plan") == actions:
+                            response = {
+                                "reconciled": True,
+                                "submit_count": accepted.get("submit_count"),
+                                "submitted_at": accepted.get("submitted_at"),
+                            }
+                            break
                     self._record_submission_latency(
                         session_id,
                         day=day_index,
@@ -2984,23 +3420,19 @@ class CompetitionSessionManager:
                             "agent_selection_time_limit_seconds", 30.0
                         ),
                     )
-                    types = run_core(
-                        "types",
-                        current["method"],
+                    selection = self._stream_agent_selection(
+                        session_id,
+                        client,
+                        current,
+                        config,
                         type_payload,
-                        binary=find_binary(self.binary_path),
-                        timeout=max(60.0, type_budget + 2.0),
+                        type_budget,
+                        api_game_id,
+                        journal,
+                        state_path,
                     )
-                    validate_agent_types(types, len(config["agents"]))
-                    try:
-                        client.post(
-                            "/game/agent-types",
-                            {"game_id": api_game_id, "types": types},
-                        )
-                    except RuntimeError as error:
-                        opening = _agent_selection_opening(error)
-                        if opening is None:
-                            raise
+                    opening = selection.get("opening")
+                    if opening is not None:
                         opens_at, server_now = opening
                         # Convert the server-reported remaining interval onto
                         # our local monotonic wall clock. This tolerates small
@@ -3024,6 +3456,12 @@ class CompetitionSessionManager:
                             max(0.0, opens_at - server_now),
                         )
                         continue
+                    types = selection.get("types")
+                    if not isinstance(types, list):
+                        raise RuntimeError(
+                            str(selection.get("last_error") or
+                                "agent selection produced no accepted incumbent")
+                        )
                     journal["types"] = types
                     journal["match_starts_at"] = match_starts_at
                     _write_json(state_path, journal)

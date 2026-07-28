@@ -611,6 +611,87 @@ def test_reused_game_id_does_not_skip_agent_type_post(
     assert journal["day_snapshots"] == {}
 
 
+def test_explicit_auto_rearm_starts_recycled_official_match() -> None:
+    class FakeClient:
+        def get(self, path: str, game_id: str) -> dict:
+            assert game_id == "official-q01"
+            if path == "/game/config":
+                return {"startsAt": 2_000.0}
+            if path == "/game/state":
+                return {"status": "selecting_agents", "day": 0}
+            raise AssertionError(path)
+
+    manager = CompetitionSessionManager.__new__(CompetitionSessionManager)
+    manager._lock = threading.RLock()
+    manager._sessions = {
+        "old": {
+            "id": "old",
+            "requested_game_id": "official-q01",
+            "game_id": "official-q01",
+            "game": {"is_practice": False},
+            "method": "mlns",
+            "hyperparameters": {"lookahead_days": 3},
+            "execution_mode": "auto",
+            "time_limit_seconds": 25.0,
+            "agent_selection_time_limit_seconds": 5.0,
+            "auto_rearm": True,
+            "snapshot": {"config": {"startsAt": 1_000.0}},
+            "created_at": "2026-07-28T00:00:00+00:00",
+        }
+    }
+    calls: list[tuple[tuple, dict]] = []
+    manager.start_session = lambda *args, **kwargs: calls.append(  # type: ignore[method-assign]
+        (args, kwargs)
+    )
+
+    manager._rearm_recycled_matches_once(FakeClient())
+
+    assert calls == [
+        (
+            ("official-q01", "mlns", {"lookahead_days": 3}),
+            {
+                "execution_mode": "auto",
+                "time_limit_seconds": 25.0,
+                "agent_selection_time_limit_seconds": 5.0,
+                "auto_rearm": True,
+            },
+        )
+    ]
+
+
+def test_auto_rearm_waits_for_agent_selection() -> None:
+    class FakeClient:
+        def get(self, path: str, _game_id: str) -> dict:
+            if path == "/game/config":
+                return {"startsAt": 2_000.0}
+            if path == "/game/state":
+                return {"status": "in_progress", "day": 1}
+            raise AssertionError(path)
+
+    manager = CompetitionSessionManager.__new__(CompetitionSessionManager)
+    manager._lock = threading.RLock()
+    manager._sessions = {
+        "old": {
+            "requested_game_id": "official-q01",
+            "game": {"is_practice": False},
+            "method": "mlns",
+            "hyperparameters": {},
+            "execution_mode": "auto",
+            "auto_rearm": True,
+            "snapshot": {"config": {"startsAt": 1_000.0}},
+            "created_at": "2026-07-28T00:00:00+00:00",
+        }
+    }
+    calls: list[tuple] = []
+    manager.start_session = lambda *args, **kwargs: calls.append(  # type: ignore[method-assign]
+        (args, kwargs)
+    )
+
+    manager._rearm_recycled_matches_once(FakeClient())
+
+    assert calls == []
+
+
 def test_start_queues_until_agent_selection_opens(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -712,6 +793,108 @@ def test_start_queues_until_agent_selection_opens(
     assert observed_waits == pytest.approx([100.0, 99.9])
     assert manager._sessions["session"]["state"] == "waiting_for_day"
     assert manager._sessions["session"]["agent_selection_retry_at"] is None
+
+
+def test_agent_selection_streams_improving_incumbents_and_metrics(
+    monkeypatch, tmp_path: Path
+) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.posts: list[dict] = []
+
+        def post(self, endpoint: str, payload: dict) -> dict:
+            assert endpoint == "/game/agent-types"
+            self.posts.append(payload)
+            return {"ok": True}
+
+    manager = CompetitionSessionManager.__new__(CompetitionSessionManager)
+    manager.binary_path = None
+    manager.report_dir = tmp_path / "reports"
+    manager._lock = threading.RLock()
+    manager._sessions = {
+        "session": {
+            "id": "session",
+            "state": "starting",
+            "game": {"is_practice": True},
+            "method": "mlns",
+            "events": [],
+            "agent_selection_incumbents": [],
+            "agent_selection_metric": None,
+        }
+    }
+    monkeypatch.setattr(competition, "find_binary", lambda _path: "hexudon")
+
+    def fake_stream_types_core(_method, _payload, *, on_improve, **_kwargs):
+        on_improve(
+            {
+                "types": [0, 0],
+                "score": [3, 8, 12],
+                "phase": "robust_screen",
+            }
+        )
+        on_improve(
+            {
+                "types": [0, 1],
+                "score": [4, 9, 14],
+                "phase": "timed_screen",
+            }
+        )
+        on_improve(
+            {
+                "types": [0, 1],
+                "score": [4, 10, 15],
+                "phase": "confirmed",
+            }
+        )
+        return {
+            "kind": "final",
+            "types": [0, 1],
+            "score": [4, 10, 15],
+            "phase": "confirmed",
+        }
+
+    monkeypatch.setattr(
+        competition, "stream_types_core", fake_stream_types_core
+    )
+    client = FakeClient()
+    journal = {"types": None}
+
+    result = manager._stream_agent_selection(
+        "session",
+        client,  # type: ignore[arg-type]
+        manager._sessions["session"],
+        {"agents": [0, 1]},
+        {"config": {"agents": [0, 1]}, "search": {"timeLimitMs": 900}},
+        1.0,
+        "game:13",
+        journal,
+        tmp_path / "state.json",
+    )
+
+    assert [post["types"] for post in client.posts] == [[0, 0], [0, 1]]
+    assert result["types"] == [0, 1]
+    assert journal["types"] == [0, 1]
+    rows = manager._sessions["session"]["agent_selection_incumbents"]
+    assert [row["phase"] for row in rows] == [
+        "robust_screen",
+        "timed_screen",
+        "confirmed",
+    ]
+    assert [row["submission_status"] for row in rows] == [
+        "submitted",
+        "superseded",
+        "submitted",
+    ]
+    metric = manager._sessions["session"]["agent_selection_metric"]
+    assert metric["status"] == "accepted"
+    assert metric["submission_count"] == 2
+    assert metric["incumbent_count"] == 3
+    assert metric["best_score"] == [4, 10, 15]
+    assert metric["result"] == {
+        "patrol_agents": 1,
+        "refuel_agents": 1,
+        "types": [0, 1],
+    }
 
 
 def test_controller_does_not_open_or_submit_day_one_before_start(
@@ -1187,13 +1370,122 @@ def test_streaming_submits_first_real_incumbent_without_emergency_seed(
     ] is False
 
 
+def test_streaming_reconciles_lost_practice_submission_response(
+    monkeypatch, tmp_path: Path
+) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.posts: list[dict] = []
+
+        def post(
+            self, endpoint: str, payload: dict, *, timeout: float | None = None
+        ) -> dict:
+            assert endpoint == "/game/practice/actions"
+            assert timeout is not None and 0 < timeout <= 2.0
+            self.posts.append(payload)
+            raise RuntimeError(
+                "POST /game/practice/actions failed (ambiguous network error)"
+            )
+
+        def get(self, endpoint: str, game_id: str) -> dict:
+            assert endpoint == "/game/actions"
+            assert game_id == "game:13"
+            return {
+                "actions": [
+                    {
+                        "team_id": "13",
+                        "day": 0,
+                        "plan": [[-1]],
+                        "submit_count": 1,
+                        "submitted_at": 123.0,
+                    }
+                ]
+            }
+
+    manager = CompetitionSessionManager.__new__(CompetitionSessionManager)
+    manager.binary_path = None
+    manager._lock = threading.RLock()
+    manager._sessions = {
+        "session": {
+            "id": "session",
+            "state": "streaming",
+            "game": {"is_practice": True},
+            "method": "mlns",
+            "hyperparameters": {},
+            "incumbents": [],
+            "day_metrics": [],
+            "events": [],
+        }
+    }
+    manager.report_dir = tmp_path / "reports"
+    manager._record_prediction_accuracy = lambda *_args: None  # type: ignore[method-assign]
+    monkeypatch.setattr(competition, "find_binary", lambda _path: "hexudon")
+    monkeypatch.setattr(competition, "planning_budget", lambda *_args, **_kwargs: 1.0)
+    monkeypatch.setattr(
+        competition,
+        "trace_action_plan",
+        lambda *_args, **_kwargs: {
+            "score": {"distinct_types": 1, "daily_types": 1, "servings": 2},
+            "frames": [],
+        },
+    )
+
+    def fake_stream_core(_method, _payload, *, on_improve, **_kwargs):
+        on_improve({"actions": [[-1]], "score": [1, 1, 2]})
+        return {"kind": "final", "actions": [[-1]], "score": [1, 1, 2]}
+
+    monkeypatch.setattr(competition, "stream_core", fake_stream_core)
+    journal = {
+        "submitted_days": {},
+        "day_snapshots": {},
+        "distinct_brands": [],
+        "cumulative_daily_types": 0,
+        "total_servings": 0,
+        "planner_state": None,
+    }
+
+    manager._stream_day(
+        "session",
+        FakeClient(),  # type: ignore[arg-type]
+        manager._sessions["session"],
+        {"daySteps": [1], "daySeconds": [1], "spots": []},
+        {"day": 0, "agents": [{"kind": 0}], "traffics": []},
+        journal,
+        tmp_path / "state.json",
+        "game:13",
+        False,
+    )
+
+    assert journal["submitted_days"] == {"0": [[-1]]}
+    assert manager._sessions["session"]["day_metrics"][0][
+        "submission_status"
+    ] == "accepted"
+    assert manager._sessions["session"]["day_metrics"][0]["result"] == {
+        "distinct_types": 1,
+        "daily_types": 1,
+        "servings": 2,
+    }
+    assert manager._sessions["session"]["day_metrics"][0][
+        "failed_submission_count"
+    ] == 0
+    assert manager._sessions["session"]["last_submission"]["response"] == {
+        "reconciled": True,
+        "submit_count": 1,
+        "submitted_at": 123.0,
+    }
+
+
 def test_dashboard_parameter_ui_has_prefills_sliders_and_preview() -> None:
     script = (web.STATIC_ROOT / "app.js").read_text()
 
     assert "plannerParameters" in script
     assert 'parameterControl(field,values,"data-param",disabled)' in script
-    assert 'state.bootstrap.policies.includes("alns")' in script
+    assert 'state.bootstrap.policies.includes("mlns")' in script
+    assert 'use_lns_dp_proposals:true' in script
     assert "collectParams" in script
+    assert "agentSelectionMarkup" in script
+    assert "agent_selection_metric" in script
+    assert "agent_selection_incumbents" in script
 
 
 def test_mlns_gnn_checkbox_is_exposed_only_for_mlns() -> None:
