@@ -437,6 +437,13 @@ class CompetitionSessionManager:
         self._closed = False
         self._load_sessions()
         self._resume_result_sessions()
+        self._rearm_stop = threading.Event()
+        self._rearm_thread = threading.Thread(
+            target=self._watch_recycled_matches,
+            daemon=True,
+            name="hexbench-competition-rearm",
+        )
+        self._rearm_thread.start()
 
     def _session_path(self, session_id: str) -> Path:
         return self.report_dir / "sessions" / session_id / "session.json"
@@ -505,9 +512,89 @@ class CompetitionSessionManager:
 
     def close(self) -> None:
         self._closed = True
+        self._rearm_stop.set()
         with self._lock:
             for event in self._events.values():
                 event.set()
+
+    def _rearm_templates(self) -> list[dict[str, Any]]:
+        """Return the newest explicitly armed session for each official game."""
+        with self._lock:
+            latest: dict[str, dict[str, Any]] = {}
+            for session in self._sessions.values():
+                game = session.get("game", {})
+                game_id = str(session.get("requested_game_id") or "")
+                if (
+                    not session.get("auto_rearm")
+                    or session.get("execution_mode") != "auto"
+                    or game.get("is_practice")
+                    or not game_id
+                ):
+                    continue
+                previous = latest.get(game_id)
+                if previous is None or str(
+                    session.get("created_at") or ""
+                ) > str(previous.get("created_at") or ""):
+                    latest[game_id] = session
+            return copy.deepcopy(list(latest.values()))
+
+    def _has_match_session(self, game_id: str, starts_at: float) -> bool:
+        with self._lock:
+            for session in self._sessions.values():
+                if str(session.get("requested_game_id") or "") != game_id:
+                    continue
+                config = session.get("snapshot", {}).get("config", {})
+                if _match_starts_at(config) == starts_at:
+                    return True
+        return False
+
+    def _rearm_recycled_matches_once(self, client: GameClient) -> None:
+        for template in self._rearm_templates():
+            game_id = str(template["requested_game_id"])
+            try:
+                config = client.get("/game/config", game_id)
+                starts_at = _match_starts_at(config)
+                previous_starts_at = _match_starts_at(
+                    template.get("snapshot", {}).get("config", {})
+                )
+                if (
+                    starts_at is None
+                    or starts_at == previous_starts_at
+                    or self._has_match_session(game_id, starts_at)
+                ):
+                    continue
+                status = client.get("/game/state", game_id)
+                if status.get("status") != "selecting_agents":
+                    continue
+                self.start_session(
+                    game_id,
+                    str(template["method"]),
+                    template.get("hyperparameters"),
+                    execution_mode="auto",
+                    time_limit_seconds=template.get("time_limit_seconds"),
+                    agent_selection_time_limit_seconds=float(
+                        template.get("agent_selection_time_limit_seconds")
+                        or 30.0
+                    ),
+                    auto_rearm=True,
+                )
+            except (RuntimeError, ValueError, OSError):
+                # Selection remains open for a bounded server window. Polling
+                # retries transient discovery/rate-limit failures without
+                # mutating the completed template session.
+                continue
+
+    def _watch_recycled_matches(self) -> None:
+        client: GameClient | None = None
+        try:
+            client = GameClient(load_token(self.env_path), self.base_url)
+            while not self._rearm_stop.wait(max(1.0, self.poll_interval * 10)):
+                self._rearm_recycled_matches_once(client)
+        except (RuntimeError, ValueError, OSError):
+            return
+        finally:
+            if client is not None:
+                client.close()
 
     def list_games(self) -> list[dict[str, Any]]:
         return discover_assigned_games(load_token(self.env_path), self.base_url)
@@ -681,6 +768,7 @@ class CompetitionSessionManager:
         target_day: int | None = None,
         time_limit_seconds: float | None = None,
         agent_selection_time_limit_seconds: float = 30.0,
+        auto_rearm: bool = False,
     ) -> dict[str, Any]:
         if execution_mode not in {"manual", "auto", "curl"}:
             raise ValueError("execution_mode must be manual, auto, or curl")
@@ -780,6 +868,7 @@ class CompetitionSessionManager:
                 "agent_selection_time_limit_seconds": (
                     agent_selection_time_limit_seconds
                 ),
+                "auto_rearm": bool(auto_rearm),
                 "state": "starting",
                 "recoverable": False,
                 "snapshot": snapshot,
@@ -1070,6 +1159,7 @@ class CompetitionSessionManager:
                 raise ValueError("session not found")
             if action == "cancel":
                 session["state"] = "cancelled"
+                session["auto_rearm"] = False
             elif action == "pause":
                 session["paused"] = True
                 session["progress"] = {"status": "paused"}
@@ -1557,25 +1647,6 @@ class CompetitionSessionManager:
             }
             for agent in frame.get("agents", [])
         ]
-        timed_max = int(
-            params.get(
-                "max_iterations",
-                MLNS_ANYTIME_ITERATION_CEILING
-                if session["method"] in {"lns", "alns", "mlns", "simple_lns", "lns_dp"}
-                else 2048,
-            )
-        )
-        timed_min = int(
-            params.get(
-                "min_iterations",
-                STATEFUL_DEFAULTS[session["method"]]["min_iterations"]
-                if session["method"] in STATEFUL_POLICIES
-                else 32,
-            )
-        )
-        if session["method"] == "lns_dp" and timed_max == 16:
-            timed_max = MLNS_ANYTIME_ITERATION_CEILING
-            timed_min = 0
         return {
             "day": target_day,
             "steps": int(replay_day.get("steps", config["daySteps"][target_day])),

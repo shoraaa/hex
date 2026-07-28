@@ -4262,12 +4262,11 @@ bool mlns_reward_better(const MlnsRank& left, const MlnsRank& right) {
 // already contains the realized current day at full weight plus the discounted
 // suffix, so inside a small current-day gap it directly answers "does the better
 // continuation outweigh the current-day deficit?". Outside the band the realized
-// advantage is protected from the biased forecast. The bounded default
-// protects against forecast-only replacements: it keeps a small serving slack
-// when continuation is better, but prevents overwriting a 97-serving plan with
-// a 67-serving plan merely because two more future daily types are predicted.
+// advantage is protected from the biased forecast. The zero-slack default
+// protects every realized serving once current distinct/daily coverage ties;
+// future simulation remains available to break exact current-day ties.
 // Override with HEXUDON_MLNS_COMMIT_TOLERANCE.
-constexpr int kMlnsCommitToleranceDefault = 8;
+constexpr int kMlnsCommitToleranceDefault = 0;
 int mlns_commit_tolerance() {
   static const int value = [] {
     const char* raw = std::getenv("HEXUDON_MLNS_COMMIT_TOLERANCE");
@@ -4306,9 +4305,9 @@ bool mlns_commit_better(const MlnsRank& left, const MlnsRank& right) {
   if (left.current_daily != right.current_daily) {
     return left.current_daily > right.current_daily;
   }
-  // Do not let a noisy suffix forecast erase a materially better realized
-  // current-day serving result. Small gaps remain eligible for continuation
-  // tie-breaking below, preserving daily-first behavior with bounded slack.
+  // Do not let a noisy suffix forecast erase a better realized current-day
+  // serving result. An explicit nonzero override can reopen bounded slack;
+  // the production default reaches continuation tie-breaking only on a tie.
   const int tolerance = mlns_commit_tolerance();
   const long long serving_gap =
       static_cast<long long>(left.current_servings) -

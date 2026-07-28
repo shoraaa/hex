@@ -611,6 +611,87 @@ def test_reused_game_id_does_not_skip_agent_type_post(
     assert journal["day_snapshots"] == {}
 
 
+def test_explicit_auto_rearm_starts_recycled_official_match() -> None:
+    class FakeClient:
+        def get(self, path: str, game_id: str) -> dict:
+            assert game_id == "official-q01"
+            if path == "/game/config":
+                return {"startsAt": 2_000.0}
+            if path == "/game/state":
+                return {"status": "selecting_agents", "day": 0}
+            raise AssertionError(path)
+
+    manager = CompetitionSessionManager.__new__(CompetitionSessionManager)
+    manager._lock = threading.RLock()
+    manager._sessions = {
+        "old": {
+            "id": "old",
+            "requested_game_id": "official-q01",
+            "game_id": "official-q01",
+            "game": {"is_practice": False},
+            "method": "mlns",
+            "hyperparameters": {"lookahead_days": 3},
+            "execution_mode": "auto",
+            "time_limit_seconds": 25.0,
+            "agent_selection_time_limit_seconds": 5.0,
+            "auto_rearm": True,
+            "snapshot": {"config": {"startsAt": 1_000.0}},
+            "created_at": "2026-07-28T00:00:00+00:00",
+        }
+    }
+    calls: list[tuple[tuple, dict]] = []
+    manager.start_session = lambda *args, **kwargs: calls.append(  # type: ignore[method-assign]
+        (args, kwargs)
+    )
+
+    manager._rearm_recycled_matches_once(FakeClient())
+
+    assert calls == [
+        (
+            ("official-q01", "mlns", {"lookahead_days": 3}),
+            {
+                "execution_mode": "auto",
+                "time_limit_seconds": 25.0,
+                "agent_selection_time_limit_seconds": 5.0,
+                "auto_rearm": True,
+            },
+        )
+    ]
+
+
+def test_auto_rearm_waits_for_agent_selection() -> None:
+    class FakeClient:
+        def get(self, path: str, _game_id: str) -> dict:
+            if path == "/game/config":
+                return {"startsAt": 2_000.0}
+            if path == "/game/state":
+                return {"status": "in_progress", "day": 1}
+            raise AssertionError(path)
+
+    manager = CompetitionSessionManager.__new__(CompetitionSessionManager)
+    manager._lock = threading.RLock()
+    manager._sessions = {
+        "old": {
+            "requested_game_id": "official-q01",
+            "game": {"is_practice": False},
+            "method": "mlns",
+            "hyperparameters": {},
+            "execution_mode": "auto",
+            "auto_rearm": True,
+            "snapshot": {"config": {"startsAt": 1_000.0}},
+            "created_at": "2026-07-28T00:00:00+00:00",
+        }
+    }
+    calls: list[tuple] = []
+    manager.start_session = lambda *args, **kwargs: calls.append(  # type: ignore[method-assign]
+        (args, kwargs)
+    )
+
+    manager._rearm_recycled_matches_once(FakeClient())
+
+    assert calls == []
+
+
 def test_start_queues_until_agent_selection_opens(
     monkeypatch, tmp_path: Path
 ) -> None:

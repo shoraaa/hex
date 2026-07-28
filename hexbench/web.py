@@ -656,6 +656,7 @@ class DashboardApp:
         target_day: int | None = None,
         time_limit_seconds: float | None = None,
         agent_selection_time_limit_seconds: float = 30.0,
+        auto_rearm: bool = False,
     ) -> dict[str, Any]:
         return self._competition.start_session(
             game_id,
@@ -667,6 +668,7 @@ class DashboardApp:
             agent_selection_time_limit_seconds=(
                 agent_selection_time_limit_seconds
             ),
+            auto_rearm=auto_rearm,
         )
 
     def get_competition(self, session_id: str) -> dict[str, Any] | None:
@@ -1294,6 +1296,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 agent_selection_time_limit_seconds = payload.get(
                     "agent_selection_time_limit_seconds", 30.0
                 )
+                auto_rearm = payload.get("auto_rearm", False)
                 if not isinstance(game_id, str) or not isinstance(method, str):
                     raise ValueError("game_id and method are required")
                 if hyperparameters is not None and not isinstance(hyperparameters, dict):
@@ -1311,6 +1314,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     raise ValueError(
                         "agent_selection_time_limit_seconds must be numeric"
                     )
+                if not isinstance(auto_rearm, bool):
+                    raise ValueError("auto_rearm must be boolean")
                 session = self.app.start_competition(
                     game_id,
                     method,
@@ -1321,6 +1326,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     agent_selection_time_limit_seconds=(
                         agent_selection_time_limit_seconds
                     ),
+                    auto_rearm=auto_rearm,
                 )
                 self._json(HTTPStatus.ACCEPTED, session)
                 return
