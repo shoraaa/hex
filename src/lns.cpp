@@ -4310,13 +4310,22 @@ bool mlns_commit_better(const MlnsRank& left, const MlnsRank& right,
     return left.current_daily > right.current_daily;
   }
   // Do not let a noisy suffix forecast erase a better realized current-day
-  // serving result. An explicit nonzero override can reopen bounded slack;
-  // the production default reaches continuation tie-breaking only on a tie.
+  // serving result. Configured slack is useful only while the immediate
+  // next-day simulation says daily coverage is at risk. If both continuations
+  // already reach the structural daily maximum, there is no daily objective
+  // left to rescue, so fall back to zero tolerance and protect today's bowls.
+  // This makes a nonzero tolerance a hard-case regime instead of a global tax
+  // on easy/saturated days.
+  const int effective_tolerance =
+      (!left.full_next_daily_projection ||
+       !right.full_next_daily_projection)
+          ? tolerance
+          : 0;
   const long long serving_gap =
       static_cast<long long>(left.current_servings) -
       static_cast<long long>(right.current_servings);
-  if (serving_gap > tolerance) return true;
-  if (serving_gap < -tolerance) return false;
+  if (serving_gap > effective_tolerance) return true;
+  if (serving_gap < -effective_tolerance) return false;
   // The second official objective spans all days. Protect a suffix forecast
   // that reaches its structural maximum, without letting small/noisy forecast
   // differences dominate today's reliable serving count.

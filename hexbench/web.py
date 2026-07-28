@@ -538,7 +538,7 @@ class DashboardApp:
             client.close()
 
     def standings(self, game_id: str) -> dict[str, Any]:
-        """Build the official practice ranking for every configured match team."""
+        """Build the authoritative ranking for a regular live or practice game."""
         from .api import GameClient
 
         token = load_token(self.env_path)
@@ -549,12 +549,22 @@ class DashboardApp:
         )
         if descriptor is None:
             raise ValueError("game not found")
-        if not descriptor.get("is_practice"):
-            raise ValueError("peer standings are only available for practice games")
         client = GameClient(token, self.base_url)
         try:
             board = client.get("/game/board", game_id)
             resolved = str(board.get("game_id", game_id))
+            if not descriptor.get("is_practice"):
+                result = client.get("/game/result", resolved)
+                return {
+                    "ranking": [str(value) for value in result.get("ranking", [])],
+                    "detail": {
+                        str(team_id): copy.deepcopy(score)
+                        for team_id, score in result.get("detail", {}).items()
+                    },
+                    "teams": descriptor.get("teams", []),
+                    "own_team_id": _token_team_id(token),
+                    "errors": {},
+                }
             question_id, own_team_id = resolved.rsplit(":", 1)
             detail: dict[str, dict[str, Any]] = {}
             errors: dict[str, str] = {}

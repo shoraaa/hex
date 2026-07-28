@@ -1160,8 +1160,9 @@ def test_live_practice_ranking_does_not_use_saved_session_result() -> None:
         "if(state.game.archived&&state.game.saved_session_id)"
         "attachSession(await api("
     ) in script
-    assert "else await restoreSession();renderGame();if(resettable)loadStandings()" in script
+    assert "else await restoreSession();renderGame();if(ranked)loadStandings()" in script
     assert "function standingsMarkup(){const archived=archivedResult();" in script
+    assert "if(peer){if(peer.loading)" in script
 
 
 def test_stale_action_post_identifies_a_forward_day_transition() -> None:
@@ -1668,7 +1669,10 @@ def test_play_ui_exposes_streaming_console_and_original_game_features() -> None:
     assert '${esc(T("daily"))}: ${score.daily}' in script
     assert "competitive?.prev?.holder_score?.[1]" in script
     assert "peer.cumulative_daily_types" in script
+    assert "daily:peer.cumulative_daily_types??team.cumulative_daily_types" in script
+    assert 'id="score-types"' in script
     assert 'id="score-daily"' in script
+    assert 'id="score-servings"' in script
     assert "updateDayMetricTimers" in script
     assert "day-metrics-grid" in script
     assert "convergence-chart" not in script
@@ -2211,6 +2215,67 @@ def test_practice_standings_include_named_peers_in_official_order(
         result = app.standings("practice")
         assert result["ranking"] == ["8", "13"]
         assert result["teams"][1] == {"id": "8", "name": "BGNA"}
+        assert result["own_team_id"] == "13"
+    finally:
+        app.close()
+
+
+def test_live_standings_use_authoritative_result_daily_score(
+    monkeypatch, tmp_path: Path
+) -> None:
+    class FakeClient:
+        def __init__(self, token: str, base_url: str):
+            pass
+
+        def get(self, path: str, game_id: str):
+            if path == "/game/board":
+                return {"game_id": "live", "is_practice": False}
+            if path == "/game/result":
+                return {
+                    "ranking": ["8", "13"],
+                    "detail": {
+                        "8": {
+                            "distinct_types": 4,
+                            "cumulative_daily_types": 18,
+                            "total_servings": 40,
+                        },
+                        "13": {
+                            "distinct_types": 4,
+                            "cumulative_daily_types": 17,
+                            "total_servings": 50,
+                        },
+                    },
+                }
+            raise AssertionError((path, game_id))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(web, "load_token", lambda _: "token")
+    monkeypatch.setattr(web, "_token_team_id", lambda _: "13")
+    monkeypatch.setattr(api, "GameClient", FakeClient)
+    monkeypatch.setattr(
+        web,
+        "discover_assigned_games",
+        lambda *_: [
+            {
+                "question_id": "live",
+                "is_practice": False,
+                "teams": [
+                    {"id": "13", "name": "banned214"},
+                    {"id": "8", "name": "BGNA"},
+                ],
+            }
+        ],
+    )
+    app = web.DashboardApp(
+        tmp_path / ".env", tmp_path / "state", tmp_path / "reports"
+    )
+    try:
+        result = app.standings("live")
+
+        assert result["ranking"] == ["8", "13"]
+        assert result["detail"]["13"]["cumulative_daily_types"] == 17
         assert result["own_team_id"] == "13"
     finally:
         app.close()
