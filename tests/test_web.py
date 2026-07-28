@@ -1491,7 +1491,7 @@ def test_dashboard_parameter_ui_has_prefills_sliders_and_preview() -> None:
     assert "plannerParameters" in script
     assert 'parameterControl(field,values,"data-param",disabled)' in script
     assert 'state.bootstrap.policies.includes("mlns")' in script
-    assert 'use_lns_dp_proposals:true' in script
+    assert 'adaptive_commit_tolerance:true,use_lns_dp_proposals:true' in script
     assert "collectParams" in script
     assert "agentSelectionMarkup" in script
     assert "agent_selection_metric" in script
@@ -1505,9 +1505,11 @@ def test_mlns_planner_controls_are_exposed_only_for_mlns() -> None:
 
     assert "commit_tolerance" in mlns_fields
     assert "commit_tolerance" not in alns_fields
+    assert "adaptive_commit_tolerance" in mlns_fields
+    assert "adaptive_commit_tolerance" not in alns_fields
     assert "use_traffic_gnn" in mlns_fields
     assert "use_traffic_gnn" not in alns_fields
-    assert '["commit_tolerance","use_lns_dp_proposals","use_traffic_gnn"]' in script
+    assert '["commit_tolerance","adaptive_commit_tolerance","use_lns_dp_proposals","use_traffic_gnn"]' in script
 
 
 def test_competition_refresh_clears_historical_session_ui_and_stale_polls() -> None:

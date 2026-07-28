@@ -203,6 +203,10 @@ struct SearchLimits {
   // may accept after distinct and daily coverage tie. Negative means no
   // request-level override, preserving the legacy environment fallback.
   int mlns_commit_tolerance{-1};
+  // Apply MLNS serving tolerance only when at least one competing continuation
+  // predicts incomplete next-day daily coverage. Disabling this restores the
+  // legacy global-tolerance behavior.
+  bool mlns_adaptive_commit_tolerance{true};
   // Replace MLNS's symmetric self-traffic suffix forecast with maps supplied
   // by the optional traffic-GNN predictor. The current revealed day remains
   // authoritative; entries are used only for future suffix days.
